@@ -52,6 +52,15 @@ class BoundingBox:
     w: int
     h: int
 
+    def __getitem__(self, idx: int) -> int:
+        return (self.x, self.y, self.w, self.h)[idx]
+
+    def __iter__(self):
+        return iter((self.x, self.y, self.w, self.h))
+
+    def __len__(self) -> int:
+        return 4
+
     @property
     def bottom_center(self) -> Tuple[int, int]:
         """接地脚点估算"""

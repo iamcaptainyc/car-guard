@@ -173,10 +173,12 @@ def draw_skeleton(frame: np.ndarray, keypoints: dict, bbox=None):
 
     # 边界约束 (允许 20% 正常肢体舒展外延，抑制飞出框外十万八千里的野点)
     if bbox is not None:
-        bx = getattr(bbox, 'x', bbox[0])
-        by = getattr(bbox, 'y', bbox[1])
-        bw = getattr(bbox, 'w', bbox[2])
-        bh = getattr(bbox, 'h', bbox[3])
+        if hasattr(bbox, 'x'):
+            bx, by, bw, bh = bbox.x, bbox.y, bbox.w, bbox.h
+        elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            bx, by, bw, bh = bbox[0], bbox[1], bbox[2], bbox[3]
+        else:
+            bx, by, bw, bh = 0, 0, 0, 0
         x_min, x_max = bx - 0.20 * bw, bx + 1.20 * bw
         y_min, y_max = by - 0.15 * bh, by + 1.15 * bh
     else:
