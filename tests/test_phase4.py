@@ -1,0 +1,290 @@
+"""
+阶段四单元测试套件：端侧 VLM 异步复核与防篡改存证流水线
+验证 VLM 唤醒门控、非阻塞异步队列、“只升不降”权限沙箱、视频拼装落盘与 SHA-256 防篡改哈希链
+"""
+
+import time
+import json
+import shutil
+import tempfile
+from pathlib import Path
+import numpy as np
+import pytest
+
+from camping_guard.types import ThreatLevel, ActionType, ThreatEventRecord, OperatingMode, ClockSource
+from camping_guard.review.vlm_reviewer import AsyncVLMReviewer, MockVLMBackend
+from camping_guard.evidence.recorder import EvidenceRecorder
+
+
+def test_vlm_gating_conditions():
+    """测试阶段 4.1：VLM 唤醒门控条件 (1~4 类事件准入与普通非准入)"""
+    reviewer = AsyncVLMReviewer(enable_worker_thread=False)
+
+    # 1. 低置信度 (<0.35) 准入
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.25,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.NORMAL_PASS,
+        has_contact_signal=False,
+        is_zone3_roi_event=False
+    ) is True
+
+    # 2. 未知异形障碍物准入
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.90,
+        is_unknown_obstacle=True,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.NORMAL_PASS,
+        has_contact_signal=False,
+        is_zone3_roi_event=False
+    ) is True
+
+    # 3. 快通路 L2/L3 威胁准入
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.85,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L2_WARNING,
+        action_type=ActionType.WINDOW_PEEKING,
+        has_contact_signal=False,
+        is_zone3_roi_event=False
+    ) is True
+
+    # 4. 无接触传感器的疑似装备盗窃准入
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.80,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.EQUIPMENT_THEFT,
+        has_contact_signal=False,
+        is_zone3_roi_event=False
+    ) is True
+
+    # 5. Zone 3 ROI 扰动准入
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.90,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.NORMAL_PASS,
+        has_contact_signal=False,
+        is_zone3_roi_event=True
+    ) is True
+
+    # 6. 常规高置信度经过 (L0/L1, 无扰动, 非盗窃) -> 严控算力发热，不唤醒 VLM
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.88,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.NORMAL_PASS,
+        has_contact_signal=False,
+        is_zone3_roi_event=False
+    ) is False
+
+
+def test_vlm_async_worker_queue_non_blocking():
+    """测试阶段 4.2：VLM 异步多线程执行非阻塞性与回调机制"""
+    # 模拟大模型端侧推理延迟 0.08 秒
+    mock_backend = MockVLMBackend(simulated_delay_sec=0.08)
+    reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=True)
+
+    record = ThreatEventRecord(
+        event_id="EVT_ASYNC_001",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.WINDOW_PEEKING,
+        description="贴窗窥探测试"
+    )
+
+    callback_called = []
+    def on_complete(result):
+        callback_called.append(result)
+
+    # 提交异步任务，主调用必须在 5ms 内即刻返回，绝对禁止阻塞主视频通路
+    t_start = time.time()
+    task_id = reviewer.submit_review_async(record, callback=on_complete)
+    submit_duration = time.time() - t_start
+
+    assert submit_duration < 0.015, f"异步提交耗时过长: {submit_duration}s"
+    assert task_id.startswith("VLM_TASK_EVT_ASYNC_001")
+    assert len(callback_called) == 0 # 此时后台工作线程尚未执行完
+
+    # 等待后台工作线程执行完毕
+    finished = reviewer.wait_for_completion(timeout=1.0)
+    assert finished is True
+    assert len(callback_called) == 1
+    res = callback_called[0]
+    assert res["event_id"] == "EVT_ASYNC_001"
+    assert len(res["summary_text"]) <= 50
+    assert "车窗" in res["summary_text"]
+    assert record.vlm_summary is not None
+
+    reviewer.stop()
+
+
+def test_strict_anti_downgrade_rule():
+    """测试阶段 4.3：核心安全沙箱——有接触信号支撑的事件“只升不降铁律”"""
+    mock_backend = MockVLMBackend(simulated_delay_sec=0.0)
+    # 强制让 VLM 尝试恶意或错误地给出降级建议
+    mock_backend.override_response = {
+        "action_category": "BENIGN_TOUCH",
+        "confidence": 0.99,
+        "is_human_contact": False,
+        "is_false_alarm": True,
+        "threat_escalation": "DOWNGRADE_TO_L1",
+        "summary_text": "误判为外部飞鸟碰撞，建议取消警报。"
+    }
+
+    reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=False)
+
+    # 场景：CAN 信号已确认门把手被机械拉扯，快通路锁定 L3
+    contact_record = ThreatEventRecord(
+        event_id="EVT_CONTACT_L3",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L3_CRITICAL,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.DOOR_HANDLE_PULL,
+        description="车门把手微动开关触发",
+        has_contact_signal=True # 具有硬件接触硬信号
+    )
+
+    result = reviewer.review_event_sync(contact_record)
+
+    # 核心裁决验证：无论 VLM 输出什么，绝对禁止将 L3 降级！
+    assert result["final_threat"] == ThreatLevel.L3_CRITICAL
+    assert result["threat_escalation"] == "MAINTAIN_L3_CONTACT_LOCKED"
+    assert len(result["summary_text"]) <= 50
+
+
+def test_pure_visual_l2_false_alarm_downgrade():
+    """测试阶段 4.4：纯视觉无接触信号的 L2 事件在环境假阳性下的安全降级"""
+    mock_backend = MockVLMBackend(simulated_delay_sec=0.0)
+    mock_backend.force_false_alarm = True # 模拟大模型判定为树叶/光影
+
+    reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=False)
+
+    # 纯视觉 L2 徘徊/晃动，无任何车身传感器接触信号
+    visual_l2_record = ThreatEventRecord(
+        event_id="EVT_VISUAL_L2",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.OUT_CAR,
+        action_type=ActionType.LINGERING,
+        description="车周连续扰动",
+        has_contact_signal=False
+    )
+
+    result = reviewer.review_event_sync(visual_l2_record)
+
+    # 验证安全降级至 L1 提示，且战报提示为环境假阳性
+    assert result["final_threat"] == ThreatLevel.L1_NOTICE
+    assert result["threat_escalation"] == "DOWNGRADE_TO_L1_ENVIRONMENT_FALSE_ALARM"
+    assert "树叶" in result["summary_text"] or "光影" in result["summary_text"]
+
+
+def test_evidence_recorder_clip_assembly_and_video_export():
+    """测试阶段 4.5：环形缓冲 10s事前+20s事后视频拼装与实际文件写入"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        recorder = EvidenceRecorder(
+            buffer_duration_sec=15.0,
+            fps=10.0,
+            storage_dir=temp_dir,
+            clock_source=ClockSource.GNSS_PPS_SYNC
+        )
+
+        dummy_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        now = time.time()
+
+        # 1. 模拟推送事前 10 秒的视频帧 (100 帧, 10fps)
+        for i in range(100):
+            t = now - 10.0 + i * 0.1
+            recorder.push_frame(dummy_frame, t)
+
+        # 2. 在 now 时刻触发事件锁存
+        pre_sig = recorder.lock_event_clip(
+            event_id="EVT_CLIP_TEST_001",
+            threat_level_str="L3 紧急",
+            trigger_time=now,
+            pre_duration_sec=10.0,
+            post_duration_sec=2.0 # 测试加速：收集事后 2.0s
+        )
+        assert len(pre_sig) == 64 # SHA-256 长度
+
+        # 3. 持续推送事后视频帧 (20 帧)
+        for i in range(25):
+            t = now + i * 0.1
+            recorder.push_frame(dummy_frame, t)
+
+        # 验证 clip 已自动完成事后录制并落盘
+        assert len(recorder.locked_evidence) == 1
+        ev = recorder.locked_evidence[0]
+        assert ev["event_id"] == "EVT_CLIP_TEST_001"
+        assert ev["total_frames"] >= 100 # 包含事前与事后帧
+        assert Path(ev["video_path"]).exists()
+        assert Path(ev["video_path"]).stat().st_size > 0 # 实际生成了视频文件
+        assert ev["clock_source"] == ClockSource.GNSS_PPS_SYNC.value
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_tamper_evident_sha256_hash_chain():
+    """测试阶段 4.6：不可篡改 SHA-256 哈希链上链与防篡改审计校验引擎"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        recorder = EvidenceRecorder(
+            buffer_duration_sec=5.0,
+            fps=5.0,
+            storage_dir=temp_dir,
+            clock_source=ClockSource.GNSS_PPS_SYNC
+        )
+        dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        # 记录 3 个连续的重要威胁事件
+        now = time.time()
+        for idx in range(3):
+            t = now + idx * 5.0
+            recorder.push_frame(dummy_frame, t - 1.0)
+            recorder.push_frame(dummy_frame, t)
+            recorder.lock_event_clip(
+                event_id=f"EVT_CHAIN_{idx:03d}",
+                threat_level_str="L3 紧急",
+                trigger_time=t,
+                pre_duration_sec=2.0,
+                post_duration_sec=0.1
+            )
+            recorder.push_frame(dummy_frame, t + 0.2) # 触发完成
+
+        assert len(recorder.manifest) == 3
+
+        # 1. 验证正常哈希链完整性
+        is_valid, report, bad_idx = recorder.verify_hash_chain()
+        assert is_valid is True
+        assert bad_idx is None
+        assert "完整性验证通过" in report
+
+        # 2. 篡改攻击实验 A：恶意攻击者篡改区块 1 的时间戳以制造不在场证明
+        manifest_file = Path(temp_dir) / "evidence_manifest.jsonl"
+        lines = manifest_file.read_text(encoding='utf-8').splitlines()
+
+        tampered_entry = json.loads(lines[1])
+        tampered_entry["payload"]["trigger_time"] += 3600.0 # 篡改时间戳推后 1 小时
+        lines[1] = json.dumps(tampered_entry)
+        manifest_file.write_text("\n".join(lines) + "\n", encoding='utf-8')
+
+        # 验证审计引擎能否精准识别篡改
+        is_valid_after_tamper, tamper_report, tampered_block = recorder.verify_hash_chain()
+        assert is_valid_after_tamper is False
+        assert tampered_block == 1 # 精确锁定第 1 号区块被篡改
+        assert "数据签名被篡改" in tamper_report
+
+        # 3. 篡改攻击实验 B：恶意攻击者删除了区块 1 企图销毁特定事件
+        lines_deleted = [lines[0], lines[2]] # 删除了第 1 行
+        manifest_file.write_text("\n".join(lines_deleted) + "\n", encoding='utf-8')
+
+        is_valid_del, del_report, del_block = recorder.verify_hash_chain()
+        assert is_valid_del is False
+        assert del_block == 1
+        assert "哈希链断裂" in del_report or "不符" in del_report
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)

@@ -1,0 +1,337 @@
+"""
+环形视频缓冲、事件录像锁存与防篡改存证模块 (阶段 4)
+实现事前 10s 至事后 20s 视频截取、GNSS 授时固化、SHA-256 哈希链防篡改与完整性校验
+"""
+
+import collections
+import hashlib
+import time
+import json
+import os
+import queue
+import threading
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+import numpy as np
+import cv2
+
+from camping_guard.types import ClockSource
+
+
+class PendingClip:
+    """正在持续收集事后录像的事件切片"""
+    def __init__(
+        self,
+        event_id: str,
+        threat_level_str: str,
+        trigger_time: float,
+        post_end_time: float,
+        pre_frames: List[Tuple[float, np.ndarray]],
+        clock_source: ClockSource
+    ):
+        self.event_id = event_id
+        self.threat_level_str = threat_level_str
+        self.trigger_time = trigger_time
+        self.post_end_time = post_end_time
+        self.pre_frames = pre_frames
+        self.post_frames: List[Tuple[float, np.ndarray]] = []
+        self.clock_source = clock_source
+        self.is_finalized = False
+
+
+class EvidenceRecorder:
+    """
+    证据链管理与防篡改存证引擎
+    维护高可靠滚动内存环形缓冲，并在触发威胁时构建可审计的不可篡改证据链
+    """
+    GENESIS_HASH = "GENESIS_BLOCK_HASH_CAMPING_GUARD_2026"
+
+    def __init__(
+        self,
+        buffer_duration_sec: float = 15.0,
+        fps: float = 10.0,
+        storage_dir: Optional[str] = None,
+        clock_source: ClockSource = ClockSource.GNSS_PPS_SYNC,
+        async_encoding: bool = False
+    ):
+        """
+        :param buffer_duration_sec: 内存环形缓冲长度 (秒)
+        :param fps: 录像帧率
+        :param storage_dir: 加密/安全存储目录 (模拟车端 eMMC secure partition)
+        :param clock_source: 当前硬件授时源
+        :param async_encoding: 是否开启后台独立工作线程异步编码落盘 (避免阻塞主视觉流水线)
+        """
+        self.buffer_size = int(buffer_duration_sec * fps)
+        self.fps = fps
+        self.clock_source = clock_source
+        self.async_encoding = async_encoding
+
+        # 环形视频帧队列: [(timestamp, frame)]
+        self.ring_buffer: collections.deque = collections.deque(maxlen=self.buffer_size)
+
+        # 正在追踪中的事后录像
+        self.pending_clips: Dict[str, PendingClip] = {}
+
+        # 已锁存并落盘的事件存证清单
+        self.locked_evidence: List[Dict[str, Any]] = []
+
+        # 防篡改哈希链
+        self.prev_hash = self.GENESIS_HASH
+        self.manifest: List[Dict[str, Any]] = []
+
+        # 线程安全锁与异步工作队列
+        self._lock = threading.Lock()
+        self._encode_queue: Optional[queue.Queue] = None
+        self._worker_thread: Optional[threading.Thread] = None
+
+        if self.async_encoding:
+            self._encode_queue = queue.Queue()
+            self._worker_thread = threading.Thread(
+                target=self._async_encode_worker,
+                daemon=True,
+                name="EvidenceRecorder_Worker"
+            )
+            self._worker_thread.start()
+
+        # 存储路径
+        if storage_dir is None:
+            self.storage_dir = Path("./secure_storage/events")
+        else:
+            self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest_file = self.storage_dir / "evidence_manifest.jsonl"
+
+    def _async_encode_worker(self):
+        """后台独立工作线程：从队列消费待持久化的切片，执行视频编码与哈希计算"""
+        while True:
+            try:
+                event_id = self._encode_queue.get()
+                if event_id is None:
+                    break
+                self._do_finalize_clip(event_id)
+                self._encode_queue.task_done()
+            except Exception as e:
+                print(f"[EvidenceRecorder] 后台视频编码落盘异常: {e}")
+
+    def flush(self, timeout: float = 5.0):
+        """等待所有后台录像切片完成视频编码与哈希上链"""
+        if self.async_encoding and self._encode_queue:
+            self._encode_queue.join()
+
+    def push_frame(self, frame: np.ndarray, current_time: float):
+        """
+        持续将低码率/高清画面写入环形缓冲，并喂给所有正在录制事后视频的切片
+        """
+        frame_copy = frame.copy()
+        self.ring_buffer.append((current_time, frame_copy))
+
+        # 推进所有待完成的事后录像切片
+        completed_ids = []
+        with self._lock:
+            for event_id, pending in self.pending_clips.items():
+                if not pending.is_finalized:
+                    pending.post_frames.append((current_time, frame_copy))
+                    if current_time >= pending.post_end_time:
+                        completed_ids.append(event_id)
+
+        for event_id in completed_ids:
+            if self.async_encoding and self._encode_queue:
+                pending = self.pending_clips.get(event_id)
+                if pending and not pending.is_finalized:
+                    pending.is_finalized = True
+                    self._encode_queue.put(event_id)
+            else:
+                self.finalize_clip(event_id)
+
+    def lock_event_clip(
+        self,
+        event_id: str,
+        threat_level_str: str,
+        trigger_time: float,
+        pre_duration_sec: float = 10.0,
+        post_duration_sec: float = 20.0,
+        clock_source: Optional[ClockSource] = None
+    ) -> str:
+        """
+        触发事件录像锁存：
+        提取触发前 10 秒缓冲区数据，并注册事后持续录制 20 秒的任务
+        返回当前切片的初步安全签名
+        """
+        actual_clock = clock_source or self.clock_source
+        pre_start_time = trigger_time - pre_duration_sec
+        post_end_time = trigger_time + post_duration_sec
+
+        # 提取事前 10 秒内已缓存的所有视频帧
+        pre_frames = [
+            (t, f) for t, f in self.ring_buffer
+            if t >= pre_start_time and t <= trigger_time
+        ]
+
+        pending = PendingClip(
+            event_id=event_id,
+            threat_level_str=threat_level_str,
+            trigger_time=trigger_time,
+            post_end_time=post_end_time,
+            pre_frames=pre_frames,
+            clock_source=actual_clock
+        )
+        self.pending_clips[event_id] = pending
+
+        # 计算初步签名 (锁存预哈希)
+        pre_hash = hashlib.sha256(
+            f"{event_id}|{threat_level_str}|{trigger_time:.3f}|{len(pre_frames)}|{self.prev_hash}".encode('utf-8')
+        ).hexdigest()
+        return pre_hash
+
+    def finalize_clip(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """
+        完成并封装事件录像 (事前 10s + 事后 20s 拼装)
+        执行实际视频编码落盘与 SHA-256 哈希链上链签署
+        """
+        return self._do_finalize_clip(event_id)
+
+    def _do_finalize_clip(self, event_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            pending = self.pending_clips.get(event_id)
+            if pending is None:
+                return None
+            # 若已在 locked_evidence 中落盘过则直接返回
+            for ev in self.locked_evidence:
+                if ev["event_id"] == event_id:
+                    return ev
+            pending.is_finalized = True
+
+        all_frames = pending.pre_frames + pending.post_frames
+
+        # 1. 编码生成视频文件
+        video_filename = f"{event_id}_{int(pending.trigger_time)}.mp4"
+        video_path = self.storage_dir / video_filename
+
+        frame_h, frame_w = 480, 640
+        if len(all_frames) > 0 and all_frames[0][1] is not None:
+            frame_h, frame_w = all_frames[0][1].shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out_writer = cv2.VideoWriter(str(video_path), fourcc, self.fps, (frame_w, frame_h))
+        if not out_writer.isOpened():
+            # 降级尝试 MJPG 编码
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            video_filename = f"{event_id}_{int(pending.trigger_time)}.avi"
+            video_path = self.storage_dir / video_filename
+            out_writer = cv2.VideoWriter(str(video_path), fourcc, self.fps, (frame_w, frame_h))
+
+        if out_writer.isOpened():
+            for _, frm in all_frames:
+                out_writer.write(frm)
+            out_writer.release()
+        else:
+            # 兼容无编码器环境：写入元数据占位文件
+            video_path.write_bytes(f"MOCK_VIDEO_DATA_{event_id}_{len(all_frames)}".encode('utf-8'))
+
+        # 2. 计算视频文件的完整 SHA-256 校验和
+        video_bytes = video_path.read_bytes()
+        video_file_hash = hashlib.sha256(video_bytes).hexdigest()
+
+        # 3. 构造防篡改哈希区块 (Hash Chain Block) - 线程安全写入
+        with self._lock:
+            block_index = len(self.manifest)
+            formatted_iso_time = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(pending.trigger_time))
+            formatted_iso_time += f".{int((pending.trigger_time % 1) * 1000):03d}Z"
+
+            block_payload = {
+                "block_index": block_index,
+                "event_id": pending.event_id,
+                "threat_level": pending.threat_level_str,
+                "trigger_time": round(pending.trigger_time, 3),
+                "trigger_time_iso": formatted_iso_time,
+                "clock_source": pending.clock_source.value,
+                "pre_frame_count": len(pending.pre_frames),
+                "post_frame_count": len(pending.post_frames),
+                "total_frame_count": len(all_frames),
+                "video_file_name": video_filename,
+                "video_file_sha256": video_file_hash,
+                "prev_hash": self.prev_hash
+            }
+
+            # 严格按字段排序序列化计算区块哈希
+            payload_serialized = json.dumps(block_payload, sort_keys=True)
+            block_hash = hashlib.sha256(payload_serialized.encode('utf-8')).hexdigest()
+
+            # 更新哈希链头指针
+            self.prev_hash = block_hash
+
+            manifest_entry = {
+                "block_hash": block_hash,
+                "payload": block_payload
+            }
+            self.manifest.append(manifest_entry)
+
+            # 追加写入持久化清单文件
+            with open(self.manifest_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(manifest_entry, ensure_ascii=False) + "\n")
+
+            evidence_record = {
+                "event_id": pending.event_id,
+                "threat_level": pending.threat_level_str,
+                "trigger_time": pending.trigger_time,
+                "video_path": str(video_path),
+                "video_file_sha256": video_file_hash,
+                "block_hash": block_hash,
+                "clock_source": pending.clock_source.value,
+                "total_frames": len(all_frames),
+                "is_locked": True
+            }
+            self.locked_evidence.append(evidence_record)
+            return evidence_record
+
+    def verify_hash_chain(self, manifest_path: Optional[str] = None) -> Tuple[bool, str, Optional[int]]:
+        """
+        审计与校验防篡改哈希链完整性 (Tamper-Evidence Verification)
+        验证每一区块的 prev_hash 是否连续匹配，以及 payload 哈希签名是否一致
+        :return: (is_valid, report_message, tampered_block_index)
+        """
+        target_path = Path(manifest_path) if manifest_path else self.manifest_file
+        if not target_path.exists():
+            if len(self.manifest) == 0:
+                return (True, "清单为空，无记录需要验证", None)
+            entries = self.manifest
+        else:
+            entries = []
+            with open(target_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entries.append(json.loads(line))
+
+        if not entries:
+            return (True, "存证清单为空", None)
+
+        expected_prev_hash = self.GENESIS_HASH
+
+        for idx, entry in enumerate(entries):
+            block_hash = entry.get("block_hash")
+            payload = entry.get("payload", {})
+
+            # 1. 验证前序哈希链接
+            if payload.get("prev_hash") != expected_prev_hash:
+                return (
+                    False,
+                    f"哈希链断裂！区块 [{idx}] 的 prev_hash ({payload.get('prev_hash')}) 与预期上一区块哈希 ({expected_prev_hash}) 不符！存在非法篡改或条目被删除！",
+                    idx
+                )
+
+            # 2. 重新计算当前区块哈希并核对签名
+            recomputed_hash = hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode('utf-8')
+            ).hexdigest()
+
+            if recomputed_hash != block_hash:
+                return (
+                    False,
+                    f"数据签名被篡改！区块 [{idx}] (Event: {payload.get('event_id')}) 重新计算的 SHA-256 ({recomputed_hash}) 与记录的区块签名 ({block_hash}) 不匹配！",
+                    idx
+                )
+
+            expected_prev_hash = block_hash
+
+        return (True, f"存证哈希链完整性验证通过！共审计 {len(entries)} 个区块，链条未受任何篡改。", None)

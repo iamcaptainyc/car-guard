@@ -1,0 +1,63 @@
+# Python Cache & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.venv/
+env/
+venv/
+
+# Deep Learning Models & Weights (严禁入库大模型权重)
+models/
+*.onnx
+*.engine
+*.pt
+*.pth
+*.bin
+*.weights
+*.param
+*.tflite
+
+# Video & Image Data Files (严禁入库测试媒体数据)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.raw
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+calib_data_8155/
+
+# Temporary, Logs & Output Dirs
+tmp/
+outputs/
+secure_storage/
+*.log
+debug_*
+frame_*.jpg
+annotated_result*.jpg
+
+# C++ Build & Binaries
+build/
+bin/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+benchmark_cpp/build/
+test_serial_trt
+
+# IDE & Tool configurations
+.idea/
+.vscode/
+.claude/
+.omc/
+.codex/
+AGENTS.md

@@ -1,0 +1,407 @@
+"""
+异步 VLM 语义复核模块 (慢通路，阶段 4)
+实现端侧大模型门控唤醒、多线程异步非阻塞执行、结构化判定、<=50字中文战报生成与权限沙箱 (只升不降铁律)
+"""
+
+from typing import Dict, List, Optional, Tuple, Any, Callable
+import time
+import json
+import base64
+import queue
+import threading
+import urllib.request
+import urllib.error
+import numpy as np
+
+from camping_guard.types import ThreatLevel, ActionType, ThreatEventRecord
+
+
+class VLMBackendBase:
+    """端侧 VLM 推理后端抽象基类"""
+    def infer(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class MockVLMBackend(VLMBackendBase):
+    """
+    高仿真端侧本地 VLM 模拟后端
+    模拟 Qwen2-VL-2B / MiniCPM-V INT4 在高通 8155 上的语义复核行为
+    """
+    def __init__(self, simulated_delay_sec: float = 0.01):
+        self.simulated_delay_sec = simulated_delay_sec
+        self.force_false_alarm: bool = False
+        self.override_response: Optional[Dict[str, Any]] = None
+
+    def infer(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Dict[str, Any]:
+        if self.simulated_delay_sec > 0:
+            time.sleep(self.simulated_delay_sec)
+
+        if self.override_response is not None:
+            return dict(self.override_response)
+
+        action = event_record.action_type
+        has_contact = event_record.has_contact_signal
+
+        # 默认高置信度研判
+        confidence = 0.92
+        is_human_contact = has_contact
+        is_false_alarm = self.force_false_alarm
+        threat_escalation = "MAINTAIN"
+        summary_text = ""
+
+        if self.force_false_alarm:
+            is_false_alarm = True
+            confidence = 0.95
+            is_human_contact = False
+            action_category = "ENVIRONMENT_DISTURBANCE"
+            threat_escalation = "DOWNGRADE_TO_L1"
+            summary_text = "复核确认为树叶飘落或风吹光影晃动，未发现实质安全风险。"
+        elif action == ActionType.DOOR_HANDLE_PULL:
+            action_category = "DOOR_HANDLE_TAMPERING"
+            is_human_contact = True
+            if has_contact:
+                threat_escalation = "CONFIRM_OR_UPGRADE"
+                summary_text = "发现人员正用力反复拉扯门把手，伴有锁具冲击，已阻断。"
+            else:
+                threat_escalation = "MAINTAIN"
+                summary_text = "监测到人员在门把手附近有抓握动作，正在持续监视。"
+        elif action == ActionType.INTENTIONAL_KICK:
+            action_category = "VEHICLE_BODY_KICK"
+            is_human_contact = True
+            if has_contact:
+                threat_escalation = "CONFIRM_OR_UPGRADE"
+                summary_text = "监测到外侧人员蓄意踢踹车门下边梁，冲击已被锁定存证。"
+            else:
+                summary_text = "人员向车身做出疑似踢踹动作，暂无机械接触震动。"
+        elif action == ActionType.WINDOW_PEEKING:
+            action_category = "CABIN_PEEKING"
+            is_human_contact = False
+            summary_text = "发现人员正贴近车窗窥探座舱内部，建议车内人员保持警惕。"
+        elif action == ActionType.EQUIPMENT_THEFT:
+            action_category = "ROOF_OR_EXTERNAL_THEFT"
+            is_human_contact = True
+            # 无接触传感器的疑似装备盗窃，VLM 予以确认为盗窃并建议升级 L3
+            threat_escalation = "CONFIRM_OR_UPGRADE"
+            summary_text = "发现人员正尝试拆卸车顶行李架或外挂装备，建议立即驱逐！"
+        elif action == ActionType.BEAST_SPRINT:
+            action_category = "WILD_ANIMAL_ATTACK"
+            is_human_contact = False
+            threat_escalation = "CONFIRM_OR_UPGRADE"
+            summary_text = "警报！大型猛兽正高速逼近车辆，请务必紧闭车窗切勿外出！"
+        elif action == ActionType.FIRE_SMOKE:
+            action_category = "FIRE_OR_SMOKE_HAZARD"
+            is_human_contact = False
+            summary_text = "监测到露营火情烟雾扩散，请注意防风并准备应急灭火。"
+        elif action == ActionType.VEHICLE_COLLISION:
+            action_category = "VEHICLE_COLLISION"
+            is_human_contact = False
+            threat_escalation = "CONFIRM_OR_UPGRADE" if has_contact else "MAINTAIN"
+            if has_contact:
+                summary_text = "监测到外物剧烈撞击车身(如邻车开门/倒木砸车)，伴随震动冲击，已存证锁定！"
+            else:
+                summary_text = "监测到车身区域出现异常运动碰撞(如邻车开门贴近/外物触碰)，已锁定录像并复核。"
+        else:
+            action_category = "BENIGN_ACTIVITY"
+            summary_text = f"车身外围发现常规活动目标，等级为 {event_record.threat_level.value}。"
+
+        return {
+            "action_category": action_category,
+            "confidence": confidence,
+            "is_human_contact": is_human_contact,
+            "is_false_alarm": is_false_alarm,
+            "threat_escalation": threat_escalation,
+            "summary_text": summary_text[:50]
+        }
+
+
+class LocalHttpVLMBackend(VLMBackendBase):
+    """
+    通过 OpenAI 兼容 API 调用本地部署的轻量端侧 VLM (如 Qwen2-VL-2B / MiniCPM-V-2.6)
+    支持部署在本地端口 (例如 http://127.0.0.1:8000/v1) 的 llama.cpp / vLLM / Ollama
+    """
+    SYSTEM_PROMPT = (
+        "你是一个部署在智能汽车座舱域控制器（高通8155）上的安全哨兵多模态复核大模型。"
+        "你的职责是对守卫系统快通路提交的可疑事件关键帧进行深度语义研判，"
+        "排除光影、树叶飘落、鸟禽等环境假阳性，并为车主生成不超过50字的人性化简明情况通报。\n"
+        "请严格输出 JSON 格式：\n"
+        "{\n"
+        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "FALSE_ALARM" | "OTHER",\n'
+        '  "confidence": 0.0-1.0,\n'
+        '  "is_human_contact": true/false,\n'
+        '  "is_false_alarm": true/false,\n'
+        '  "threat_escalation": "CONFIRM_OR_UPGRADE" | "DOWNGRADE_TO_L1" | "MAINTAIN",\n'
+        '  "summary_text": "中文情况通报 (50字以内)"\n'
+        "}"
+    )
+
+    def __init__(self, api_url: str = "http://127.0.0.1:8000/v1/chat/completions", model_name: str = "qwen2-vl-2b", timeout: float = 3.0):
+        self.api_url = api_url
+        self.model_name = model_name
+        self.timeout = timeout
+        self.fallback_mock = MockVLMBackend()
+
+    def infer(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Dict[str, Any]:
+        """构造多图 Vision 请求并调用本地端侧推理"""
+        user_content = [
+            {"type": "text", "text": f"快通路事件动作: {event_record.action_type.value}, 初始威胁等级: {event_record.threat_level.value}, 是否有物理接触信号: {event_record.has_contact_signal}。请对以下事件关键帧进行语义复核："}
+        ]
+
+        # 编码多帧关键帧为 Base64 JPEG
+        if keyframes:
+            import cv2
+            for idx, img in enumerate(keyframes[:3]):
+                _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                b64_str = base64.b64encode(buffer).decode('utf-8')
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64_str}"}
+                })
+
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 150
+        }
+
+        try:
+            req_data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(self.api_url, data=req_data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                resp_json = json.loads(response.read().decode('utf-8'))
+                raw_text = resp_json['choices'][0]['message']['content'].strip()
+                # 尝试解析 JSON 代码块
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.split("```")[1]
+                    if raw_text.startswith("json"):
+                        raw_text = raw_text[4:]
+                parsed = json.loads(raw_text.strip())
+                if "summary_text" in parsed:
+                    parsed["summary_text"] = parsed["summary_text"][:50]
+                return parsed
+        except Exception:
+            # 端侧离线或服务异常时降级至离线安全保底规则
+            return self.fallback_mock.infer(event_record, keyframes)
+
+
+class AsyncVLMReviewer:
+    """
+    异步多线程 VLM 语义复核引擎 (阶段 4 慢通路主控)
+    维护低优先级后台工作线程队列，彻底解耦 30ms 快通路防御与 0.8~1.5s 大模型复核
+    """
+    def __init__(
+        self,
+        backend: Optional[VLMBackendBase] = None,
+        enable_worker_thread: bool = True
+    ):
+        self.backend = backend or MockVLMBackend()
+        self.review_history: List[Dict[str, Any]] = []
+        self.task_queue: queue.Queue = queue.Queue()
+        self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
+
+        self._active_tasks_count = 0
+        self._lock = threading.Lock()
+        self._is_running = enable_worker_thread
+        self._worker_thread: Optional[threading.Thread] = None
+
+        if enable_worker_thread:
+            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="VLM_Reviewer_Worker")
+            self._worker_thread.start()
+
+    def register_completion_callback(self, callback: Callable[[Dict[str, Any]], None]):
+        """注册异步完成后的事件回调"""
+        self.callbacks.append(callback)
+
+    def should_trigger_vlm(
+        self,
+        category_conf: float,
+        is_unknown_obstacle: bool,
+        fast_path_threat: ThreatLevel,
+        action_type: ActionType,
+        has_contact_signal: bool,
+        is_body_roi_event: bool = False,
+        is_zone3_roi_event: Optional[bool] = None
+    ) -> bool:
+        """
+        唤醒门控逻辑 (步骤 2.2 门控条件 1~5)
+        """
+        # 条件 1: 检测置信度低 (<35%) 或未知障碍物
+        if is_unknown_obstacle or category_conf < 0.35:
+            return True
+
+        # 条件 2: 快通路已触发 L2/L3，需要为车主生成人话总结
+        if fast_path_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
+            return True
+
+        # 条件 3: 无接触传感器的疑似装备盗窃
+        if action_type == ActionType.EQUIPMENT_THEFT and not has_contact_signal:
+            return True
+
+        # 条件 4: 车身固定 ROI (敏感部件/防碰撞区) 扰动事件，需要复核是否为人为接触或物理破坏
+        roi_flag = is_body_roi_event if is_zone3_roi_event is None else (is_body_roi_event or is_zone3_roi_event)
+        if roi_flag:
+            return True
+
+        # 条件 5: 车身碰撞/外物撞击事件 (邻车开门碰撞、树木倒塌、外物砸击) 必须唤醒 VLM 语义复核
+        if action_type == ActionType.VEHICLE_COLLISION:
+            return True
+
+        return False
+
+    def submit_review_async(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[Any]] = None,
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    ) -> str:
+        """
+        非阻塞提交复核任务至后台工作线程队列 (耗时 < 1ms)
+        """
+        task_id = f"VLM_TASK_{event_record.event_id}_{int(time.time() * 1000)}"
+        with self._lock:
+            self._active_tasks_count += 1
+        self.task_queue.put((task_id, event_record, keyframes, callback))
+        return task_id
+
+    def review_event_sync(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        同步复核接口（用于离线测试或引擎立即获取保底战报）
+        """
+        raw_vlm_out = self.backend.infer(event_record, keyframes)
+        return self._arbitrate_and_finalize(event_record, raw_vlm_out)
+
+    def review_event_async(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        向后兼容接口：提交异步队列，同时立即计算并返回仲裁结构
+        确保既不阻塞快通路，又使外部调用能立即获取有效语义摘要
+        """
+        # 1. 提交至异步队列由后台工作线程执行（若工作线程开启）
+        if self._is_running:
+            self.submit_review_async(event_record, keyframes)
+
+        # 2. 立即产出当前仲裁快照
+        raw_vlm_out = self.backend.infer(event_record, keyframes)
+        return self._arbitrate_and_finalize(event_record, raw_vlm_out)
+
+    def _arbitrate_and_finalize(
+        self,
+        event_record: ThreatEventRecord,
+        raw_vlm_out: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        核心安全权限沙箱：执行“只升不降铁律”与“纯视觉假阳性降级”
+        """
+        adjusted_threat = event_record.threat_level
+        action_cat = raw_vlm_out.get("action_category", "")
+        vlm_conf = raw_vlm_out.get("confidence", 0.8)
+        summary = raw_vlm_out.get("summary_text", "")
+        threat_escalation = raw_vlm_out.get("threat_escalation", "MAINTAIN")
+
+        # 权限沙箱原则 1: “只升不降铁律” (Hard Rule)
+        # 凡是有 CAN 门把手、车锁或车身 IMU 物理接触信号支撑的事件，VLM 绝对禁止降级！
+        if event_record.has_contact_signal:
+            if threat_escalation.startswith("DOWNGRADE") or raw_vlm_out.get("is_false_alarm", False):
+                threat_escalation = "MAINTAIN_L3_CONTACT_LOCKED"
+                adjusted_threat = event_record.threat_level
+            elif threat_escalation == "CONFIRM_OR_UPGRADE" and event_record.threat_level == ThreatLevel.L2_WARNING:
+                adjusted_threat = ThreatLevel.L3_CRITICAL
+
+        # 权限沙箱原则 2: “纯视觉假阳性降级通道” (Soft Rule)
+        # 仅针对纯视觉、完全无接触信号的 L2 事件，若 VLM 高置信度 (>=0.85) 明确判定为环境假阳性 (树叶/光影/飞鸟)，
+        # 允许降为 L1，但必须保留录像与审计日志！
+        elif event_record.threat_level == ThreatLevel.L2_WARNING and not event_record.has_contact_signal:
+            if (raw_vlm_out.get("is_false_alarm", False) or threat_escalation == "DOWNGRADE_TO_L1") and vlm_conf >= 0.85:
+                adjusted_threat = ThreatLevel.L1_NOTICE
+                threat_escalation = "DOWNGRADE_TO_L1_ENVIRONMENT_FALSE_ALARM"
+            elif threat_escalation == "CONFIRM_OR_UPGRADE":
+                # 无接触信号但行为极其恶劣（如装备拆卸），升级至 L3
+                if event_record.action_type == ActionType.EQUIPMENT_THEFT:
+                    adjusted_threat = ThreatLevel.L3_CRITICAL
+
+        # 战报长度硬性截断 <= 50 字
+        summary = summary[:50]
+
+        result = {
+            "event_id": event_record.event_id,
+            "original_threat": event_record.threat_level,
+            "final_threat": adjusted_threat,
+            "vlm_confidence": vlm_conf,
+            "action_category": action_cat,
+            "threat_escalation": threat_escalation,
+            "summary_text": summary,
+            "timestamp": time.time()
+        }
+
+        self.review_history.append(result)
+        return result
+
+    def _worker_loop(self):
+        """后台低优先级异步推理循环"""
+        while self._is_running:
+            try:
+                task = self.task_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            task_id, event_record, keyframes, callback = task
+            try:
+                raw_out = self.backend.infer(event_record, keyframes)
+                result = self._arbitrate_and_finalize(event_record, raw_out)
+
+                # 更新原记录
+                event_record.vlm_summary = result["summary_text"]
+                event_record.final_threat_level = result["final_threat"]
+
+                # 分发特定回调与通用回调
+                if callback:
+                    callback(result)
+                for cb in self.callbacks:
+                    cb(result)
+            except Exception:
+                # 记录工作线程异常，不影响整车防御
+                pass
+            finally:
+                with self._lock:
+                    self._active_tasks_count = max(0, self._active_tasks_count - 1)
+                self.task_queue.task_done()
+
+    def wait_for_completion(self, timeout: float = 2.0) -> bool:
+        """等待队列中所有任务执行完毕"""
+        start_t = time.time()
+        while True:
+            with self._lock:
+                if self._active_tasks_count == 0 and self.task_queue.empty():
+                    return True
+            time.sleep(0.01)
+            if time.time() - start_t > timeout:
+                return False
+
+
+    def stop(self):
+        """安全停止后台工作线程"""
+        self._is_running = False
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)

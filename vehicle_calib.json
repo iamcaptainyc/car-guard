@@ -1,0 +1,647 @@
+{
+  "vehicle_info": {
+    "model_name": "SUV_Camping_Guard_Edition",
+    "vin": "VIN_8155_2026_TEST_001",
+    "wheelbase_m": 2.95,
+    "width_m": 1.98,
+    "length_m": 4.98
+  },
+  "cameras": {
+    "0": {
+      "camera_id": 0,
+      "name": "front_fisheye",
+      "install_pos_m": [
+        2.45,
+        0.0,
+        0.85
+      ],
+      "camera_height_m": 0.85,
+      "camera_pitch_deg": -12.0,
+      "camera_yaw_deg": 0.0,
+      "camera_roll_deg": 0.0,
+      "fov_deg": 190.0,
+      "resolution": [
+        640,
+        480
+      ],
+      "vehicle_body_side": "front",
+      "zone1_polygon": [
+        [
+          64,
+          168
+        ],
+        [
+          576,
+          168
+        ],
+        [
+          627,
+          456
+        ],
+        [
+          13,
+          456
+        ]
+      ],
+      "zone2_polygon": [
+        [
+          140,
+          240
+        ],
+        [
+          500,
+          240
+        ],
+        [
+          588,
+          456
+        ],
+        [
+          52,
+          456
+        ]
+      ]
+    },
+    "1": {
+      "camera_id": 1,
+      "name": "left_mirror_fisheye",
+      "install_pos_m": [
+        0.85,
+        1.02,
+        1.0
+      ],
+      "camera_height_m": 1.0,
+      "camera_pitch_deg": -55.0,
+      "camera_yaw_deg": 112.0,
+      "camera_roll_deg": -5.0,
+      "fov_deg": 190.0,
+      "resolution": [
+        640,
+        480
+      ],
+      "vehicle_body_side": "left",
+      "zone1_polygon": [
+        [
+          120,
+          125
+        ],
+        [
+          145,
+          106
+        ],
+        [
+          179,
+          88
+        ],
+        [
+          218,
+          74
+        ],
+        [
+          255,
+          67
+        ],
+        [
+          293,
+          66
+        ],
+        [
+          336,
+          72
+        ],
+        [
+          375,
+          84
+        ],
+        [
+          406,
+          98
+        ],
+        [
+          436,
+          116
+        ],
+        [
+          469,
+          142
+        ],
+        [
+          501,
+          175
+        ],
+        [
+          526,
+          209
+        ],
+        [
+          545,
+          244
+        ],
+        [
+          566,
+          296
+        ],
+        [
+          578,
+          346
+        ],
+        [
+          583,
+          391
+        ],
+        [
+          583,
+          391
+        ],
+        [
+          576,
+          357
+        ],
+        [
+          559,
+          309
+        ],
+        [
+          544,
+          277
+        ],
+        [
+          526,
+          248
+        ],
+        [
+          508,
+          223
+        ],
+        [
+          480,
+          193
+        ],
+        [
+          455,
+          170
+        ],
+        [
+          407,
+          137
+        ],
+        [
+          370,
+          118
+        ],
+        [
+          334,
+          106
+        ],
+        [
+          302,
+          98
+        ],
+        [
+          253,
+          92
+        ],
+        [
+          211,
+          95
+        ],
+        [
+          174,
+          102
+        ],
+        [
+          152,
+          110
+        ],
+        [
+          120,
+          125
+        ]
+      ],
+      "zone2_polygon": [
+        [
+          120,
+          125
+        ],
+        [
+          152,
+          110
+        ],
+        [
+          174,
+          102
+        ],
+        [
+          211,
+          95
+        ],
+        [
+          253,
+          92
+        ],
+        [
+          302,
+          98
+        ],
+        [
+          334,
+          106
+        ],
+        [
+          370,
+          118
+        ],
+        [
+          407,
+          137
+        ],
+        [
+          455,
+          170
+        ],
+        [
+          480,
+          193
+        ],
+        [
+          508,
+          223
+        ],
+        [
+          526,
+          248
+        ],
+        [
+          544,
+          277
+        ],
+        [
+          559,
+          309
+        ],
+        [
+          576,
+          357
+        ],
+        [
+          583,
+          391
+        ],
+        [
+          639,
+          461
+        ],
+        [
+          391,
+          444
+        ],
+        [
+          245,
+          318
+        ],
+        [
+          145,
+          140
+        ]
+      ]
+    },
+    "2": {
+      "camera_id": 2,
+      "name": "right_mirror_fisheye",
+      "install_pos_m": [
+        0.85,
+        -1.02,
+        1.15
+      ],
+      "camera_height_m": 1.15,
+      "camera_pitch_deg": -38.0,
+      "camera_yaw_deg": -90.0,
+      "camera_roll_deg": 0.0,
+      "fov_deg": 190.0,
+      "resolution": [
+        640,
+        480
+      ],
+      "vehicle_body_side": "right",
+      "zone1_polygon": [
+        [
+          40,
+          140
+        ],
+        [
+          600,
+          140
+        ],
+        [
+          620,
+          360
+        ],
+        [
+          20,
+          360
+        ]
+      ],
+      "zone2_polygon": [
+        [
+          80,
+          200
+        ],
+        [
+          560,
+          200
+        ],
+        [
+          600,
+          440
+        ],
+        [
+          40,
+          440
+        ]
+      ]
+    },
+    "3": {
+      "camera_id": 3,
+      "name": "rear_fisheye",
+      "install_pos_m": [
+        -2.45,
+        0.0,
+        0.95
+      ],
+      "camera_height_m": 0.95,
+      "camera_pitch_deg": -35.0,
+      "camera_yaw_deg": 180.0,
+      "camera_roll_deg": 0.0,
+      "fov_deg": 190.0,
+      "resolution": [
+        640,
+        480
+      ],
+      "vehicle_body_side": "rear",
+      "zone1_polygon": [
+        [
+          64,
+          168
+        ],
+        [
+          576,
+          168
+        ],
+        [
+          627,
+          456
+        ],
+        [
+          13,
+          456
+        ]
+      ],
+      "zone2_polygon": [
+        [
+          140,
+          240
+        ],
+        [
+          500,
+          240
+        ],
+        [
+          588,
+          456
+        ],
+        [
+          52,
+          456
+        ]
+      ]
+    }
+  },
+  "zone3_rois": [
+    {
+      "roi_id": "handle_fl",
+      "name": "左前门把手",
+      "camera_id": 1,
+      "polygon": [
+        [
+          160,
+          260
+        ],
+        [
+          220,
+          260
+        ],
+        [
+          220,
+          310
+        ],
+        [
+          160,
+          310
+        ]
+      ],
+      "threshold_ratio": 0.1,
+      "confirm_frames": 2
+    },
+    {
+      "roi_id": "handle_rl",
+      "name": "左后门把手",
+      "camera_id": 1,
+      "polygon": [
+        [
+          380,
+          260
+        ],
+        [
+          440,
+          260
+        ],
+        [
+          440,
+          310
+        ],
+        [
+          380,
+          310
+        ]
+      ],
+      "threshold_ratio": 0.1,
+      "confirm_frames": 2
+    },
+    {
+      "roi_id": "charge_port",
+      "name": "快慢充电口",
+      "camera_id": 1,
+      "polygon": [
+        [
+          520,
+          240
+        ],
+        [
+          580,
+          240
+        ],
+        [
+          580,
+          320
+        ],
+        [
+          520,
+          320
+        ]
+      ],
+      "threshold_ratio": 0.12,
+      "confirm_frames": 2
+    },
+    {
+      "roi_id": "trunk_lock",
+      "name": "后备箱开关与锁扣",
+      "camera_id": 3,
+      "polygon": [
+        [
+          270,
+          280
+        ],
+        [
+          370,
+          280
+        ],
+        [
+          370,
+          350
+        ],
+        [
+          270,
+          350
+        ]
+      ],
+      "threshold_ratio": 0.12,
+      "confirm_frames": 2
+    },
+    {
+      "roi_id": "roof_rack",
+      "name": "车顶行李架与外挂自行车",
+      "camera_id": 3,
+      "polygon": [
+        [
+          180,
+          80
+        ],
+        [
+          460,
+          80
+        ],
+        [
+          460,
+          160
+        ],
+        [
+          180,
+          160
+        ]
+      ],
+      "threshold_ratio": 0.15,
+      "confirm_frames": 2,
+      "roi_type": "part"
+    },
+    {
+      "roi_id": "body_flank_l",
+      "name": "左侧车身门板防碰撞区",
+      "camera_id": 1,
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          479
+        ],
+        [
+          639,
+          479
+        ],
+        [
+          639,
+          461
+        ],
+        [
+          391,
+          444
+        ],
+        [
+          245,
+          318
+        ],
+        [
+          145,
+          140
+        ]
+      ],
+      "threshold_ratio": 0.08,
+      "confirm_frames": 2,
+      "roi_type": "body"
+    },
+    {
+      "roi_id": "body_flank_r",
+      "name": "右侧车身门板防碰撞区",
+      "camera_id": 2,
+      "polygon": [
+        [
+          120,
+          240
+        ],
+        [
+          580,
+          240
+        ],
+        [
+          600,
+          440
+        ],
+        [
+          100,
+          440
+        ]
+      ],
+      "threshold_ratio": 0.08,
+      "confirm_frames": 2,
+      "roi_type": "body"
+    },
+    {
+      "roi_id": "body_rear_bumper",
+      "name": "后保险杠与尾门防撞区",
+      "camera_id": 3,
+      "polygon": [
+        [
+          150,
+          320
+        ],
+        [
+          490,
+          320
+        ],
+        [
+          520,
+          440
+        ],
+        [
+          120,
+          440
+        ]
+      ],
+      "threshold_ratio": 0.08,
+      "confirm_frames": 2,
+      "roi_type": "body"
+    }
+  ],
+  "thresholds": {
+    "zone_far_dist_m": 6.0,
+    "zone_outer_dist_m": 6.0,
+    "zone_inner_dist_m": 3.0,
+    "hysteresis_buffer_m": 0.25,
+    "door_pull_min_sec": 0.8,
+    "window_peek_min_sec": 3.0,
+    "theft_min_sec": 2.0,
+    "contact_fusion_window_sec": 1.5
+  }
+}

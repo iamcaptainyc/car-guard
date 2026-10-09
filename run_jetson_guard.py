@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=============================================================================
+🚀 Jetson Orin 专属车载露营守卫运行控制台 (run_jetson_guard.py)
+专为 NVIDIA Jetson Orin (Orin Nano / Orin NX / AGX Orin) 打造的端到端 TensorRT 部署入口
+
+特性：
+1. 硬件状态与功耗模式自检 (Jetson Model, JetPack, nvpmodel, jetson_clocks)
+2. 纯 TensorRT .engine 模型全管线挂载 (YOLO 目标检测 + RTMPose 姿态 + OSNet ReID + SCRFD/ArcFace 人脸)
+3. 缺失模型自动化一键编译引导 (对接 batch_convert_trt.py 与 trtexec)
+4. 多源视频流输入：MP4 视频文件、CSI 车载鱼眼相机 (nvarguscamerasrc)、USB (v4l2) 或 RTSP
+5. UI 渲染与 AI 推理流式解耦，保障车载级 30+ FPS 零卡顿物理流畅度
+=============================================================================
+"""
+
+import os
+import sys
+import time
+import argparse
+import subprocess
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+import cv2
+import numpy as np
+
+from camping_guard.engine import CampingGuardEngine
+from camping_guard.types import GuardState, ThreatLevel, VehicleZone
+from camping_guard.config import load_vehicle_calibration
+from camping_guard.perception.trt_engine import (
+    is_jetson,
+    get_jetson_info,
+    TRTInferenceSession,
+    load_inference_backend
+)
+from camping_guard.perception.detector import ONNXObjectDetector
+from camping_guard.perception.pose_estimator import RTMPoseEstimator
+from camping_guard.perception.distance import GroundDistanceEstimator
+from camping_guard.profiler import PipelineProfiler
+from test_video_pipeline import run_video_pipeline
+
+
+def print_banner(info: dict):
+    print("=" * 76)
+    print(" 🚀 NVIDIA Jetson Orin 露营守卫系统 - TensorRT Engine 高性能控制台")
+    print("=" * 76)
+    print(f" 平台设备   : {info.get('model', 'NVIDIA Jetson')}")
+    print(f" L4T/驱动   : {info.get('l4t_ver', 'Linux for Tegra')}")
+    print(f" TensorRT   : v{info.get('tensorrt_ver', '8.x/10.x')}")
+    print(f" CUDA状态   : {'可用 (' + info.get('device_name', '') + ')' if info.get('cuda_available') else '未就绪'}")
+    print("-" * 76)
+
+
+def check_and_recommend_power_mode():
+    """检查 Jetson Orin 功耗模式并给出调优建议"""
+    if not is_jetson():
+        return
+
+    try:
+        res = subprocess.run(["nvpmodel", "-q"], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            print(f"[*] 当前系统功耗模式: {res.stdout.strip()}")
+            if "MAXN" not in res.stdout.upper() and "MODE 0" not in res.stdout.upper():
+                print("[!] 建议提示: 为获得最强哨兵响应与满血 TensorRT 推理算力，建议执行:")
+                print("    sudo nvpmodel -m 0 && sudo jetson_clocks")
+    except Exception:
+        pass
+
+
+def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optional[Path]]:
+    """检查系统所需的 5 大核心 TensorRT Engine 模型文件"""
+    engine_status = {
+        "yolo": None,
+        "pose": None,
+        "reid": None,
+        "face_det": None,
+        "face_rec": None
+    }
+
+    # 1. YOLO 目标检测
+    yolo_cands = [
+        models_dir / "yolo" / "yolo11s.engine",
+        models_dir / "yolo" / "yolo11n.engine",
+        models_dir / "yolo" / "yolo11n-fisheye.engine",
+        models_dir / "yolo" / "yolo26n.engine",
+        models_dir / "yolo" / "yolov8n.engine",
+    ]
+    for c in yolo_cands:
+        if c.is_file():
+            engine_status["yolo"] = c
+            break
+
+    # 2. RTMPose 人体姿态
+    pose_cands = [
+        models_dir / "pose" / "rtmpose-s.engine",
+        models_dir / "pose" / "yolo26n-pose.engine",
+    ]
+    for c in pose_cands:
+        if c.is_file():
+            engine_status["pose"] = c
+            break
+
+    # 3. OSNet 人员重识别
+    reid_cand = models_dir / "reid" / "osnet_x0_25.engine"
+    if reid_cand.is_file():
+        engine_status["reid"] = reid_cand
+
+    # 4. 人脸检测
+    face_det_cand = models_dir / "insightface" / "det_500m.engine"
+    if face_det_cand.is_file():
+        engine_status["face_det"] = face_det_cand
+
+    # 5. 人脸识别
+    face_rec_cand = models_dir / "insightface" / "w600k_mbf.engine"
+    if face_rec_cand.is_file():
+        engine_status["face_rec"] = face_rec_cand
+
+    return engine_status
+
+
+def auto_compile_engines(models_dir: Path = Path("models")):
+    """调用 batch_convert_trt.py 批量将未编译的 ONNX 编译为 TensorRT Engine"""
+    print("\n[*] 正在启动 Jetson Orin 自动化 TensorRT 引擎编译工具 (batch_convert_trt.py)...")
+    convert_script = Path("batch_convert_trt.py")
+    if not convert_script.is_file():
+        print(f"[!] 错误: 未在当前目录找到 {convert_script}，无法自动编译！")
+        return False
+
+    cmd = [sys.executable, str(convert_script), str(models_dir), "--precision", "fp16", "--skip-existing"]
+    print(f"[*] 执行命令: {' '.join(cmd)}")
+    ret = subprocess.run(cmd)
+    return ret.returncode == 0
+
+
+def get_csi_gstreamer_pipeline(
+    sensor_id: int = 0,
+    capture_w: int = 1920,
+    capture_h: int = 1080,
+    display_w: int = 640,
+    display_h: int = 480,
+    framerate: int = 30,
+    flip_method: int = 0
+) -> str:
+    """生成适用于 Jetson Orin 的 CSI 鱼眼摄像头硬件解码 GStreamer 管道字符串"""
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM), width=(int){capture_w}, height=(int){capture_h}, "
+        f"format=(string)NV12, framerate=(fraction){framerate}/1 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){display_w}, height=(int){display_h}, format=(string)BGRx ! "
+        f"videoconvert ! video/x-raw, format=(string)BGR ! appsink drop=1"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Jetson Orin 专属车载露营守卫 - TensorRT 运行控制台")
+    parser.add_argument("--video", type=str, default=None,
+                        help="测试用本地鱼眼 MP4 视频路径 (若未指定则自动选用内置样本或摄像头)")
+    parser.add_argument("--camera-id", type=int, default=1,
+                        help="相机机位通道: 0前, 1左, 2右, 3后 (默认 1 左侧后视镜鱼眼)")
+    parser.add_argument("--csi", type=int, default=None,
+                        help="使用 Jetson 硬件 CSI 鱼眼相机传感器通道编号 (例如: --csi 0 或 --csi 1)")
+    parser.add_argument("--usb", type=int, default=None,
+                        help="使用 USB 视频摄像头设备编号 (例如: --usb 0 代表 /dev/video0)")
+    parser.add_argument("--compile", action="store_true",
+                        help="强制调用 batch_convert_trt.py 检查并编译所有 ONNX 为 TensorRT .engine 文件")
+    parser.add_argument("--config", type=str, default="vehicle_calib.json",
+                        help="全车标定配置文件 (默认: vehicle_calib.json)")
+    parser.add_argument("--detector", type=str, default=None,
+                        help="显式指定 YOLO .engine 模型路径 (如 models/yolo/yolo11n.engine)")
+    parser.add_argument("--pose", type=str, default=None,
+                        help="显式指定 RTMPose .engine 模型路径 (如 models/pose/rtmpose-s.engine)")
+    parser.add_argument("--conf", type=float, default=0.25, help="检测置信度阈值 (默认 0.25)")
+    parser.add_argument("--headless", action="store_true", help="无头模式运行 (适用于车载后台守护进程或 SSH 调试)")
+    parser.add_argument("--realtime", action="store_true", default=True, help="启用实时异步流式调度 (默认开启)")
+    parser.add_argument("--no-sidebar", action="store_true", help="关闭右侧看板，使用极简纯画面显示")
+    parser.add_argument("--output", type=str, default=None, help="保存渲染好的视频文件至路径 (如 output.mp4)")
+    parser.add_argument("--loop", dest="loop_video", action="store_true", default=None,
+                        help="强制循环播放视频")
+    parser.add_argument("--no-loop", dest="loop_video", action="store_false",
+                        help="单次处理后自动退出，不循环回放 (当指定 --output 时默认开启此项)")
+    parser.add_argument("--web", action="store_true", default=True,
+                        help="启用内置 Web 实时流仪表盘 (默认开启，远程浏览器直接查看效果)")
+    parser.add_argument("--no-web", action="store_true", help="关闭 Web 实时推流仪表盘")
+    parser.add_argument("--web-port", type=int, default=8080, help="Web 实时流端口号 (默认: 8080)")
+
+    args = parser.parse_args()
+
+    jetson_info = get_jetson_info()
+    print_banner(jetson_info)
+    check_and_recommend_power_mode()
+
+    # 1. 编译或检查 TensorRT 引擎
+    if args.compile:
+        auto_compile_engines()
+
+    engines = check_required_engines()
+    print("\n[*] 检查 TensorRT Engine 模型挂载状态:")
+    for k, p in engines.items():
+        status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
+        print(f"    - {k:<10}: {status}")
+
+    if not engines["yolo"] and not args.detector:
+        print("\n[!] 提示: 检测到尚未编译 YOLO TensorRT Engine。")
+        print("    可在启动命令后追加 --compile 自动一键编译，或单独运行:")
+        print("    python batch_convert_trt.py models --precision fp16")
+
+    # 2. 视频输入源判定
+    video_source = args.video
+    if args.csi is not None:
+        video_source = get_csi_gstreamer_pipeline(sensor_id=args.csi)
+        print(f"[*] 已配置 Jetson CSI 摄像头硬件加速管道 (Sensor {args.csi})")
+    elif args.usb is not None:
+        video_source = args.usb
+        print(f"[*] 已配置 USB 摄像头设备 (/dev/video{args.usb})")
+
+    if video_source is None:
+        # 寻找默认样本视频
+        for cand in [
+            "C:\\Users\\chanceyu\\Downloads\\开门碰撞1.mp4",
+            "sample_fisheye_left.mp4",
+            "models/sample.mp4"
+        ]:
+            if os.path.exists(cand):
+                video_source = cand
+                print(f"[*] 自动选用默认测试视频源: {cand}")
+                break
+
+    if video_source is None:
+        print("[!] 错误: 未指定视频输入源！请使用 --video <mp4文件> 或 --csi 0。")
+        sys.exit(1)
+
+    # 3. 运行主视频/摄像头端到端管线 (强制启用 --use-trt)
+    loop_val = args.loop_video
+    if loop_val is None:
+        loop_val = False if args.output else True
+
+    print("\n[*] 正在启动车载露营守卫 (TensorRT 模式)...")
+    run_video_pipeline(
+        video_path=video_source,
+        config_path=args.config,
+        camera_id=args.camera_id,
+        detector_onnx_path=args.detector or (str(engines["yolo"]) if engines["yolo"] else None),
+        pose_onnx_path=args.pose or (str(engines["pose"]) if engines["pose"] else None),
+        conf_threshold=args.conf,
+        show_sidebar=not args.no_sidebar,
+        headless=args.headless,
+        realtime=args.realtime,
+        use_trt=True,
+        loop_video=loop_val,
+        output_path=args.output,
+        enable_web=args.web and not args.no_web,
+        web_port=args.web_port
+    )
+
+
+if __name__ == "__main__":
+    main()
