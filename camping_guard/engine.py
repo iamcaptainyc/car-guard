@@ -339,7 +339,7 @@ class CampingGuardEngine:
 
             # 若目标进入核心研判区 (Zone 2) 且为人员，按需触发 RTMPose 局部切片骨骼点提取 (Top-Down 节能范式)
             if target.category == 'person' and target.zone == VehicleZone.ZONE_2_INNER:
-                if primary_frame is not None and not target.keypoints and self.pose_estimator is not None:
+                if primary_frame is not None and self.pose_estimator is not None:
                     bx = int(target.bbox.x if hasattr(target.bbox, 'x') else target.bbox[0])
                     by = int(target.bbox.y if hasattr(target.bbox, 'y') else target.bbox[1])
                     bw = int(target.bbox.w if hasattr(target.bbox, 'w') else target.bbox[2])
@@ -349,6 +349,9 @@ class CampingGuardEngine:
                         kpts_list = self.pose_estimator.estimate_keypoints(primary_frame, [(bx, by, bw, bh)])
                     if kpts_list:
                         target.keypoints = kpts_list[0]
+            elif target.category == 'person' and target.zone != VehicleZone.ZONE_2_INNER:
+                # 退出 Zone 2 时及时清理姿态关键点，避免远距离依然残留陈旧姿态
+                target.keypoints = None
 
             # 动作与姿态分类 (传入门把手与车窗 ROI 空间多边形)
             action, visual_threat, v_desc = self.pose_classifier.classify_action(

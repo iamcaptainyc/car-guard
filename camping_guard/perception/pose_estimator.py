@@ -106,7 +106,15 @@ class RTMPoseEstimator(BasePoseEstimator):
         Top-Down 仿射变换人体切片，保持 256x192 比例并不形变
         :return: (crop_img_256x192, inv_affine_matrix)
         """
+        h_frame, w_frame = frame.shape[:2]
         x, y, w, h = bbox
+
+        # 边界约束，防止极小或越界框导致仿射变换矩阵奇异
+        x = max(0, min(w_frame - 1, int(x)))
+        y = max(0, min(h_frame - 1, int(y)))
+        w = max(10, min(w_frame - x, int(w)))
+        h = max(10, min(h_frame - y, int(h)))
+
         center_x = x + w / 2.0
         center_y = y + h / 2.0
 
@@ -142,12 +150,23 @@ class RTMPoseEstimator(BasePoseEstimator):
         self,
         simcc_x: np.ndarray, # [17, 384]
         simcc_y: np.ndarray, # [17, 512]
-        inv_matrix: np.ndarray
+        inv_matrix: np.ndarray,
+        bbox: Optional[Tuple[int, int, int, int]] = None
     ) -> Dict[str, Tuple[float, float, float]]:
         """
         SimCC 1D 坐标分类解码：从两个 1D 概率向量恢复原始图像关键点
+        支持基于人体边界框的几何合理性软校验，抑制背景噪声跳跃
         """
         kpts = {}
+        if bbox is not None:
+            bx, by, bw, bh = bbox
+            valid_x_min = bx - 0.25 * bw
+            valid_x_max = bx + 1.25 * bw
+            valid_y_min = by - 0.20 * bh
+            valid_y_max = by + 1.20 * bh
+        else:
+            valid_x_min, valid_x_max, valid_y_min, valid_y_max = None, None, None, None
+
         for i, name in enumerate(KEYPOINT_NAMES):
             vx = simcc_x[i]
             vy = simcc_y[i]
@@ -164,8 +183,15 @@ class RTMPoseEstimator(BasePoseEstimator):
             # 逆仿射变换还原回全图坐标
             pt_crop = np.array([idx_x, idx_y, 1.0], dtype=np.float32)
             pt_orig = np.dot(inv_matrix, pt_crop)
+            orig_x = float(pt_orig[0])
+            orig_y = float(pt_orig[1])
 
-            kpts[name] = (float(pt_orig[0]), float(pt_orig[1]), conf)
+            # 软约束：若关键点坐标显著飞出合理人体边界框外廓，大幅降低其置信度
+            if valid_x_min is not None:
+                if orig_x < valid_x_min or orig_x > valid_x_max or orig_y < valid_y_min or orig_y > valid_y_max:
+                    conf *= 0.2
+
+            kpts[name] = (orig_x, orig_y, conf)
 
         return kpts
 
@@ -182,7 +208,7 @@ class RTMPoseEstimator(BasePoseEstimator):
             crop_img, inv_matrix = self.crop_and_warp(frame, bbox)
 
             if self.session is not None:
-                # 真实 ONNX 推理通道
+                # 真实 ONNX/TensorRT 推理通道
                 # 预处理: BGR to RGB, 归一化 (x - mean) / std
                 norm_img = crop_img[:, :, ::-1].astype(np.float32) / 255.0
                 mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -191,10 +217,17 @@ class RTMPoseEstimator(BasePoseEstimator):
                 blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...] # [1, 3, 256, 192]
 
                 outputs = self.session.run(None, {self.input_name: blob})
-                # RTMPose ONNX 通常输出两个张量: simcc_x [1, 17, 384] 和 simcc_y [1, 17, 512]
-                simcc_x = outputs[0][0]
-                simcc_y = outputs[1][0]
-                kpts = self.decode_simcc(simcc_x, simcc_y, inv_matrix)
+                out0 = outputs[0][0]
+                out1 = outputs[1][0]
+                # 动态自适应 simcc_x (最后一维 384) 与 simcc_y (最后一维 512)，防止不同平台/TRT顺序错位
+                if out0.shape[-1] == 384 and out1.shape[-1] == 512:
+                    simcc_x, simcc_y = out0, out1
+                elif out0.shape[-1] == 512 and out1.shape[-1] == 384:
+                    simcc_x, simcc_y = out1, out0
+                else:
+                    simcc_x, simcc_y = out0, out1
+
+                kpts = self.decode_simcc(simcc_x, simcc_y, inv_matrix, bbox=bbox)
                 results.append(kpts)
             else:
                 # 离线环境与测试用合成骨骼生成器 (依据 Box 解算自然人体站立姿态)

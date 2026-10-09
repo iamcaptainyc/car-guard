@@ -379,6 +379,30 @@ def get_sidebar_font(size: int = 14):
     return f
 
 
+def draw_text_utf8(image: np.ndarray, text: str, org: Tuple[int, int], font_size: int = 14, color: Tuple[int, int, int] = (255, 255, 255)):
+    """支持 UTF-8 中文与英文的高质感抗锯齿无乱码文字渲染 (含中文自动走 PIL TrueType，纯英文走 cv2.putText)"""
+    if not text:
+        return image
+    has_unicode = any(ord(c) > 127 for c in text)
+    if not has_unicode:
+        cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_size / 28.0, color, 1, cv2.LINE_AA)
+        return image
+
+    try:
+        from PIL import Image, ImageDraw
+        font = get_sidebar_font(font_size)
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(img_pil)
+        rgb_color = (color[2], color[1], color[0]) if len(color) == 3 else color
+        draw_y = max(0, org[1] - font_size)
+        draw.text((org[0], draw_y), text, font=font, fill=rgb_color)
+        image[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    except Exception:
+        cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_size / 28.0, color, 1, cv2.LINE_AA)
+    return image
+
+
 def draw_telemetry_sidebar(
     video_frame: np.ndarray,
     engine: CampingGuardEngine,
@@ -905,14 +929,11 @@ def run_video_pipeline(
     t_prev = time.perf_counter()
     real_fps = fps
 
-    # 5. 若启用 --realtime 实时流速模式，启动后台流式 AI 守护工作线程与高帧率运动补偿器
+    # 5. 若启用 --realtime 实时流速模式，启动处理后实时帧流步调控制器
     worker = None
     compensator = None
     if realtime:
-        print("[*] 正在启动异步多线程流式引擎 (--realtime 已激活): 视频流 25 FPS 满速流畅回放，AI 后台并行推理")
-        print("[*] 正在启用目标运动实时补偿引擎 (卡尔曼外插 + 连续微光流追踪，彻底消除异步延迟导致的目标框滞后)")
-        worker = AsyncInferenceWorker(engine, camera_id=camera_id)
-        compensator = RealtimeMotionCompensator()
+        print("[*] 正在启动同步处理实时帧流引擎 (--realtime 已激活): 视频流按物理帧率节拍播放，逐帧处理并即时渲染，零框延迟、零骨骼漂移")
 
     def handle_interactive_key(k: int, now_time: float):
         """处理快捷键交互，返回 (event_msg, should_quit, req_reset)"""
@@ -1149,29 +1170,18 @@ def run_video_pipeline(
         # 视频虚拟时间戳推进 (严格与视频源物理帧率对齐，彻底解决 CPU 处理慢导致速度与滞留时间被扭曲的缺陷)
         video_timestamp = base_sim_time + (frame_idx / fps)
 
-        # 4. 算法研判分发 (实时流式 vs 同步逐帧)
-        if realtime and worker is not None:
-            # 异步模式: 非阻塞提交当前帧给后台 worker
-            worker.submit_frame(frame, video_timestamp, frame_idx=frame_idx)
-            snapshot = worker.get_latest_snapshot()
-            tick_res = snapshot["tick_result"]
-            active_targets = compensator.update(frame, frame_idx, snapshot) if compensator else snapshot["active_targets"]
-            active_rois = snapshot["active_roi_disturbances"]
-            ai_fps = snapshot["ai_fps"]
-            ai_e2e_ms = snapshot["ai_e2e_ms"]
-        else:
-            # 同步模式: 逐帧全量研判 (支持 detect_interval 步长控制)
-            camera_dict = {camera_id: frame}
-            run_detection = (frame_idx % detect_interval == 0) if detect_interval > 1 else True
-            tick_res = engine.process_tick(
-                camera_frames=camera_dict,
-                raw_detections=None if run_detection else [],
-                current_time=video_timestamp
-            )
-            active_targets = engine.active_targets
-            active_rois = engine.active_roi_disturbances
-            ai_fps = None
-            ai_e2e_ms = tick_res.get("e2e_ms", 0.0)
+        # 4. 算法研判分发 (单流同步处理帧流：逐帧推理、逐帧绘制，确保画面展示 100% 处理帧，杜绝异步框延迟)
+        camera_dict = {camera_id: frame}
+        run_detection = (frame_idx % detect_interval == 0) if detect_interval > 1 else True
+        tick_res = engine.process_tick(
+            camera_frames=camera_dict,
+            raw_detections=None if run_detection else [],
+            current_time=video_timestamp
+        )
+        active_targets = engine.active_targets
+        active_rois = engine.active_roi_disturbances
+        ai_e2e_ms = tick_res.get("e2e_ms", 0.0)
+        ai_fps = 1000.0 / max(ai_e2e_ms, 1e-3)
 
         # 5. 可视化增强绘制
         render_frame = frame.copy()
@@ -1192,9 +1202,9 @@ def run_video_pipeline(
             cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-            # 若有骨骼点则渲染
+            # 若有骨骼点则渲染 (传入当前 bbox，严格限制连线在人体合理生理轮廓内，防止骨骼划出框外)
             if t.keypoints:
-                draw_skeleton(render_frame, t.keypoints)
+                draw_skeleton(render_frame, t.keypoints, bbox=t.bbox)
 
         # 画面组合输出: 采用独立侧边栏展示指标，彻底避免遮挡视频画面主体 (0% 遮挡原视频)
         if view_mode == "SIDEBAR":
@@ -1224,8 +1234,8 @@ def run_video_pipeline(
             cv2.putText(display_frame, status_pill, (video_w - 250, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
             if sim_event_msg:
-                cv2.putText(display_frame, f"[EVENT] {sim_event_msg}", (20, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (50, 255, 255), 1, cv2.LINE_AA)
+                draw_text_utf8(display_frame, f"[EVENT] {sim_event_msg}", (20, 25),
+                               font_size=15, color=(50, 255, 255))
 
         # 显示与保存
         if not headless:
@@ -1238,7 +1248,7 @@ def run_video_pipeline(
         if writer:
             writer.write(display_frame)
 
-        # 网页端实时推流与遥测指标同步
+        # 网页端实时推流与遥测指标同步 (展示的视频 100% 为带有算法标注的实时处理帧)
         if web_streamer:
             web_streamer.push_frame(display_frame)
             web_streamer.update_meta(
@@ -1255,6 +1265,12 @@ def run_video_pipeline(
             target_wall_time = start_wall_time + (frame_idx * target_frame_interval)
             remaining_sec = target_wall_time - now_render
             wait_ms = max(1, int(remaining_sec * 1000.0)) if remaining_sec > 0 else 1
+            # 追赶物理时钟: 若落后物理时间超过 1 帧 (例如偶发卡顿)，快速 grab 跳过陈旧帧保持与物理时钟严格对齐
+            if remaining_sec < -0.04:
+                lag_frames = min(int((-remaining_sec) / target_frame_interval), 3)
+                for _ in range(lag_frames):
+                    cap.grab()
+                    frame_idx += 1
         else:
             # 同步模式: 减去当帧算法处理耗时
             e2e_ms = tick_res.get("e2e_ms", 0.0)
@@ -1419,7 +1435,7 @@ def main():
     parser.add_argument("--headless", action="store_true", help="无头模式运行 (不弹窗，适合后台/无显示器环境)")
     parser.add_argument("--max-frames", type=int, default=None, help="最大测试评估帧数 (达到后自动结束并输出统计报告)")
     parser.add_argument("--realtime", action="store_true",
-                        help="以真实时间速度播放视频 (启用异步多线程流式引擎，保证 25 FPS 满速流畅回放)")
+                        help="以真实时间速度播放视频 (锁定 30 FPS 物理帧率节拍，画面 100% 展示实时处理帧，零框延迟)")
     parser.add_argument("--detect-interval", type=int, default=1,
                         help="目标检测推理采样间隔 (默认 1，即每帧推理；设置 >1 可跳帧推理仅运行轻量跟踪)")
     parser.add_argument("--use-trt", "--trt", action="store_true",

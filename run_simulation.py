@@ -126,12 +126,12 @@ def draw_vehicle_and_zones(frame: np.ndarray, engine: CampingGuardEngine, camera
     cv2.polylines(frame, [z1_poly], True, (60, 60, 90), 1, cv2.LINE_AA)
     cv2.polylines(frame, [z2_poly], True, (90, 90, 120), 1, cv2.LINE_AA)
 
-    side_label_map = {"front": "前向", "left": "左侧", "right": "右侧", "rear": "后向"}
-    side_cn = side_label_map.get(body_side, "车周")
-    cv2.putText(frame, f"[{side_cn} Cam{camera_id}] Zone 1 (3.0~6.0m)", (z1_poly[0][0] + 10, z1_poly[0][1] + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (110, 110, 140), 1)
-    cv2.putText(frame, f"[{side_cn} Cam{camera_id}] Zone 2 (0~3.0m)", (z2_poly[0][0] + 10, z2_poly[0][1] + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (140, 140, 170), 1)
+    side_label_map = {"front": "Front", "left": "Left", "right": "Right", "rear": "Rear"}
+    side_en = side_label_map.get(body_side, "Surround")
+    cv2.putText(frame, f"[{side_en} Cam{camera_id}] Zone 1 (3.0~6.0m)", (z1_poly[0][0] + 10, z1_poly[0][1] + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (110, 110, 140), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"[{side_en} Cam{camera_id}] Zone 2 (0~3.0m)", (z2_poly[0][0] + 10, z2_poly[0][1] + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (140, 140, 170), 1, cv2.LINE_AA)
 
     # 3. 严格仅绘制属于当前相机 camera_id 的车身敏感部件与防撞区
     for roi in engine.zone3_daemon.rois:
@@ -151,13 +151,17 @@ def draw_vehicle_and_zones(frame: np.ndarray, engine: CampingGuardEngine, camera
         else:
             color = (0, 220, 255) # 敏感部件 (门把手/充电口/锁扣)
             thickness = 1
-        cv2.polylines(frame, [pts], True, color, thickness)
+        cv2.polylines(frame, [pts], True, color, thickness, cv2.LINE_AA)
         rx, ry = pts[0]
-        label = roi.name if getattr(roi, "roi_type", "part") == "body" else roi.roi_id
-        cv2.putText(frame, label, (rx, max(15, ry - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+        # 使用标准化英文 ROI ID (如 body_flank_l, handle_fl) 杜绝 OpenCV 因不支持汉字显示为 ??? 乱码
+        label = roi.roi_id
+        cv2.putText(frame, label, (rx, max(15, ry - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
 
-def draw_skeleton(frame: np.ndarray, keypoints: dict):
-    """绘制 COCO 17 点人体骨骼连线与关节点"""
+def draw_skeleton(frame: np.ndarray, keypoints: dict, bbox=None):
+    """
+    绘制 COCO 17 点人体骨骼连线与关节点
+    若提供 bbox，严格约束连线与关节点必须在目标合理生理外廓内，杜绝连线划出框外
+    """
     links = [
         ("nose", "left_eye"), ("nose", "right_eye"), ("left_eye", "left_ear"), ("right_eye", "right_ear"),
         ("left_shoulder", "right_shoulder"), ("left_shoulder", "left_elbow"), ("left_elbow", "left_wrist"),
@@ -166,20 +170,44 @@ def draw_skeleton(frame: np.ndarray, keypoints: dict):
         ("left_hip", "left_knee"), ("left_knee", "left_ankle"),
         ("right_hip", "right_knee"), ("right_knee", "right_ankle")
     ]
+
+    # 边界约束 (允许 20% 正常肢体舒展外延，抑制飞出框外十万八千里的野点)
+    if bbox is not None:
+        bx = getattr(bbox, 'x', bbox[0])
+        by = getattr(bbox, 'y', bbox[1])
+        bw = getattr(bbox, 'w', bbox[2])
+        bh = getattr(bbox, 'h', bbox[3])
+        x_min, x_max = bx - 0.20 * bw, bx + 1.20 * bw
+        y_min, y_max = by - 0.15 * bh, by + 1.15 * bh
+    else:
+        x_min, x_max, y_min, y_max = None, None, None, None
+
+    def _is_valid(pt, conf):
+        if conf <= 0.35:
+            return False
+        if x_min is not None:
+            if pt[0] < x_min or pt[0] > x_max or pt[1] < y_min or pt[1] > y_max:
+                return False
+        return True
+
     # 绘制骨骼连线
     for p1, p2 in links:
         if p1 in keypoints and p2 in keypoints:
             pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
             pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
-            conf1, conf2 = keypoints[p1][2], keypoints[p2][2]
-            if conf1 > 0.4 and conf2 > 0.4:
+            conf1 = keypoints[p1][2] if len(keypoints[p1]) >= 3 else 1.0
+            conf2 = keypoints[p2][2] if len(keypoints[p2]) >= 3 else 1.0
+            if _is_valid(pt1, conf1) and _is_valid(pt2, conf2):
                 cv2.line(frame, pt1, pt2, (0, 255, 180), 2, cv2.LINE_AA)
 
     # 绘制关节点圆圈
-    for name, (kx, ky, conf) in keypoints.items():
-        if conf > 0.4:
+    for name, kpt_val in keypoints.items():
+        kx, ky = kpt_val[0], kpt_val[1]
+        conf = kpt_val[2] if len(kpt_val) >= 3 else 1.0
+        pt = (int(kx), int(ky))
+        if _is_valid(pt, conf):
             color = (0, 0, 255) if "wrist" in name else ((255, 0, 255) if "ankle" in name else (0, 220, 255))
-            cv2.circle(frame, (int(kx), int(ky)), 3, color, -1)
+            cv2.circle(frame, pt, 3, color, -1, cv2.LINE_AA)
 
 def run_simulation_loop(config_path: str = "vehicle_calib.json"):
     print("=" * 70)
