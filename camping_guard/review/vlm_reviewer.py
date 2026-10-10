@@ -331,25 +331,23 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if self.engine_path_arg:
             engine_candidates.append(Path(self.engine_path_arg))
 
-        for env_var in ["QWEN_ENGINE_DIR", "VLM_ENGINE_DIR", "EDGELLM_ENGINE_DIR"]:
+        for env_var in ["MODEL_DIR", "VLM_MODEL_DIR", "QWEN_MODEL_DIR", "QWEN_ENGINE_DIR", "VLM_ENGINE_DIR", "EDGELLM_ENGINE_DIR"]:
             val = os.environ.get(env_var)
             if val:
                 engine_candidates.append(Path(val))
 
         default_model_paths = [
+            Path("/home/nvidia/models"),
             Path("/home/nvidia/models/Qwen3.5-0.8B"),
             Path("/home/nvidia/models/Qwen3.5-2B"),
             Path("/home/nvidia/models/qwen3.5-2b"),
-            Path("/home/nvidia/qwen35-orin/models/vlm/qwen3.5-2b"),
-            Path("/home/nvidia/qwen35-orin/engines/qwen3.5-2b"),
+            Path("/home/nvidia/qwen35-orin/models"),
             Path("/home/nvidia/qwen35-orin/engines"),
-            Path("/home/nvidia/qwen35-orin/qwen3.5-2b"),
-            Path("/home/nvidia/qwen35-orin/qwen35-2b"),
-            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/engines"),
             Path("models/vlm/qwen3.5-2b.engine"),
             Path("models/vlm/qwen3.5-2b"),
             Path("models/vlm/qwen2.5-vl-2b.engine"),
             Path("models/vlm/qwen2.5-vl-2b"),
+            Path("models"),
             Path("qwen3.5-2b.engine"),
         ]
         engine_candidates.extend(default_model_paths)
@@ -360,62 +358,72 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         for ep in engine_candidates:
             if ep and ep.exists():
-                if ep.is_dir():
-                    # 场景 1: <模型目录>/engines/llm 与 <模型目录>/engines/visual 结构
-                    llm_sub = None
-                    visual_sub = None
-                    if (ep / "engines" / "llm").is_dir():
-                        llm_sub = ep / "engines" / "llm"
-                    if (ep / "engines" / "visual").is_dir() and self._resolved_visual_dir is None:
-                        visual_sub = ep / "engines" / "visual"
+                llm_dir, vis_dir = self._resolve_model_engines(ep)
+                if llm_dir:
+                    self._resolved_engine_dir = llm_dir
+                    if not self._resolved_visual_dir and vis_dir:
+                        self._resolved_visual_dir = vis_dir
+                    print(f"[*] [TRT-Edge-LLM] 成功解析并验证端侧 LLM 引擎目录: {self._resolved_engine_dir}")
+                    if self._resolved_visual_dir:
+                        print(f"[*] [TRT-Edge-LLM] 成功解析并验证端侧 Visual 视觉编码器目录: {self._resolved_visual_dir}")
+                    break
 
-                    # 场景 2: 传入总目录，内部直接拆分了 llm 与 visual / visual_engines
-                    if not llm_sub:
-                        for cand_llm in ["llm", "engines", "text", "llm_engines"]:
-                            if (ep / cand_llm).is_dir():
-                                llm_sub = ep / cand_llm
-                                break
+        if not self._resolved_engine_dir:
+            print("[i] [TRT-Edge-LLM] 未检测到合规的 Qwen-VLM 引擎 (需包含 config.json 或 *.engine)，已挂载端侧高保真语义保底引擎")
 
-                    if not visual_sub and self._resolved_visual_dir is None:
-                        for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
-                            if (ep / cand_vis).is_dir():
-                                visual_sub = ep / cand_vis
-                                break
+    @staticmethod
+    def _is_valid_engine_dir(d: Optional[Path]) -> bool:
+        """检查目录是否为合法的 TensorRT 引擎目录 (必须包含 config.json 或 *.engine)"""
+        if not d or not d.is_dir():
+            return False
+        has_config = (d / "config.json").is_file()
+        has_engine = (d / "llm.engine").is_file() or (d / "visual.engine").is_file() or any(d.glob("*.engine"))
+        return has_config or has_engine
 
-                    # 场景 3: 传入的是 llm 目录本身 (如 .../qwen3.5-2b/llm)，寻找同级 visual 目录
-                    if not visual_sub and self._resolved_visual_dir is None:
-                        for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
-                            if (ep.parent / cand_vis).is_dir():
-                                visual_sub = ep.parent / cand_vis
-                                break
-                            # 平行目录 (如 engines/qwen3.5-2b 对照 visual_engines/qwen3.5-2b)
-                            if (ep.parent.parent / cand_vis / ep.name).is_dir():
-                                visual_sub = ep.parent.parent / cand_vis / ep.name
-                                break
+    def _resolve_model_engines(self, root: Path) -> Tuple[Optional[Path], Optional[Path]]:
+        """从模型路径根目录智能推导并验证合规的 (llm_engine_dir, visual_engine_dir)"""
+        if not root or not root.exists():
+            return None, None
 
-                    # 场景 4: 目录下直接包含 visual*.engine 或 visual_encoder 权重文件
-                    if not visual_sub and self._resolved_visual_dir is None:
-                        has_visual_file = any("visual" in f.name.lower() or "multimodal" in f.name.lower() for f in ep.iterdir() if f.is_file())
-                        if has_visual_file:
-                            visual_sub = ep
+        # 场景 1: <root>/engines/llm 与 <root>/engines/visual 结构 (用户官方标准结构)
+        llm_cand = root / "engines" / "llm"
+        vis_cand = root / "engines" / "visual"
+        if self._is_valid_engine_dir(llm_cand):
+            vis = vis_cand if self._is_valid_engine_dir(vis_cand) else None
+            return llm_cand, vis
 
-                    if llm_sub:
-                        self._resolved_engine_dir = llm_sub
-                    else:
-                        self._resolved_engine_dir = ep
+        # 场景 2: <root>/llm 与 <root>/visual 结构
+        llm_cand2 = root / "llm"
+        vis_cand2 = root / "visual"
+        if self._is_valid_engine_dir(llm_cand2):
+            vis = vis_cand2 if self._is_valid_engine_dir(vis_cand2) else None
+            return llm_cand2, vis
 
-                    if visual_sub and self._resolved_visual_dir is None:
-                        self._resolved_visual_dir = visual_sub
-                else:
-                    # 单文件 .engine 输入
-                    self._resolved_engine_dir = ep.parent if ep.is_file() else ep
+        # 场景 3: root 本身就是一个合法的引擎目录 (直接包含 config.json 或 *.engine)
+        if self._is_valid_engine_dir(root):
+            vis = None
+            for cand_name in ["visual", "visual_engines", "vision", "multimodal"]:
+                if self._is_valid_engine_dir(root.parent / cand_name):
+                    vis = root.parent / cand_name
+                    break
+            return root, vis
 
-                print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM LLM 引擎: {self._resolved_engine_dir}")
-                if self._resolved_visual_dir:
-                    print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM Visual 视觉编码器引擎: {self._resolved_visual_dir}")
-                else:
-                    print(f"[i] [TRT-Edge-LLM] 未检测到独立 visual 引擎子目录 (若为纯多模态一体或单引擎，将默认共用引擎目录)")
-                break
+        # 场景 4: root 是单文件 .engine
+        if root.is_file() and root.suffix == ".engine":
+            return root.parent, None
+
+        # 场景 5: root 是模型仓库总目录 (如 /home/nvidia/models)，递归扫描其一层子目录
+        if root.is_dir():
+            try:
+                for sub in sorted(root.iterdir()):
+                    if sub.is_dir() and sub.name not in ["__pycache__", ".git"]:
+                        l, v = self._resolve_model_engines(sub)
+                        if l:
+                            return l, v
+            except Exception:
+                pass
+
+        return None, None
 
     def _infer_native_cpp(
         self,
@@ -424,6 +432,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
     ) -> Optional[Dict[str, Any]]:
         """最高效调用方案：通过 TensorRT-Edge-LLM 官方 C++ 原生二进制无守护进程推理"""
         if not self._resolved_edgellm_bin or not self._resolved_engine_dir:
+            return None
+        # 双重防御：确保解析出的目录确实为合法引擎目录，杜绝无效路径引发 C++ runtime 崩溃
+        if not self._is_valid_engine_dir(self._resolved_engine_dir):
             return None
 
         dwell_s = getattr(event_record, "target_dwell_time", 0.0)

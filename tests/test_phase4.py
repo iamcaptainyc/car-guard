@@ -407,6 +407,8 @@ def test_trt_edgellm_native_cpp_ipc_mocked(monkeypatch):
         mock_bin.write_text("#!/bin/sh\nexit 0\n")
         mock_engine = Path(temp_dir) / "qwen3.5-2b"
         mock_engine.mkdir()
+        (mock_engine / "config.json").touch()
+        (mock_engine / "llm.engine").touch()
 
         backend = TRTEdgeLLMOnDemandBackend(
             engine_path=str(mock_engine),
@@ -473,12 +475,14 @@ def test_trt_edgellm_split_engine_discovery():
     temp_dir = tempfile.mkdtemp(prefix="test_split_engine_")
     try:
         model_root = Path(temp_dir) / "qwen3.5-2b"
-        llm_dir = model_root / "llm"
+        llm_dir = model_root / "engines" / "llm"
         llm_dir.mkdir(parents=True)
-        visual_dir = model_root / "visual"
+        (llm_dir / "config.json").touch()
+        visual_dir = model_root / "engines" / "visual"
         visual_dir.mkdir(parents=True)
+        (visual_dir / "config.json").touch()
 
-        # 1. 传入模型总根目录 -> 自动细化识别出 llm 和 visual
+        # 1. 传入模型总根目录 -> 自动细化识别出 engines/llm 和 engines/visual
         backend = TRTEdgeLLMOnDemandBackend(engine_path=str(model_root))
         backend._probe_paths()
         assert backend._resolved_engine_dir == llm_dir
@@ -493,6 +497,7 @@ def test_trt_edgellm_split_engine_discovery():
         # 3. 显式指定 visual_engine_path
         custom_vis = Path(temp_dir) / "custom_visual"
         custom_vis.mkdir()
+        (custom_vis / "config.json").touch()
         backend_explicit = TRTEdgeLLMOnDemandBackend(
             engine_path=str(llm_dir),
             visual_engine_path=str(custom_vis)
@@ -500,6 +505,13 @@ def test_trt_edgellm_split_engine_discovery():
         backend_explicit._probe_paths()
         assert backend_explicit._resolved_engine_dir == llm_dir
         assert backend_explicit._resolved_visual_dir == custom_vis
+
+        # 4. 传入纯空目录 -> 验证不会误判为引擎目录 (防止 Embedding file not found 崩溃)
+        empty_root = Path(temp_dir) / "empty_proj"
+        empty_root.mkdir()
+        backend_empty = TRTEdgeLLMOnDemandBackend(engine_path=str(empty_root))
+        backend_empty._probe_paths()
+        assert backend_empty._resolved_engine_dir is None
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
