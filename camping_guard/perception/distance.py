@@ -329,6 +329,11 @@ class GroundDistanceEstimator:
         for tid in stale:
             del self.history_records[tid]
 
+    def reassign_track_id(self, old_id: int, new_id: int):
+        """跨遮挡 ReID 轨迹重新关联时同步映射距离时序历史"""
+        if old_id in self.history_records:
+            self.history_records[new_id] = self.history_records.pop(old_id)
+
 
 class ZoneHysteresisFilter:
     """
@@ -338,6 +343,11 @@ class ZoneHysteresisFilter:
     def __init__(self):
         # 记录每个目标的当前防区状态: {track_id: VehicleZone}
         self.current_zones: Dict[int, VehicleZone] = {}
+
+    def reassign_track_id(self, old_id: int, new_id: int):
+        """跨遮挡 ReID 轨迹重新关联时同步防区状态"""
+        if old_id in self.current_zones:
+            self.current_zones[new_id] = self.current_zones.pop(old_id)
 
     def update_zone(self, track_id: int, dist: float) -> VehicleZone:
         buf = GuardConfig.HYSTERESIS_BUFFER # 0.3m

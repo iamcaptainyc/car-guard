@@ -5,7 +5,7 @@
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import time
 
 from camping_guard.types import TrackedEntity, BoundingBox, VehicleZone, FaceIDState
@@ -172,7 +172,7 @@ class STrack:
 
 
 class ByteTracker:
-    def __init__(self, high_thresh: float = 0.5, low_thresh: float = 0.15, max_time_lost: int = 30):
+    def __init__(self, high_thresh: float = 0.5, low_thresh: float = 0.15, max_time_lost: int = 60):
         self.high_thresh = high_thresh
         self.low_thresh = low_thresh
         self.max_time_lost = max_time_lost
@@ -185,10 +185,18 @@ class ByteTracker:
         # 离场 10 秒内重入缓存: {track_id: (leave_time, cumulative_dwell)}
         self.departed_history: Dict[int, Tuple[float, float]] = {}
 
-    def update(self, detections: List[dict], current_time: float) -> List[TrackedEntity]:
+    def update(
+        self,
+        detections: List[dict],
+        current_time: float,
+        frame: Optional[np.ndarray] = None,
+        reid_extractor: Optional[Any] = None
+    ) -> List[TrackedEntity]:
         """
         :param detections: [{'bbox': (x,y,w,h), 'conf': float, 'category': str, 'track_id': opt}]
         :param current_time: 当前秒级时间戳
+        :param frame: 原始全景帧 (可选，用于遮挡重识别外观特征提取)
+        :param reid_extractor: ReID 特征提取器 (可选，用于外观特征召回)
         :return: 活跃的 TrackedEntity 实体列表
         """
         self.frame_id += 1
@@ -244,8 +252,41 @@ class ByteTracker:
             track.mark_lost()
             lost_stracks.append(track)
 
-        # 6. 处理未匹配的高置信度检测 -> 初始化为新目标 (并检查 10 秒重入继承)
-        for d_idx in unmatched_dets_1:
+        # 5.5 (Deep-ByteTrack 核心): 针对未通过 IoU 匹配的高置信度人员检测，通过 ReID 外观特征从 lost_stracks 中精准召回
+        matched_reid_dets = set()
+        if frame is not None and reid_extractor is not None and len(unmatched_dets_1) > 0 and len(self.lost_stracks) > 0:
+            lost_candidates = [t for t in self.lost_stracks if t.category == 'person' and t.reid_feature is not None]
+            if len(lost_candidates) > 0:
+                for d_idx in unmatched_dets_1:
+                    det = high_dets[d_idx]
+                    if det.category != 'person':
+                        continue
+                    bx, by, bw, bh = det.tlwh
+                    crop_bbox = BoundingBox(int(bx), int(by), int(bw), int(bh))
+                    feat = reid_extractor.extract_from_frame(frame, crop_bbox)
+                    if feat is None or len(feat) == 0:
+                        continue
+                    det.reid_feature = feat
+
+                    best_sim = -1.0
+                    best_lost_trk = None
+                    for lost_trk in lost_candidates:
+                        sim = float(np.dot(feat, lost_trk.reid_feature))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_lost_trk = lost_trk
+
+                    # 跨遮挡外观相似度门禁 (>= 0.65 判定为同一目标被遮挡重现)
+                    if best_lost_trk is not None and best_sim >= 0.65:
+                        best_lost_trk.update(det, self.frame_id, current_time)
+                        best_lost_trk.reid_feature = feat
+                        refind_stracks.append(best_lost_trk)
+                        lost_candidates.remove(best_lost_trk)
+                        matched_reid_dets.add(d_idx)
+
+        # 6. 处理剩余未匹配的高置信度检测 -> 初始化为新目标
+        unmatched_dets_final = [i for i in unmatched_dets_1 if i not in matched_reid_dets]
+        for d_idx in unmatched_dets_final:
             det = high_dets[d_idx]
             # 继承或赋予新 ID
             det.frame_id = self.frame_id
@@ -319,6 +360,24 @@ class ByteTracker:
             if st.track_id == track_id:
                 return st
         return None
+
+    def reassign_track_id(self, current_id: int, target_id: int):
+        """
+        跨遮挡/长时时空穿透 ReID 关联重识别: 将新分配的临时轨迹 ID 缝合回历史根轨迹 ID
+        """
+        if current_id == target_id:
+            return
+
+        # 1. 清理 lost_stracks 或 removed_stracks 中残留的原 target_id 孤儿轨迹
+        self.lost_stracks = [s for s in self.lost_stracks if s.track_id != target_id]
+        self.removed_stracks = [s for s in self.removed_stracks if s.track_id != target_id]
+
+        # 2. 将当前活跃轨迹的 ID 变更回 target_id
+        for st in self.tracked_stracks:
+            if st.track_id == current_id:
+                st.track_id = target_id
+                st.track_uid = f"cam1_trk{target_id}"
+                break
 
     def _linear_assignment(self, tracks: List[STrack], dets: List[STrack], iou_thresh: float) -> Tuple[List[int], List[int], List[Tuple[int, int]]]:
         """贪心/IoU 快速关联算法"""

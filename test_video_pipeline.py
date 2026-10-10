@@ -499,7 +499,8 @@ def draw_telemetry_sidebar(
             z_short = t.zone.value.split()[0] if hasattr(t.zone, 'value') else str(t.zone)
             pose_status = "17点骨骼活跃" if t.keypoints else "休眠"
             cat_cn = "行人" if "person" in str(t.category).lower() else str(t.category)
-            put_sb(f"ID:{t.track_id} [{cat_cn}] {t.ground_dist:.1f}m ({z_short}) vr:{t.radial_speed:+.1f}m/s", y_base, font_size=12, color=(220, 220, 220))
+            sess_txt = f"({t.person_session_id})" if t.person_session_id else ""
+            put_sb(f"ID:{t.track_id}{sess_txt} [{cat_cn}] {t.ground_dist:.1f}m ({z_short}) vr:{t.radial_speed:+.1f}m/s", y_base, font_size=12, color=(220, 220, 220))
             put_sb(f"姿态: {pose_status} | 驻留: {t.cumulative_dwell_time:.1f}s", y_base + 14, font_size=11, color=(120, 255, 180))
 
     # 4. 车身敏感部位 (Zone 3 Fixed ROIs)
@@ -1198,7 +1199,8 @@ def run_video_pipeline(
             color = (0, 255, 120) if t.is_whitelisted else ((0, 160, 255) if "Zone 2" in z_short else (255, 180, 0))
             cv2.rectangle(render_frame, (bx, by), (bx + bw, by + bh), color, 2)
 
-            info_text = f"ID:{t.track_id} {cat_short} | {t.ground_dist:.1f}m ({z_short}) | vr:{t.radial_speed:+.1f}m/s"
+            sess_suffix = f"({t.person_session_id})" if t.person_session_id else ""
+            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {t.ground_dist:.1f}m ({z_short}) | vr:{t.radial_speed:+.1f}m/s"
             cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 

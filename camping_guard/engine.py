@@ -220,8 +220,12 @@ class CampingGuardEngine:
         # 6. 目标追踪与防区测距
         with self.profiler.profile_stage("Tracking_and_ReID"):
             if self.bytetracker is not None:
-                # 使用车载轻量 ByteTrack 引擎
-                tracked_entities = self.bytetracker.update(raw_detections, current_time)
+                # 使用车载轻量 ByteTrack 引擎 (内嵌 Deep-ByteTrack 遮挡重识别外观召回)
+                tracked_entities = self.bytetracker.update(
+                    raw_detections, current_time,
+                    frame=primary_frame,
+                    reid_extractor=self.reid_extractor
+                )
                 for t in tracked_entities:
                     cam_id = getattr(t, 'camera_id', primary_cam_id)
                     dist = self.distance_estimator.estimate_ground_distance(t.bbox.bottom_center, frame_shape, camera_id=cam_id)
@@ -245,24 +249,38 @@ class CampingGuardEngine:
                         reid_sess = getattr(self.reid_extractor, 'session', None)
                         with self.profiler.profile_model("OSNet-ReID", condition=f"ID:{t.track_id} ByteTrack建档", session=reid_sess):
                             t.reid_feature = self.reid_extractor.extract_from_frame(primary_frame, t.bbox)
-                        if self.session_manager:
-                            sess, is_new = self.session_manager.match_or_create_session(
-                                t.track_uid, t.reid_feature, current_time, quality_score=t.confidence, camera_id=cam_id
-                            )
-                            t.person_session_id = sess.session_id
-                            if not is_new:
-                                t.cumulative_dwell_time = max(t.cumulative_dwell_time, sess.cumulative_dwell_time)
-                            if sess.is_whitelisted and not t.is_whitelisted:
-                                t.is_whitelisted = True
-                                t.face_state = FaceIDState.VERIFIED
-                                t.face_id_name = sess.whitelist_name
-                        # 持久化同步写回底层 STrack 缓存，杜绝下帧重复推理
-                        if st is not None:
-                            st.reid_feature = t.reid_feature
-                            st.person_session_id = t.person_session_id
-                            st.is_whitelisted = t.is_whitelisted
-                            st.face_state = t.face_state
-                            st.face_id_name = t.face_id_name
+
+                    if t.category == 'person' and t.reid_feature is not None and self.session_manager:
+                        sess, is_new = self.session_manager.match_or_create_session(
+                            t.track_uid, t.reid_feature, current_time, quality_score=t.confidence, camera_id=cam_id, track_id=t.track_id
+                        )
+                        t.person_session_id = sess.session_id
+                        if not is_new:
+                            t.cumulative_dwell_time = max(t.cumulative_dwell_time, sess.cumulative_dwell_time)
+                            # 跨长时遮挡缝合根轨迹 ID，保证目标被遮挡重现后 ID 绝对稳定不变
+                            if sess.root_track_id is not None and sess.root_track_id != t.track_id:
+                                old_id = t.track_id
+                                root_id = sess.root_track_id
+                                self.bytetracker.reassign_track_id(old_id, root_id)
+                                self.distance_estimator.reassign_track_id(old_id, root_id)
+                                self.zone_filter.reassign_track_id(old_id, root_id)
+                                self.pose_classifier.reassign_track_id(old_id, root_id)
+                                t.track_id = root_id
+                                t.track_uid = f"cam{cam_id}_trk{root_id}"
+                                st = self.bytetracker.get_track(root_id)
+
+                        if sess.is_whitelisted and not t.is_whitelisted:
+                            t.is_whitelisted = True
+                            t.face_state = FaceIDState.VERIFIED
+                            t.face_id_name = sess.whitelist_name
+
+                    # 持久化同步写回底层 STrack 缓存，杜绝下帧重复推理
+                    if st is not None:
+                        st.reid_feature = t.reid_feature
+                        st.person_session_id = t.person_session_id
+                        st.is_whitelisted = t.is_whitelisted
+                        st.face_state = t.face_state
+                        st.face_id_name = t.face_id_name
                 self.active_targets = tracked_entities
             else:
                 # 使用基础 TrackManager 流程 (向下兼容)

@@ -100,6 +100,7 @@ class PersonSession:
     is_whitelisted: bool = False          # 是否确认为白名单
     whitelist_name: Optional[str] = None  # 白名单姓名/身份备注
     current_track_uids: List[str] = field(default_factory=list) # 当前绑定的活跃轨迹
+    root_track_id: Optional[int] = None   # 首次建档绑定的原始轨迹 ID (用于跨遮挡恢复原始 ID)
 
 @dataclass
 class TrackedEntity:

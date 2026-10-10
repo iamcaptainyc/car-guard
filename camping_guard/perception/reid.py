@@ -166,17 +166,26 @@ class PersonSessionManager:
         feature: np.ndarray,
         current_time: float,
         quality_score: float = 0.8,
-        camera_id: int = 0
+        camera_id: int = 0,
+        track_id: Optional[int] = None
     ) -> Tuple[PersonSession, bool]:
         """
         根据当前人体 ReID 特征匹配全局人员会话
         :return: (PersonSession, is_new_session)
         """
+        if track_id is None and "trk" in track_uid:
+            try:
+                track_id = int(track_uid.split("trk")[-1])
+            except ValueError:
+                track_id = None
+
         # 1. 如果该 track_uid 已经绑定会话，直接返回
         if track_uid in self.track_uid_to_session:
             sid = self.track_uid_to_session[track_uid]
             session = self.sessions[sid]
             session.last_seen_time = current_time
+            if session.root_track_id is None and track_id is not None:
+                session.root_track_id = track_id
             # 尝试增量更新特征库 (防污染入库)
             self._try_add_exemplar(session, feature, quality_score, camera_id, current_time)
             return session, False
@@ -208,6 +217,8 @@ class PersonSessionManager:
             session = self.sessions[best_sid]
             session.last_seen_time = current_time
             session.visit_count += 1
+            if session.root_track_id is None and track_id is not None:
+                session.root_track_id = track_id
             if track_uid not in session.current_track_uids:
                 session.current_track_uids.append(track_uid)
             self.track_uid_to_session[track_uid] = session.session_id
@@ -226,7 +237,8 @@ class PersonSessionManager:
             cumulative_dwell_time=0.0,
             visit_count=1,
             is_whitelisted=False,
-            current_track_uids=[track_uid]
+            current_track_uids=[track_uid],
+            root_track_id=track_id
         )
         # 初始特征直接入库
         new_session.exemplars.append(ReIDExemplar(

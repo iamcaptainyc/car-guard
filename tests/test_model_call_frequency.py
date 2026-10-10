@@ -158,3 +158,54 @@ def test_faceid_scrfd_cooldown_throttling():
 
     # 在 1 秒跨度下，0.5s 冷却应仅允许触发约 2~3 次 SCRFD (原先 30 帧会触发 30 次！)
     assert scrfd_call_count <= 3, f"SCRFD 冷却失效，30 帧内调用了 {scrfd_call_count} 次！"
+
+def test_occlusion_reid_track_recovery():
+    """验证目标被偶尔遮挡、IoU 失效重现后，通过 ReID 维持原有 track_id 不跳变"""
+    engine = CampingGuardEngine(use_bytetrack=True)
+    engine.vehicle_bus.uwb_key_pos = None
+    engine.state_machine.operating_mode = OperatingMode.OUT_CAR
+    engine.state_machine.is_system_active = True
+
+    # 模拟一致的 ReID 512 维特征
+    fixed_feat = np.ones(512, dtype=np.float32)
+    fixed_feat /= np.linalg.norm(fixed_feat)
+
+    engine.reid_extractor = MagicMock()
+    engine.reid_extractor.extract_from_frame.return_value = fixed_feat
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    now = 1000.0
+
+    # 阶段 1: 目标在场 5 帧 (位置 x=100)
+    for i in range(5):
+        dets = [{'bbox': (100, 100, 50, 150), 'conf': 0.95, 'category': 'person'}]
+        engine.process_tick(
+            camera_frames={0: dummy_frame},
+            raw_detections=dets,
+            current_time=now + i * 0.033
+        )
+    assert len(engine.active_targets) == 1
+    init_tid = engine.active_targets[0].track_id
+
+    # 阶段 2: 目标被车辆/立柱遮挡 10 帧 (画面中无检测框)
+    for i in range(5, 15):
+        engine.process_tick(
+            camera_frames={0: dummy_frame},
+            raw_detections=[],
+            current_time=now + i * 0.033
+        )
+    assert len(engine.active_targets) == 0
+
+    # 阶段 3: 目标从遮挡后走出，出现在新位置 (x=250，与原有位置 IoU 为 0)
+    dets_reappear = [{'bbox': (250, 100, 50, 150), 'conf': 0.95, 'category': 'person'}]
+    engine.process_tick(
+        camera_frames={0: dummy_frame},
+        raw_detections=dets_reappear,
+        current_time=now + 15 * 0.033
+    )
+
+    # 核心断言: 重现后目标必须通过 ReID 恢复初始 ID，绝对不得变成新 ID！
+    assert len(engine.active_targets) == 1
+    reappeared_tid = engine.active_targets[0].track_id
+    assert reappeared_tid == init_tid, f"遮挡后 ID 发生跳变！原 ID={init_tid}, 重现后 ID={reappeared_tid}"
+

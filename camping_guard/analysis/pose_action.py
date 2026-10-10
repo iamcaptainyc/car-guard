@@ -18,6 +18,13 @@ class PoseActionClassifier:
         # 记录目标历史脚踝位置用于踢踹检测: {track_id: [(time, ankle_x, ankle_y)]}
         self.ankle_history: Dict[int, list] = {}
 
+    def reassign_track_id(self, old_id: int, new_id: int):
+        """跨遮挡 ReID 轨迹重新关联时同步动作时序状态"""
+        if old_id in self.action_states:
+            self.action_states[new_id] = self.action_states.pop(old_id)
+        if old_id in self.ankle_history:
+            self.ankle_history[new_id] = self.ankle_history.pop(old_id)
+
     def classify_action(
         self,
         target: TrackedEntity,
