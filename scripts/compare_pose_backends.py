@@ -68,13 +68,28 @@ def extract_person_frame_and_bbox(video_path: str, target_frame_idx: int = -1):
 
         if detector is not None:
             dets = detector.detect(frame)
-            person_dets = [d for d in dets if d.category == 'person']
+            person_dets = []
+            for d in dets:
+                cat = d.get('category') if isinstance(d, dict) else getattr(d, 'category', None)
+                if cat == 'person':
+                    person_dets.append(d)
+
             if person_dets:
-                top_p = max(person_dets, key=lambda d: d.confidence)
-                if top_p.confidence > best_conf:
-                    best_conf = top_p.confidence
+                def get_conf(det):
+                    return det.get('conf', 0.0) if isinstance(det, dict) else getattr(det, 'confidence', 0.0)
+
+                top_p = max(person_dets, key=get_conf)
+                conf = get_conf(top_p)
+                if conf > best_conf:
+                    best_conf = conf
                     best_frame = frame.copy()
-                    bx, by, bw, bh = top_p.bbox.to_xywh()
+                    if isinstance(top_p, dict):
+                        bx, by, bw, bh = top_p['bbox']
+                    elif hasattr(top_p, 'bbox'):
+                        b = top_p.bbox
+                        bx, by, bw, bh = b.to_xywh() if hasattr(b, 'to_xywh') else (b.x, b.y, b.w, b.h)
+                    else:
+                        bx, by, bw, bh = 0, 0, 0, 0
                     best_bbox = (int(bx), int(by), int(bw), int(bh))
                     if best_conf > 0.60:
                         break
