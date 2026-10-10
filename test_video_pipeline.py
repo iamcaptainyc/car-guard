@@ -704,7 +704,8 @@ def run_video_pipeline(
     use_trt: bool = False,
     enable_web: bool = False,
     web_port: int = 8080,
-    vlm_engine_path: Optional[str] = None
+    vlm_engine_path: Optional[str] = None,
+    edgellm_dir: Optional[str] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -887,11 +888,15 @@ def run_video_pipeline(
     print(f"[*] 系统激活状态: {msg}")
     engine.vehicle_bus.uwb_key_pos = None # 默认钥匙不在现场
 
-    # 挂载端侧按需低功耗 Qwen-VLM 后端 (若指定)
-    if vlm_engine_path:
-        from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
-        engine.vlm_reviewer.backend = TRTEdgeLLMOnDemandBackend(engine_path=vlm_engine_path)
-        print(f"[*] 成功挂载端侧按需低功耗 Qwen-VLM 引擎: {vlm_engine_path}")
+    # 挂载端侧按需低功耗 Qwen-VLM 后端 (支持 TensorRT-Edge-LLM C++ 原生运行与路径自发现)
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+    vlm_backend = TRTEdgeLLMOnDemandBackend(engine_path=vlm_engine_path, edgellm_dir=edgellm_dir)
+    engine.vlm_reviewer.backend = vlm_backend
+    vlm_backend._probe_paths()
+    if vlm_backend._resolved_edgellm_bin or vlm_backend._resolved_engine_dir:
+        print(f"[*] 成功挂载端侧按需低功耗 Qwen-VLM 引擎: engine={vlm_backend._resolved_engine_dir}, bin={vlm_backend._resolved_edgellm_bin}")
+    elif vlm_engine_path:
+        print(f"[*] 成功挂载端侧按需 Qwen-VLM (离线语义兜底): {vlm_engine_path}")
 
     # 4. 规范化引擎证据录像器：统一设置为标准 30 FPS，环形缓冲容量确保满足事前 10s (450 帧)
     import collections
@@ -1526,6 +1531,10 @@ def main():
                         help="启用内置 Web 实时流仪表盘 (无头设备/远程服务器专属，浏览器访问即可实时查看视频与遥测)")
     parser.add_argument("--web-port", type=int, default=8080,
                         help="Web 实时流端口号 (默认 8080)")
+    parser.add_argument("--vlm-engine", type=str, default=None,
+                        help="显式指定端侧 Qwen-VLM .engine 模型或目录路径")
+    parser.add_argument("--edgellm-dir", type=str, default=None,
+                        help="TensorRT-Edge-LLM 构建目录 (默认自动探测)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1556,7 +1565,8 @@ def main():
         use_trt=args.use_trt,
         enable_web=args.web,
         web_port=args.web_port,
-        vlm_engine_path=args.vlm_engine
+        vlm_engine_path=args.vlm_engine,
+        edgellm_dir=args.edgellm_dir
     )
 
 

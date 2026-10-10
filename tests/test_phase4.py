@@ -347,3 +347,121 @@ def test_evidence_recorder_30s_30fps_normal_flow_playback():
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+def test_trt_edgellm_backend_path_probing_and_fallback():
+    """测试 TensorRT-Edge-LLM 后端路径推导与离线保底行为 (含驻留时间动态注入)"""
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    backend = TRTEdgeLLMOnDemandBackend(
+        engine_path="non_existent/qwen3.5-2b.engine",
+        edgellm_dir="non_existent/build"
+    )
+    backend._probe_paths()
+
+    # 路径不存在时，安全降级且不抛出未捕获异常
+    assert backend._resolved_edgellm_bin is None
+
+    # 测试短时间滞留 (<=10s)
+    event_short = ThreatEventRecord(
+        event_id="EVT_VLM_TRT_001",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.DOOR_HANDLE_PULL,
+        description="拉门把手",
+        has_contact_signal=True,
+        target_dwell_time=4.5,
+        target_distance=0.8
+    )
+    res_short = backend.infer(event_short)
+    assert res_short["action_category"] == "DOOR_HANDLE_TAMPERING"
+    assert "徘徊" not in res_short["summary_text"]
+    assert res_short["is_human_contact"] is True
+
+    # 测试长时间徘徊 (>10s) 自动融合滞留时间
+    event_long = ThreatEventRecord(
+        event_id="EVT_VLM_TRT_002",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.WINDOW_PEEKING,
+        description="窥视",
+        has_contact_signal=False,
+        target_dwell_time=15.2,
+        target_distance=1.2
+    )
+    res_long = backend.infer(event_long)
+    assert "徘徊" in res_long["summary_text"]
+    assert "15.2" in res_long["summary_text"]
+    assert len(res_long["summary_text"]) <= 50
+
+
+def test_trt_edgellm_native_cpp_ipc_mocked(monkeypatch):
+    """测试 TensorRT-Edge-LLM C++ 原生轻量二进制 IPC 推理流程 (模拟真实 Orin 运行环境)"""
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+    import subprocess
+
+    temp_dir = tempfile.mkdtemp(prefix="test_edgellm_")
+    try:
+        mock_bin = Path(temp_dir) / "llm_inference"
+        mock_bin.write_text("#!/bin/sh\nexit 0\n")
+        mock_engine = Path(temp_dir) / "qwen3.5-2b"
+        mock_engine.mkdir()
+
+        backend = TRTEdgeLLMOnDemandBackend(
+            engine_path=str(mock_engine),
+            edgellm_dir=temp_dir
+        )
+        backend._resolved_edgellm_bin = mock_bin
+        backend._resolved_engine_dir = mock_engine
+
+        # 模拟 C++ 二进制执行并写入合规的 output.json
+        def mock_subprocess_run(cmd, **kwargs):
+            # 找到 --outputFile 参数后面的路径
+            out_idx = cmd.index("--outputFile") + 1
+            out_file = Path(cmd[out_idx])
+            simulated_vlm_json = {
+                "action_category": "CABIN_PEEKING",
+                "confidence": 0.96,
+                "is_human_contact": False,
+                "is_false_alarm": False,
+                "threat_escalation": "MAINTAIN",
+                "summary_text": "监测到可疑人员在主驾车窗贴近窥探，已自动警戒。"
+            }
+            out_data = {
+                "responses": [
+                    {"text": f"```json\n{json.dumps(simulated_vlm_json, ensure_ascii=False)}\n```"}
+                ]
+            }
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(out_data, f, ensure_ascii=False)
+
+            class DummyCompletedProcess:
+                returncode = 0
+                stdout = "Inference completed in 180ms"
+                stderr = ""
+            return DummyCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        event = ThreatEventRecord(
+            event_id="EVT_CPP_001",
+            timestamp=time.time(),
+            threat_level=ThreatLevel.L2_WARNING,
+            operating_mode=OperatingMode.IN_CAR,
+            action_type=ActionType.WINDOW_PEEKING,
+            description="车窗窥视测试",
+            target_dwell_time=12.0,
+            target_distance=0.9
+        )
+
+        res = backend.infer(event, keyframes=[dummy_frame])
+        assert res is not None
+        assert res["action_category"] == "CABIN_PEEKING"
+        assert res["confidence"] == 0.96
+        assert "窥探" in res["summary_text"]
+        assert len(res["summary_text"]) <= 50
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+

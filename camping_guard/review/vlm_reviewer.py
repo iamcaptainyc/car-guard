@@ -4,13 +4,19 @@
 """
 
 from typing import Dict, List, Optional, Tuple, Any, Callable
+import os
+import sys
 import time
 import json
 import base64
 import queue
+import shutil
+import tempfile
 import threading
+import subprocess
 import urllib.request
 import urllib.error
+from pathlib import Path
 import numpy as np
 
 from camping_guard.types import ThreatLevel, ActionType, ThreatEventRecord
@@ -201,15 +207,23 @@ class LocalHttpVLMBackend(VLMBackendBase):
 
 class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
     """
-    基于 tensorrt-edge-llm / TensorRT-LLM 的车载端侧按需低功耗 VLM 推理后端
-    专为端侧部署的 qwen3.5-2b.engine (Qwen2.5-VL-2B / Qwen3.5-2B) 打造。
+    基于 NVIDIA TensorRT-Edge-LLM 的车载端侧按需低功耗 VLM 推理后端
+    专为端侧部署的 qwen3.5-2b (Qwen2.5-VL-2B / Qwen3.5-2B) 多模态模型打造。
 
-    低功耗与按需执行特性：
-    1. 零常驻服务守护进程：杜绝 vLLM / HTTP 服务 24h 驻留显存导致的 15~25W 持续怠速功耗与电瓶亏电
-    2. 门控唤醒 (Gate-Triggered)：平时 0% GPU / 0% CPU 沉睡，仅在快通路触发 L2/L3 或车身敏感 ROI 触碰时按需唤醒
-    3. 进程内直调：通过 tensorrt-edge-llm 运行时动态加载本地 .engine 直接推理
-    4. 执行完毕即时回落：产出 <=50 字中文战报与结构化决策后，GPU 频率迅速降回最低待机状态
-    5. 无物理环境/缺少库时安全降级：若宿主机无硬件环境，自动回退到保底规则，杜绝程序崩溃
+    端侧最高效执行架构设计 (按需门控唤醒 + C++ 原生运行 + 即时显存释放)：
+    1. 零常驻服务守护进程：
+       - 彻底杜绝 vLLM / Ollama / Triton 等后台常驻服务 24 小时占用 4~8GB 显存并维持高频率怠速 (持续消耗 15~25W 导致电瓶亏电)。
+       - 平时 (99.9% 监控工况) 保持 0% GPU 显存占用、0% CPU 大模型负载，仅运行微秒级轻量检测器。
+    2. 门控唤醒 (Gate-Triggered On-Demand)：
+       - 仅在快通路触发 L2/L3 高威胁或车身核心接触报警时，由门控机制在慢通路异步按需拉起。
+    3. C++ 原生执行 (Pure C++ Zero-Python-Overhead Runtime)：
+       - 优先调用 TensorRT-Edge-LLM 官方编译的原生二进制 `llm_inference`，跳过 Python GIL 与 PyTorch 庞大运行时。
+       - 通过轻量 IPC JSON 传递关键帧图片与上下文，直接利用 Orin TensorRT 与专用 SM87 插件加速。
+    4. 执行完毕即时回落 (Instant Memory Reclaim)：
+       - 产出 <=50 字结构化判定与人性化通报后，进程立即退出，OS 内核瞬间回收全部 CUDA 显存，GPU 回归待机休眠。
+    5. 全自动路径推导与智能降级：
+       - 自动检索 EDGELLM_BUILD_DIR、系统环境变量及 Orin 默认安装路径 (/home/nvidia/qwen35-orin/...)。
+       - 在开发主机或无硬件环境时，无缝衔接高保真端侧规则兜底引擎，保障单元测试与全流程绝对稳定。
     """
     SYSTEM_PROMPT = (
         "你是一个部署在智能汽车座舱域控制器上的安全哨兵多模态复核大模型。"
@@ -227,51 +241,253 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
     def __init__(
         self,
-        engine_path: str = "models/vlm/qwen3.5-2b.engine",
+        engine_path: Optional[str] = None,
+        edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
-        timeout: float = 3.0
+        timeout: float = 8.0,
+        max_tokens: int = 128
     ):
-        self.engine_path = engine_path
+        self.engine_path_arg = engine_path
+        self.edgellm_dir_arg = edgellm_dir
         self.model_name = model_name
         self.timeout = timeout
+        self.max_tokens = max_tokens
         self.fallback_mock = MockVLMBackend()
-        self._runner = None
-        self._init_attempted = False
 
-    def _try_init_runner(self):
-        if self._init_attempted:
+        self._resolved_engine_dir: Optional[Path] = None
+        self._resolved_visual_dir: Optional[Path] = None
+        self._resolved_edgellm_bin: Optional[Path] = None
+        self._paths_probed = False
+
+    def _probe_paths(self):
+        """自动推导并探测 TensorRT-Edge-LLM 运行目录与 Qwen 模型路径"""
+        if self._paths_probed:
             return
-        self._init_attempted = True
+        self._paths_probed = True
 
-        if not os.path.exists(self.engine_path):
-            print(f"[i] [VLM Backend] 未在 '{self.engine_path}' 找到 Qwen-VLM TensorRT 引擎，将按需采用高保真端侧语义保底引擎")
-            return
+        # 1. 探测 TensorRT-Edge-LLM build 目录与 llm_inference 二进制
+        bin_candidates = []
+        dir_candidates = []
 
-        try:
-            # 优先尝试导入端侧专用 tensorrt-edge-llm 框架
-            import tensorrt_edge_llm as trt_edge
-            print(f"[*] [VLM Backend] 成功检测到 tensorrt-edge-llm 运行时，挂载端侧模型: {self.engine_path}")
-            self._runner = trt_edge.ModelRunner(self.engine_path)
-        except ImportError:
-            try:
-                # 兼容 TensorRT-LLM 官方 Python 绑定
-                import tensorrt_llm
-                print(f"[*] [VLM Backend] 成功检测到 tensorrt_llm 运行时，挂载端侧模型: {self.engine_path}")
-                self._runner = None
-            except ImportError:
-                print(f"[i] [VLM Backend] 当前环境未安装 tensorrt-edge-llm (非 Jetson 物理机或开发测试环境)，已自动挂载端侧高保真语义复核引擎")
+        if self.edgellm_dir_arg:
+            dir_candidates.append(Path(self.edgellm_dir_arg))
+        for env_var in ["EDGELLM_BUILD_DIR", "EDGELLM_DIR", "TRT_EDGELLM_DIR"]:
+            val = os.environ.get(env_var)
+            if val:
+                dir_candidates.append(Path(val))
 
-    def infer(
+        # Jetson Orin 默认常见构建路径
+        default_jetson_builds = [
+            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build"),
+            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM"),
+            Path("/home/nvidia/TensorRT-Edge-LLM/build"),
+            Path("/home/nvidia/TensorRT-Edge-LLM"),
+            Path.home() / "qwen35-orin/TensorRT-Edge-LLM/build",
+            Path("../TensorRT-Edge-LLM/build"),
+            Path("TensorRT-Edge-LLM/build"),
+        ]
+        dir_candidates.extend(default_jetson_builds)
+
+        for d in dir_candidates:
+            if d and d.exists():
+                cands = [
+                    d / "examples" / "llm" / "llm_inference",
+                    d / "bin" / "llm_inference",
+                    d / "llm_inference",
+                ]
+                for c in cands:
+                    if c.is_file() and os.access(c, os.X_OK):
+                        bin_candidates.append(c)
+
+        which_bin = shutil.which("llm_inference")
+        if which_bin:
+            bin_candidates.append(Path(which_bin))
+
+        if bin_candidates:
+            self._resolved_edgellm_bin = bin_candidates[0]
+            print(f"[*] [TRT-Edge-LLM] 定位到 C++ 推理二进制: {self._resolved_edgellm_bin}")
+
+        # 2. 探测 Qwen 模型引擎路径
+        engine_candidates = []
+        if self.engine_path_arg:
+            engine_candidates.append(Path(self.engine_path_arg))
+
+        for env_var in ["QWEN_ENGINE_DIR", "VLM_ENGINE_DIR", "EDGELLM_ENGINE_DIR"]:
+            val = os.environ.get(env_var)
+            if val:
+                engine_candidates.append(Path(val))
+
+        default_model_paths = [
+            Path("/home/nvidia/qwen35-orin/models/vlm/qwen3.5-2b"),
+            Path("/home/nvidia/qwen35-orin/engines/qwen3.5-2b"),
+            Path("/home/nvidia/qwen35-orin/engines"),
+            Path("/home/nvidia/qwen35-orin/qwen3.5-2b"),
+            Path("/home/nvidia/qwen35-orin/qwen35-2b"),
+            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/engines"),
+            Path("models/vlm/qwen3.5-2b.engine"),
+            Path("models/vlm/qwen3.5-2b"),
+            Path("models/vlm/qwen2.5-vl-2b.engine"),
+            Path("models/vlm/qwen2.5-vl-2b"),
+            Path("qwen3.5-2b.engine"),
+        ]
+        engine_candidates.extend(default_model_paths)
+
+        for ep in engine_candidates:
+            if ep and ep.exists():
+                # 若为目录，细化 llm 和 visual 引擎
+                if ep.is_dir():
+                    llm_sub = ep / "llm"
+                    visual_sub = ep / "visual"
+                    if not visual_sub.exists():
+                        visual_sub = ep / "visual_engines"
+                    if not visual_sub.exists():
+                        visual_sub = ep / "multimodal"
+
+                    if llm_sub.is_dir():
+                        self._resolved_engine_dir = llm_sub
+                        self._resolved_visual_dir = visual_sub if visual_sub.is_dir() else None
+                    else:
+                        self._resolved_engine_dir = ep
+                        self._resolved_visual_dir = visual_sub if visual_sub.is_dir() else None
+                else:
+                    self._resolved_engine_dir = ep.parent if ep.is_file() else ep
+                    self._resolved_visual_dir = None
+                print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM 引擎: {self._resolved_engine_dir}")
+                if self._resolved_visual_dir:
+                    print(f"[*] [TRT-Edge-LLM] 定位到视觉编码器引擎: {self._resolved_visual_dir}")
+                break
+
+    def _infer_native_cpp(
         self,
         event_record: ThreatEventRecord,
         keyframes: Optional[List[np.ndarray]] = None
-    ) -> Dict[str, Any]:
-        """按需执行端侧 VLM 视觉推理与语义战报生成"""
-        self._try_init_runner()
+    ) -> Optional[Dict[str, Any]]:
+        """最高效调用方案：通过 TensorRT-Edge-LLM 官方 C++ 原生二进制无守护进程推理"""
+        if not self._resolved_edgellm_bin or not self._resolved_engine_dir:
+            return None
 
-        # 若真实端侧引擎可用，执行进程内直调
-        if self._runner is not None:
-            try:
+        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
+        dist_m = getattr(event_record, "target_distance", 0.0)
+        target_cat = getattr(event_record, "target_category", "person")
+
+        prompt_text = (
+            f"{self.SYSTEM_PROMPT}\n\n"
+            f"当前事件动作: {event_record.action_type.value}, 目标类别: {target_cat}, "
+            f"滞留时间: {dwell_s:.1f}秒, 空间距离: {dist_m:.1f}米, "
+            f"是否有物理接触信号: {event_record.has_contact_signal}。\n"
+            "请输出判定 JSON："
+        )
+
+        tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_")
+        tmp_dir_path = Path(tmp_dir)
+        try:
+            input_file = tmp_dir_path / "input.json"
+            output_file = tmp_dir_path / "output.json"
+
+            content_list: List[Dict[str, Any]] = []
+
+            # 关键帧处理：优化分辨率至不超过 640px 以确保 ViT 编码器百毫秒内完成
+            if keyframes and len(keyframes) > 0:
+                import cv2
+                img = keyframes[0]
+                h, w = img.shape[:2]
+                max_dim = max(h, w)
+                if max_dim > 640:
+                    scale = 640.0 / max_dim
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+                img_path = tmp_dir_path / "keyframe.jpg"
+                cv2.imwrite(str(img_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                content_list.append({"type": "image", "image": str(img_path.resolve())})
+
+            content_list.append({"type": "text", "text": prompt_text})
+
+            req_payload = {
+                "batch_size": 1,
+                "temperature": 0.1,
+                "max_generate_length": self.max_tokens,
+                "requests": [
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": content_list
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            with open(input_file, "w", encoding="utf-8") as f:
+                json.dump(req_payload, f, ensure_ascii=False)
+
+            cmd = [
+                str(self._resolved_edgellm_bin),
+                "--engineDir", str(self._resolved_engine_dir),
+                "--inputFile", str(input_file),
+                "--outputFile", str(output_file),
+                "--temperature", "0.1",
+                "--maxGenerateLength", str(self.max_tokens)
+            ]
+            if self._resolved_visual_dir:
+                cmd.extend(["--multimodalEngineDir", str(self._resolved_visual_dir)])
+
+            t0 = time.time()
+            res = subprocess.run(cmd, timeout=self.timeout, capture_output=True, text=True)
+            elapsed_ms = (time.time() - t0) * 1000.0
+
+            if res.returncode == 0 and output_file.exists():
+                with open(output_file, "r", encoding="utf-8") as f:
+                    out_data = json.load(f)
+
+                output_str = ""
+                if isinstance(out_data, dict):
+                    if "responses" in out_data and len(out_data["responses"]) > 0:
+                        output_str = out_data["responses"][0].get("text", "")
+                    elif "choices" in out_data and len(out_data["choices"]) > 0:
+                        output_str = out_data["choices"][0].get("text", "") or out_data["choices"][0].get("message", {}).get("content", "")
+                    elif "text" in out_data:
+                        output_str = out_data["text"]
+                elif isinstance(out_data, list) and len(out_data) > 0:
+                    first = out_data[0]
+                    if isinstance(first, dict):
+                        output_str = first.get("text", "") or first.get("response", "")
+
+                if output_str:
+                    raw_text = output_str.strip()
+                    if "```" in raw_text:
+                        raw_text = raw_text.split("```")[1]
+                        if raw_text.startswith("json"):
+                            raw_text = raw_text[4:]
+                    if "{" in raw_text and "}" in raw_text:
+                        s = raw_text.find("{")
+                        e = raw_text.rfind("}") + 1
+                        parsed = json.loads(raw_text[s:e])
+                        if "summary_text" in parsed:
+                            parsed["summary_text"] = parsed["summary_text"][:50]
+                        print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 ({elapsed_ms:.1f}ms): {parsed.get('summary_text')}")
+                        return parsed
+            else:
+                print(f"[!] [TRT-Edge-LLM] 二进制推理非零退出 (code {res.returncode}): {res.stderr[:200]}")
+        except Exception as e:
+            print(f"[!] [TRT-Edge-LLM] 原生推理过程捕获异常: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return None
+
+    def _infer_python_bindings(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """备选方案：通过已安装的 tensorrt_edgellm Python 绑定进行进程内直调"""
+        try:
+            import tensorrt_edgellm as trt_edge
+            if not hasattr(self, "_py_runner") or self._py_runner is None:
+                if self._resolved_engine_dir:
+                    self._py_runner = trt_edge.ModelRunner(str(self._resolved_engine_dir))
+            if getattr(self, "_py_runner", None):
                 dwell_s = getattr(event_record, "target_dwell_time", 0.0)
                 dist_m = getattr(event_record, "target_distance", 0.0)
                 prompt = (
@@ -280,7 +496,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     f"滞留时间: {dwell_s:.1f}秒, 空间距离: {dist_m:.1f}米, 是否有物理接触信号: {event_record.has_contact_signal}。\n"
                     "请输出判定 JSON："
                 )
-                output_str = self._runner.generate(prompt, keyframes=keyframes[:2] if keyframes else None)
+                output_str = self._py_runner.generate(prompt, keyframes=keyframes[:2] if keyframes else None)
                 if output_str:
                     raw_text = output_str.strip()
                     if "```" in raw_text:
@@ -294,10 +510,29 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         if "summary_text" in parsed:
                             parsed["summary_text"] = parsed["summary_text"][:50]
                         return parsed
-            except Exception as e:
-                print(f"[!] [VLM Backend] 端侧 Qwen-VLM 推理执行异常，安全降级至保底规则: {e}")
+        except Exception:
+            pass
+        return None
 
-        # 端侧语义保底规则 (结合滞留时间、目标类型与车身接触综合生成精准战报)
+    def infer(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Dict[str, Any]:
+        """端侧 VLM 视觉推理与语义战报生成入口"""
+        self._probe_paths()
+
+        # 1. 优先尝试最高效的 C++ 原生按需推理 (零常驻守护进程、即时显存回收)
+        res_cpp = self._infer_native_cpp(event_record, keyframes)
+        if res_cpp is not None:
+            return res_cpp
+
+        # 2. 备选尝试 Python 原生绑定
+        res_py = self._infer_python_bindings(event_record, keyframes)
+        if res_py is not None:
+            return res_py
+
+        # 3. 开发测试/离线主机兜底：挂载端侧高保真语义复核规则 (融合滞留时间与空间距离)
         res = self.fallback_mock.infer(event_record, keyframes)
         dwell_s = getattr(event_record, "target_dwell_time", 0.0)
         dist_m = getattr(event_record, "target_distance", 0.0)

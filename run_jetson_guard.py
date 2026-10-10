@@ -120,10 +120,16 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     vlm_cands = [
         models_dir / "vlm" / "qwen3.5-2b.engine",
         models_dir / "vlm" / "qwen2.5-vl-2b.engine",
+        Path("/home/nvidia/qwen35-orin/models/vlm/qwen3.5-2b"),
+        Path("/home/nvidia/qwen35-orin/engines/qwen3.5-2b"),
+        Path("/home/nvidia/qwen35-orin/engines"),
+        Path("/home/nvidia/qwen35-orin/qwen3.5-2b"),
+        Path("/home/nvidia/qwen35-orin/qwen35-2b"),
+        Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/engines"),
         Path("qwen3.5-2b.engine")
     ]
     for c in vlm_cands:
-        if c.is_file():
+        if c.is_file() or c.is_dir():
             engine_status["vlm"] = c
             break
 
@@ -196,6 +202,8 @@ def main():
                         help="启用内置 Web 实时流仪表盘 (默认开启，远程浏览器直接查看效果)")
     parser.add_argument("--no-web", action="store_true", help="关闭 Web 实时推流仪表盘")
     parser.add_argument("--web-port", type=int, default=8080, help="Web 实时流端口号 (默认: 8080)")
+    parser.add_argument("--edgellm-dir", type=str, default=None, help="TensorRT-Edge-LLM 构建目录 (默认自动推导)")
+    parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
 
     args = parser.parse_args()
 
@@ -267,7 +275,8 @@ def main():
         output_path=args.output,
         enable_web=args.web and not args.no_web,
         web_port=args.web_port,
-        vlm_engine_path=vlm_eng
+        vlm_engine_path=vlm_eng,
+        edgellm_dir=args.edgellm_dir
     )
 
 
