@@ -259,6 +259,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self._resolved_engine_dir: Optional[Path] = None
         self._resolved_visual_dir: Optional[Path] = None
         self._resolved_edgellm_bin: Optional[Path] = None
+        self._resolved_build_dir: Optional[Path] = None
+        self._resolved_plugin_path: Optional[Path] = None
         self._paths_probed = False
 
     def _probe_paths(self):
@@ -307,7 +309,22 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         if bin_candidates:
             self._resolved_edgellm_bin = bin_candidates[0]
+            # 向上推导 build 目录并定位 libNvInfer_edgellm_plugin.so
+            b_cand = self._resolved_edgellm_bin.parent
+            if (b_cand / "libNvInfer_edgellm_plugin.so").exists():
+                self._resolved_build_dir = b_cand
+            elif (b_cand.parent / "libNvInfer_edgellm_plugin.so").exists():
+                self._resolved_build_dir = b_cand.parent
+            elif (b_cand.parent.parent / "libNvInfer_edgellm_plugin.so").exists():
+                self._resolved_build_dir = b_cand.parent.parent
+
+            if self._resolved_build_dir:
+                plugin_file = self._resolved_build_dir / "libNvInfer_edgellm_plugin.so"
+                if plugin_file.exists():
+                    self._resolved_plugin_path = plugin_file
             print(f"[*] [TRT-Edge-LLM] 定位到 C++ 推理二进制: {self._resolved_edgellm_bin}")
+            if self._resolved_plugin_path:
+                print(f"[*] [TRT-Edge-LLM] 定位到专用 SM87 插件: {self._resolved_plugin_path}")
 
         # 2. 探测 Qwen 模型引擎路径 (包括 LLM 语言引擎与 Visual 视觉编码器引擎)
         engine_candidates = []
@@ -320,6 +337,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 engine_candidates.append(Path(val))
 
         default_model_paths = [
+            Path("/home/nvidia/models/Qwen3.5-0.8B"),
+            Path("/home/nvidia/models/Qwen3.5-2B"),
+            Path("/home/nvidia/models/qwen3.5-2b"),
             Path("/home/nvidia/qwen35-orin/models/vlm/qwen3.5-2b"),
             Path("/home/nvidia/qwen35-orin/engines/qwen3.5-2b"),
             Path("/home/nvidia/qwen35-orin/engines"),
@@ -341,21 +361,28 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         for ep in engine_candidates:
             if ep and ep.exists():
                 if ep.is_dir():
-                    # 场景 1: 传入总目录，内部拆分了 llm 与 visual / visual_engines
+                    # 场景 1: <模型目录>/engines/llm 与 <模型目录>/engines/visual 结构
                     llm_sub = None
-                    for cand_llm in ["llm", "engines", "text", "llm_engines"]:
-                        if (ep / cand_llm).is_dir():
-                            llm_sub = ep / cand_llm
-                            break
-
                     visual_sub = None
-                    if self._resolved_visual_dir is None:
+                    if (ep / "engines" / "llm").is_dir():
+                        llm_sub = ep / "engines" / "llm"
+                    if (ep / "engines" / "visual").is_dir() and self._resolved_visual_dir is None:
+                        visual_sub = ep / "engines" / "visual"
+
+                    # 场景 2: 传入总目录，内部直接拆分了 llm 与 visual / visual_engines
+                    if not llm_sub:
+                        for cand_llm in ["llm", "engines", "text", "llm_engines"]:
+                            if (ep / cand_llm).is_dir():
+                                llm_sub = ep / cand_llm
+                                break
+
+                    if not visual_sub and self._resolved_visual_dir is None:
                         for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
                             if (ep / cand_vis).is_dir():
                                 visual_sub = ep / cand_vis
                                 break
 
-                    # 场景 2: 传入的是 llm 目录本身 (如 .../qwen3.5-2b/llm)，寻找同级 visual 目录
+                    # 场景 3: 传入的是 llm 目录本身 (如 .../qwen3.5-2b/llm)，寻找同级 visual 目录
                     if not visual_sub and self._resolved_visual_dir is None:
                         for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
                             if (ep.parent / cand_vis).is_dir():
@@ -366,7 +393,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                                 visual_sub = ep.parent.parent / cand_vis / ep.name
                                 break
 
-                    # 场景 3: 目录下直接包含 visual*.engine 或 visual_encoder 权重文件
+                    # 场景 4: 目录下直接包含 visual*.engine 或 visual_encoder 权重文件
                     if not visual_sub and self._resolved_visual_dir is None:
                         has_visual_file = any("visual" in f.name.lower() or "multimodal" in f.name.lower() for f in ep.iterdir() if f.is_file())
                         if has_visual_file:
@@ -411,7 +438,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             "请输出判定 JSON："
         )
 
-        tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_")
+        # 优先使用 Linux /dev/shm 内存盘加速 (0ms 磁盘读写延迟，0 闪存损耗)
+        shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
+        tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_", dir=shm_dir)
         tmp_dir_path = Path(tmp_dir)
         try:
             input_file = tmp_dir_path / "input.json"
@@ -435,10 +464,16 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
             content_list.append({"type": "text", "text": prompt_text})
 
+            # 严格遵循 TensorRT-Edge-LLM 官方多模态请求契约
             req_payload = {
                 "batch_size": 1,
-                "temperature": 0.1,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 1,
                 "max_generate_length": self.max_tokens,
+                "apply_chat_template": True,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
                 "requests": [
                     {
                         "messages": [
@@ -452,21 +487,29 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             }
 
             with open(input_file, "w", encoding="utf-8") as f:
-                json.dump(req_payload, f, ensure_ascii=False)
+                json.dump(req_payload, f, ensure_ascii=False, indent=2)
 
             cmd = [
                 str(self._resolved_edgellm_bin),
                 "--engineDir", str(self._resolved_engine_dir),
                 "--inputFile", str(input_file),
                 "--outputFile", str(output_file),
-                "--temperature", "0.1",
-                "--maxGenerateLength", str(self.max_tokens)
+                "--maxGenerateLength", str(self.max_tokens),
+                "--dumpOutput"
             ]
             if self._resolved_visual_dir:
                 cmd.extend(["--multimodalEngineDir", str(self._resolved_visual_dir)])
 
+            # 注入专用 SM87 插件与运行时动态库环境变量
+            env = os.environ.copy()
+            if self._resolved_plugin_path and self._resolved_plugin_path.exists():
+                env["EDGELLM_PLUGIN_PATH"] = str(self._resolved_plugin_path)
+            if self._resolved_build_dir and self._resolved_build_dir.exists():
+                curr_ld = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = f"{self._resolved_build_dir}:{curr_ld}" if curr_ld else str(self._resolved_build_dir)
+
             t0 = time.time()
-            res = subprocess.run(cmd, timeout=self.timeout, capture_output=True, text=True)
+            res = subprocess.run(cmd, env=env, timeout=self.timeout, capture_output=True, text=True)
             elapsed_ms = (time.time() - t0) * 1000.0
 
             if res.returncode == 0 and output_file.exists():
@@ -476,7 +519,12 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 output_str = ""
                 if isinstance(out_data, dict):
                     if "responses" in out_data and len(out_data["responses"]) > 0:
-                        output_str = out_data["responses"][0].get("text", "")
+                        resp0 = out_data["responses"][0]
+                        output_str = resp0.get("output_text", "") or resp0.get("text", "") or resp0.get("response", "")
+                    elif "choices" in out_data and len(out_data["choices"]) > 0:
+                        output_str = out_data["choices"][0].get("text", "") or out_data["choices"][0].get("message", {}).get("content", "")
+                    elif "text" in out_data:
+                        output_str = out_data["text"]
                     elif "choices" in out_data and len(out_data["choices"]) > 0:
                         output_str = out_data["choices"][0].get("text", "") or out_data["choices"][0].get("message", {}).get("content", "")
                     elif "text" in out_data:
