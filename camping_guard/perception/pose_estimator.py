@@ -167,17 +167,50 @@ class RTMPoseEstimator(BasePoseEstimator):
         else:
             valid_x_min, valid_x_max, valid_y_min, valid_y_max = None, None, None, None
 
+        HEAD_KPTS = {"nose", "left_eye", "right_eye", "left_ear", "right_ear"}
+        HIP_KPTS = {"left_hip", "right_hip"}
+
         for i, name in enumerate(KEYPOINT_NAMES):
             vx = simcc_x[i]
             vy = simcc_y[i]
 
+            # 解剖学生理空间约束 (抑制 FP16 量化在极端高对比暗夜/地面火光反射下产生的偶发假阳性峰值)
+            # 头部关键点在标准站立人体切片中物理位于上半身 (前 60% 区域，vy 索引 < 300)
+            if name in HEAD_KPTS and len(vy) >= 512:
+                raw_max_idx = int(np.argmax(vy))
+                if raw_max_idx > 300: # 峰值错误漂移到底部地面反射区
+                    upper_vy = vy[:300]
+                    if np.max(upper_vy) > 0.15:
+                        idx_y = float(np.argmax(upper_vy)) / self.simcc_split_ratio
+                        conf_y = float(np.max(upper_vy))
+                    else:
+                        idx_y = float(raw_max_idx) / self.simcc_split_ratio
+                        conf_y = float(np.max(vy))
+                else:
+                    idx_y = float(raw_max_idx) / self.simcc_split_ratio
+                    conf_y = float(np.max(vy))
+            elif name in HIP_KPTS and len(vy) >= 512:
+                raw_max_idx = int(np.argmax(vy))
+                if raw_max_idx > 420: # 髋关节错误漂移到脚踝区
+                    mid_vy = vy[120:420]
+                    if np.max(mid_vy) > 0.15:
+                        idx_y = float(120 + np.argmax(mid_vy)) / self.simcc_split_ratio
+                        conf_y = float(np.max(mid_vy))
+                    else:
+                        idx_y = float(raw_max_idx) / self.simcc_split_ratio
+                        conf_y = float(np.max(vy))
+                else:
+                    idx_y = float(raw_max_idx) / self.simcc_split_ratio
+                    conf_y = float(np.max(vy))
+            else:
+                idx_y = float(np.argmax(vy)) / self.simcc_split_ratio
+                conf_y = float(np.max(vy))
+
             # 提取最大概率索引并除以 split_ratio
             idx_x = float(np.argmax(vx)) / self.simcc_split_ratio
-            idx_y = float(np.argmax(vy)) / self.simcc_split_ratio
 
             # 计算置信度 (取两个维度的概率峰值均值)
             conf_x = float(np.max(vx))
-            conf_y = float(np.max(vy))
             conf = min(1.0, max(0.0, (conf_x + conf_y) / 2.0))
 
             # 逆仿射变换还原回全图坐标
