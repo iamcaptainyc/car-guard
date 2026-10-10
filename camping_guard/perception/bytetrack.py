@@ -278,7 +278,16 @@ class ByteTracker:
 
                     # 跨遮挡外观相似度门禁 (>= 0.65 判定为同一目标被遮挡重现)
                     if best_lost_trk is not None and best_sim >= 0.65:
-                        best_lost_trk.update(det, self.frame_id, current_time)
+                        # 核心修复: 目标被遮挡重现后，位置可能发生显著空间跳跃，
+                        # 必须将卡尔曼滤波器重置/对齐至当前最新检测框测量值，
+                        # 杜绝 Kalman 平滑滤波导致的目标框滞后、悬空漂移与关键点/画面延迟不匹配
+                        best_lost_trk.mean, best_lost_trk.covariance = best_lost_trk.kalman.initiate(det.initial_measurement)
+                        best_lost_trk.score = det.score
+                        best_lost_trk.category = det.category
+                        best_lost_trk.state = 1
+                        best_lost_trk.is_activated = True
+                        best_lost_trk.frame_id = self.frame_id
+                        best_lost_trk.last_seen_time = current_time
                         best_lost_trk.reid_feature = feat
                         refind_stracks.append(best_lost_trk)
                         lost_candidates.remove(best_lost_trk)

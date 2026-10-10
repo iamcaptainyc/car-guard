@@ -1268,7 +1268,14 @@ def run_video_pipeline(
             target_wall_time = start_wall_time + (frame_idx * target_frame_interval)
             remaining_sec = target_wall_time - now_render
             wait_ms = max(1, int(remaining_sec * 1000.0)) if remaining_sec > 0 else 1
-            # 严禁使用 cap.grab() 物理抽帧丢帧，确保 100% 原始帧送入录制缓冲与感知流水线
+            # 追赶物理时钟与排空硬件驱动队列:
+            # 当单帧 AI 耗时超出帧间隔时 (如 Jetson Orin 耗时 ~55ms > 33ms)，
+            # 必须快速抓取跳过积压陈旧帧，保障实时流以 1.0x 真实流速播放，杜绝硬件队列积压导致的数秒级画面延迟
+            if remaining_sec < -0.04:
+                lag_frames = min(int((-remaining_sec) / target_frame_interval), 3)
+                for _ in range(lag_frames):
+                    cap.grab()
+                    frame_idx += 1
         else:
             # 同步模式: 减去当帧算法处理耗时
             e2e_ms = tick_res.get("e2e_ms", 0.0)
