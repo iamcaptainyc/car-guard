@@ -100,7 +100,7 @@ class STrack:
     """单条目标轨迹状态"""
     _count = 0
 
-    def __init__(self, bbox_xywh: Tuple[float, float, float, float], score: float, category: str, initial_dwell: float = 0.0):
+    def __init__(self, bbox_xywh: Tuple[float, float, float, float], score: float, category: str, initial_dwell: float = 0.0, current_time: Optional[float] = None):
         STrack._count += 1
         self.track_id = STrack._count
         self.category = category
@@ -118,8 +118,9 @@ class STrack:
 
         self.frame_id = 0
         self.tracklet_len = 0
-        self.first_seen_time = time.time()
-        self.last_seen_time = self.first_seen_time
+        now_t = current_time if current_time is not None else time.time()
+        self.first_seen_time = now_t
+        self.last_seen_time = now_t
         self.cumulative_dwell_time = initial_dwell
         self.ground_dist = 5.0
         self.radial_speed = 0.0
@@ -160,9 +161,10 @@ class STrack:
         self.is_activated = True
 
         dt = current_time - self.last_seen_time
+        if dt <= 0 or dt > 1.0:
+            dt = 1.0 / 25.0
         self.last_seen_time = current_time
-        if self.zone in [VehicleZone.ZONE_1_OUTER, VehicleZone.ZONE_2_INNER]:
-            self.cumulative_dwell_time += dt
+        self.cumulative_dwell_time += dt
 
     def mark_lost(self):
         self.state = 2
@@ -212,7 +214,7 @@ class ByteTracker:
             conf = d.get('conf', 0.5)
             cat = d.get('category', 'person')
             bbox = tuple(d['bbox'])
-            st = STrack(bbox, conf, cat)
+            st = STrack(bbox, conf, cat, current_time=current_time)
             if conf >= self.high_thresh:
                 high_dets.append(st)
             elif conf >= self.low_thresh:
@@ -300,6 +302,8 @@ class ByteTracker:
             # 继承或赋予新 ID
             det.frame_id = self.frame_id
             det.is_activated = True
+            det.first_seen_time = current_time
+            det.last_seen_time = current_time
             activated_stracks.append(det)
 
         # 7. 更新内部轨迹集合与清理超时 Lost 轨迹

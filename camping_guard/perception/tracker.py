@@ -49,15 +49,15 @@ class TargetTrackManager:
                 # 目标持续在场，累加时长
                 entity = self.active_tracks[tid]
                 dt = current_time - entity.last_seen_time
+                if dt <= 0:
+                    dt = 1.0 / 25.0
                 entity.last_seen_time = current_time
                 entity.bbox = det['bbox']
                 entity.ground_dist = det['dist']
                 entity.radial_speed = det['radial_speed']
                 entity.zone = det['zone']
                 entity.confidence = det['conf']
-                # 仅在警戒区 (Zone 1/2) 内累加滞留时间
-                if entity.zone in [VehicleZone.ZONE_1_OUTER, VehicleZone.ZONE_2_INNER]:
-                    entity.cumulative_dwell_time += dt
+                entity.cumulative_dwell_time += dt
 
                 # 全局会话时长同步
                 if self.session_manager and entity.track_uid:

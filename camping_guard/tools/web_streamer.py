@@ -78,18 +78,18 @@ WEB_UI_HTML = """<!DOCTYPE html>
         body { background-color: var(--bg-dark); color: var(--text-main); display: flex; flex-direction: column; min-height: 100vh; overflow-x: hidden; }
         
         /* 顶部导航与全局遥测条 */
-        header { background: var(--panel-bg); border-bottom: 1px solid var(--border-color); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .logo { font-size: 17px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
+        header { background: var(--panel-bg); border-bottom: 1px solid var(--border-color); padding: 8px 16px; height: 50px; display: flex; justify-content: space-between; align-items: center; flex-wrap: nowrap; overflow-x: auto; gap: 10px; flex-shrink: 0; }
+        .logo { font-size: 17px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
         .logo-tag { font-size: 12px; background: #047857; color: #fff; padding: 2px 8px; border-radius: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
         .pulse-dot { width: 8px; height: 8px; background-color: #34d399; border-radius: 50%; display: inline-block; animation: pulse-live 1.5s infinite; }
         @keyframes pulse-live { 0% { transform: scale(0.9); opacity: 0.7; } 50% { transform: scale(1.3); opacity: 1; } 100% { transform: scale(0.9); opacity: 0.7; } }
         
-        .telemetry-bar { display: flex; gap: 8px; font-size: 12px; flex-wrap: wrap; align-items: center; }
-        .badge { background: var(--card-bg); border: 1px solid var(--border-color); padding: 5px 10px; border-radius: 6px; display: flex; align-items: center; gap: 6px; }
+        .telemetry-bar { display: flex; gap: 8px; font-size: 12px; flex-wrap: nowrap; align-items: center; flex-shrink: 0; }
+        .badge { background: var(--card-bg); border: 1px solid var(--border-color); padding: 5px 10px; border-radius: 6px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
         .badge b { color: #fff; }
         
         /* 主体布局 */
-        main { display: flex; flex: 1; padding: 12px; gap: 12px; width: 100%; height: calc(100vh - 60px); }
+        main { display: flex; flex: 1; padding: 12px; gap: 12px; width: 100%; height: calc(100vh - 50px); overflow: hidden; }
         .video-box { flex: 7; background: #000; border-radius: 8px; border: 1px solid var(--border-color); overflow: hidden; display: flex; justify-content: center; align-items: center; position: relative; }
         .video-box img { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: -webkit-optimize-contrast; }
         
@@ -101,13 +101,24 @@ WEB_UI_HTML = """<!DOCTYPE html>
         .card h3 { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border-color); padding-bottom: 4px; display: flex; justify-content: space-between; align-items: center; }
         .card-count { font-size: 11px; background: #26344d; color: #94a3b8; padding: 1px 6px; border-radius: 10px; }
         
-        /* 数据表格 */
-        .table-wrap { width: 100%; overflow-x: auto; max-height: 180px; }
+        /* 交互控制卡片：置顶吸顶锁定，高度固定，任何后台数据轮询与增删均零抖动、零跳动 */
+        .control-card { position: sticky; top: 0; z-index: 20; background: var(--panel-bg); box-shadow: 0 4px 12px rgba(0,0,0,0.45); flex-shrink: 0; }
+        .btn-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+        button { background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); padding: 8px 4px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 500; transition: background 0.15s, border-color 0.15s; text-align: center; user-select: none; -webkit-user-select: none; }
+        button:hover { background: #222d42; border-color: #3b82f6; color: #fff; }
+        button:active { transform: translateY(1px); }
+        button.warn { background: #5a2e04; border-color: #f59e0b; color: #fff; }
+        button.warn:hover { background: #783d05; }
+        button.danger { background: #5f1515; border-color: #ef4444; color: #fff; }
+        button.danger:hover { background: #7f1d1d; }
+
+        /* 数据表格：固定高度容器，目标出入时不会撑大或收缩页面高度 */
+        .table-wrap { width: 100%; overflow-x: auto; height: 145px; max-height: 145px; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
-        th { background: #1a2233; color: var(--text-muted); padding: 6px 8px; border-bottom: 1px solid var(--border-color); font-weight: 600; white-space: nowrap; }
+        th { background: #1a2233; color: var(--text-muted); padding: 6px 8px; border-bottom: 1px solid var(--border-color); font-weight: 600; white-space: nowrap; position: sticky; top: 0; z-index: 2; }
         td { padding: 6px 8px; border-bottom: 1px solid rgba(38, 52, 77, 0.4); white-space: nowrap; }
         tr:hover td { background-color: var(--card-hover); }
-        .empty-row { text-align: center; color: var(--text-muted); padding: 16px; }
+        .empty-row { text-align: center; color: var(--text-muted); padding: 45px 0; }
         
         /* 滞留时间与状态标签 */
         .dwell-tag { font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
@@ -125,23 +136,14 @@ WEB_UI_HTML = """<!DOCTYPE html>
         .roi-pill.active .status { color: #f87171; }
         .roi-pill.normal .status { color: #34d399; }
         
-        /* 最新威胁事件卡片 */
+        /* 最新威胁事件卡片：固定最小高度以防止出现事件时下方元素跳位 */
+        #latest-event-container { min-height: 115px; max-height: 165px; overflow-y: auto; }
         .event-card { background: #182236; border-left: 4px solid #ef4444; padding: 10px; border-radius: 4px; font-size: 12px; line-height: 1.5; }
         .event-card .evt-header { display: flex; justify-content: space-between; font-weight: 700; margin-bottom: 4px; }
         .event-card .evt-meta { color: var(--text-muted); font-size: 11px; margin-bottom: 6px; }
         .event-card .evt-vlm { background: #0f172a; padding: 6px 8px; border-radius: 4px; border: 1px solid #1e293b; color: #38bdf8; font-size: 12px; margin-bottom: 6px; }
         .event-card .evt-actions { display: flex; gap: 4px; flex-wrap: wrap; }
         .evt-act-tag { background: #1e3a8a; color: #bfdbfe; font-size: 10px; padding: 2px 6px; border-radius: 4px; }
-        
-        /* 交互控制按钮 */
-        .btn-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-        button { background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); padding: 7px 4px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; text-align: center; }
-        button:hover { background: #222d42; border-color: #3b82f6; color: #fff; }
-        button:active { transform: scale(0.97); }
-        button.warn { background: #5a2e04; border-color: #f59e0b; color: #fff; }
-        button.warn:hover { background: #783d05; }
-        button.danger { background: #5f1515; border-color: #ef4444; color: #fff; }
-        button.danger:hover { background: #7f1d1d; }
         
         /* 推送 JSON 抽屉 */
         .json-box { background: #0b0f19; border: 1px solid #1e293b; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 11px; color: #a5f3fc; max-height: 110px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
@@ -176,7 +178,25 @@ WEB_UI_HTML = """<!DOCTYPE html>
             <img id="stream-img" src="/stream.mjpg" alt="实时视频流" />
         </div>
         <div class="sidebar">
-            <!-- 1. 实时目标感知表 (直接展示滞留时间) -->
+            <!-- 1. 远程控制与实车信号注入 (置顶吸顶固定，杜绝任何数据刷新抖动跳位) -->
+            <div class="card control-card">
+                <h3>
+                    <span>控制与实车物理信号注入</span>
+                    <span class="card-count" style="color:#60a5fa;">即时响应</span>
+                </h3>
+                <div class="btn-grid">
+                    <button onclick="sendAction('pause')">⏯ 暂停/继续</button>
+                    <button onclick="sendAction('step')">⏭ 单帧步进</button>
+                    <button onclick="sendAction('reset')">🔄 重播起点</button>
+                    <button onclick="sendAction('toggle_key')">🔑 切换钥匙</button>
+                    <button class="warn" onclick="sendAction('inject_handle')">🚪 CAN拉门</button>
+                    <button class="danger" onclick="sendAction('inject_vibe')">💥 IMU震动</button>
+                    <button onclick="sendAction('test_relay')">🛡 中继防盗</button>
+                    <button class="danger" onclick="if(confirm('确定要停止守卫并保存视频退出吗？')) sendAction('quit')">⏹ 安全退出</button>
+                </div>
+            </div>
+
+            <!-- 2. 实时目标感知表 (直接展示滞留时间) -->
             <div class="card">
                 <h3>
                     <span>动态目标追踪与滞留研判</span>
@@ -201,7 +221,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- 2. 车身 ROI 微动监测 -->
+            <!-- 3. 车身 ROI 微动监测 -->
             <div class="card">
                 <h3>
                     <span>车身固定部件微动守护 (ROI)</span>
@@ -215,26 +235,11 @@ WEB_UI_HTML = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- 3. 最新威胁事件与端侧 VLM 战报 -->
+            <!-- 4. 最新威胁事件与端侧 VLM 战报 -->
             <div class="card">
                 <h3>最新威胁事件与 VLM 复核战报</h3>
                 <div id="latest-event-container">
-                    <div style="color:var(--text-muted); font-size:12px; padding:10px; text-align:center;">暂无防御威胁事件触发</div>
-                </div>
-            </div>
-
-            <!-- 4. 远程控制与实车信号注入 -->
-            <div class="card">
-                <h3>控制与实车物理信号注入</h3>
-                <div class="btn-grid">
-                    <button onclick="sendAction('pause')">⏯ 暂停/继续</button>
-                    <button onclick="sendAction('step')">⏭ 单帧步进</button>
-                    <button onclick="sendAction('reset')">🔄 重播起点</button>
-                    <button onclick="sendAction('toggle_key')">🔑 切换钥匙</button>
-                    <button class="warn" onclick="sendAction('inject_handle')">🚪 CAN拉门</button>
-                    <button class="danger" onclick="sendAction('inject_vibe')">💥 IMU震动</button>
-                    <button onclick="sendAction('test_relay')">🛡 中继防盗</button>
-                    <button class="danger" onclick="if(confirm('确定要停止守卫并保存视频退出吗？')) sendAction('quit')">⏹ 安全退出</button>
+                    <div style="color:var(--text-muted); font-size:12px; padding:35px 10px; text-align:center;">暂无防御威胁事件触发</div>
                 </div>
             </div>
 

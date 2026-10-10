@@ -1216,18 +1216,33 @@ def run_video_pipeline(
         # 绘制车周防区参考线与固定 ROI (根据当前机位 camera_id 独立匹配与渲染)
         draw_vehicle_and_zones(render_frame, engine, camera_id=camera_id)
 
-        # 绘制检测与追踪目标
+        # 绘制检测与追踪目标 (框上所有提示字符 100% 采用 ASCII 英文，杜绝 OpenCV putText 乱码)
         for t in active_targets:
             bx, by, bw, bh = t.bbox.x, t.bbox.y, t.bbox.w, t.bbox.h
             z_val = t.zone.value if hasattr(t.zone, 'value') else str(t.zone)
             z_short = "Zone 2" if ("Zone 2" in z_val or "2" in z_val) else ("Zone 1" if ("Zone 1" in z_val or "1" in z_val) else "Zone 0")
-            cat_short = "Person" if ("person" in str(t.category).lower() or "人" in str(t.category)) else ("Car" if ("veh" in str(t.category).lower() or "车" in str(t.category)) else str(t.category))
+            cat_str = str(t.category).lower()
+            if "person" in cat_str or "人" in str(t.category):
+                cat_short = "Person"
+            elif "car" in cat_str or "veh" in cat_str or "车" in str(t.category):
+                cat_short = "Vehicle"
+            elif "fire" in cat_str or "火" in str(t.category):
+                cat_short = "Fire"
+            elif "smoke" in cat_str or "烟" in str(t.category):
+                cat_short = "Smoke"
+            elif "animal" in cat_str or "兽" in str(t.category) or "物" in str(t.category):
+                cat_short = "Animal"
+            else:
+                cat_short = str(t.category).split(".")[-1].capitalize()
+
             color = (0, 255, 120) if t.is_whitelisted else ((0, 160, 255) if "Zone 2" in z_short else (255, 180, 0))
             cv2.rectangle(render_frame, (bx, by), (bx + bw, by + bh), color, 2)
 
             sess_suffix = f"({t.person_session_id})" if t.person_session_id else ""
-            dwell_s = getattr(t, "cumulative_dwell_time", 0.0)
-            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {t.ground_dist:.1f}m ({z_short}) | 驻留:{dwell_s:.1f}s | vr:{t.radial_speed:+.1f}m/s"
+            dwell_s = max(0.0, float(getattr(t, "cumulative_dwell_time", 0.0)))
+            dist_val = float(getattr(t, "ground_dist", 0.0))
+            vr_val = float(getattr(t, "radial_speed", 0.0))
+            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {dist_val:.1f}m ({z_short}) | Dwell:{dwell_s:.1f}s | vr:{vr_val:+.1f}m/s"
             cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
