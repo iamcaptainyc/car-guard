@@ -27,7 +27,9 @@ class PendingClip:
         trigger_time: float,
         post_end_time: float,
         pre_frames: List[Tuple[float, np.ndarray]],
-        clock_source: ClockSource
+        clock_source: ClockSource,
+        pre_duration_sec: float = 10.0,
+        post_duration_sec: float = 20.0
     ):
         self.event_id = event_id
         self.threat_level_str = threat_level_str
@@ -36,7 +38,58 @@ class PendingClip:
         self.pre_frames = pre_frames
         self.post_frames: List[Tuple[float, np.ndarray]] = []
         self.clock_source = clock_source
+        self.pre_duration_sec = pre_duration_sec
+        self.post_duration_sec = post_duration_sec
         self.is_finalized = False
+
+
+def normalize_clip_frames_to_target_fps(
+    all_frames: List[Tuple[float, np.ndarray]],
+    target_fps: float = 30.0,
+    expected_start: Optional[float] = None,
+    expected_end: Optional[float] = None
+) -> List[np.ndarray]:
+    """
+    根据时间戳严格等间距重采样/对齐视频帧至固定目标帧率 (默认 30.0 FPS)，
+    彻底解决抽帧、变帧率或推理抖动导致的播放倍速快放或慢放问题。
+    确保无论输入源是 25fps、30fps 还是存在丢帧，输出视频均严格以 1.0x 真实物理流速播放。
+    """
+    if not all_frames:
+        return []
+    if len(all_frames) == 1:
+        return [all_frames[0][1]]
+
+    # 提取时间戳并排序
+    sorted_pairs = sorted(all_frames, key=lambda x: x[0])
+    timestamps = np.array([p[0] for p in sorted_pairs], dtype=np.float64)
+    raw_frames = [p[1] for p in sorted_pairs]
+
+    t_start = expected_start if (expected_start is not None and expected_start >= timestamps[0]) else timestamps[0]
+    t_end = expected_end if (expected_end is not None and expected_end <= timestamps[-1]) else timestamps[-1]
+    if t_end <= t_start:
+        t_start = timestamps[0]
+        t_end = timestamps[-1]
+
+    duration = t_end - t_start
+    if duration <= 0:
+        return raw_frames
+
+    # 计算目标总帧数 (例如 30s * 30fps = 900 帧)
+    num_target_frames = max(1, int(round(duration * target_fps)))
+    target_timestamps = np.linspace(t_start, t_end, num_target_frames, endpoint=False)
+
+    # 对每个目标时间点定位最近邻帧
+    indices = np.searchsorted(timestamps, target_timestamps)
+    indices = np.clip(indices, 0, len(timestamps) - 1)
+
+    resampled_frames = []
+    for idx, t_target in zip(indices, target_timestamps):
+        best_idx = idx
+        if idx > 0 and abs(timestamps[idx - 1] - t_target) < abs(timestamps[idx] - t_target):
+            best_idx = idx - 1
+        resampled_frames.append(raw_frames[best_idx])
+
+    return resampled_frames
 
 
 class EvidenceRecorder:
@@ -49,14 +102,14 @@ class EvidenceRecorder:
     def __init__(
         self,
         buffer_duration_sec: float = 15.0,
-        fps: float = 10.0,
+        fps: float = 30.0,
         storage_dir: Optional[str] = None,
         clock_source: ClockSource = ClockSource.GNSS_PPS_SYNC,
         async_encoding: bool = False
     ):
         """
         :param buffer_duration_sec: 内存环形缓冲长度 (秒)
-        :param fps: 录像帧率
+        :param fps: 录像帧率 (默认 30.0 FPS，满足人眼查看的标准流畅视频要求)
         :param storage_dir: 加密/安全存储目录 (模拟车端 eMMC secure partition)
         :param clock_source: 当前硬件授时源
         :param async_encoding: 是否开启后台独立工作线程异步编码落盘 (避免阻塞主视觉流水线)
@@ -173,7 +226,9 @@ class EvidenceRecorder:
             trigger_time=trigger_time,
             post_end_time=post_end_time,
             pre_frames=pre_frames,
-            clock_source=actual_clock
+            clock_source=actual_clock,
+            pre_duration_sec=pre_duration_sec,
+            post_duration_sec=post_duration_sec
         )
         self.pending_clips[event_id] = pending
 
@@ -203,13 +258,25 @@ class EvidenceRecorder:
 
         all_frames = pending.pre_frames + pending.post_frames
 
+        # 0. 规范化重采样为恒定目标帧率 (默认 30 FPS) 正常流速视频帧序列
+        exp_start = pending.trigger_time - getattr(pending, 'pre_duration_sec', 10.0)
+        exp_end = pending.post_end_time
+        resampled_frames = normalize_clip_frames_to_target_fps(
+            all_frames,
+            target_fps=self.fps,
+            expected_start=exp_start,
+            expected_end=exp_end
+        )
+        if not resampled_frames:
+            resampled_frames = [f for _, f in all_frames]
+
         # 1. 编码生成视频文件
         video_filename = f"{event_id}_{int(pending.trigger_time)}.mp4"
         video_path = self.storage_dir / video_filename
 
         frame_h, frame_w = 480, 640
-        if len(all_frames) > 0 and all_frames[0][1] is not None:
-            frame_h, frame_w = all_frames[0][1].shape[:2]
+        if len(resampled_frames) > 0 and resampled_frames[0] is not None:
+            frame_h, frame_w = resampled_frames[0].shape[:2]
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out_writer = cv2.VideoWriter(str(video_path), fourcc, self.fps, (frame_w, frame_h))
@@ -221,12 +288,12 @@ class EvidenceRecorder:
             out_writer = cv2.VideoWriter(str(video_path), fourcc, self.fps, (frame_w, frame_h))
 
         if out_writer.isOpened():
-            for _, frm in all_frames:
+            for frm in resampled_frames:
                 out_writer.write(frm)
             out_writer.release()
         else:
             # 兼容无编码器环境：写入元数据占位文件
-            video_path.write_bytes(f"MOCK_VIDEO_DATA_{event_id}_{len(all_frames)}".encode('utf-8'))
+            video_path.write_bytes(f"MOCK_VIDEO_DATA_{event_id}_{len(resampled_frames)}".encode('utf-8'))
 
         # 2. 计算视频文件的完整 SHA-256 校验和
         video_bytes = video_path.read_bytes()
@@ -247,7 +314,7 @@ class EvidenceRecorder:
                 "clock_source": pending.clock_source.value,
                 "pre_frame_count": len(pending.pre_frames),
                 "post_frame_count": len(pending.post_frames),
-                "total_frame_count": len(all_frames),
+                "total_frame_count": len(resampled_frames),
                 "video_file_name": video_filename,
                 "video_file_sha256": video_file_hash,
                 "prev_hash": self.prev_hash
@@ -278,7 +345,7 @@ class EvidenceRecorder:
                 "video_file_sha256": video_file_hash,
                 "block_hash": block_hash,
                 "clock_source": pending.clock_source.value,
-                "total_frames": len(all_frames),
+                "total_frames": len(resampled_frames),
                 "is_locked": True
             }
             self.locked_evidence.append(evidence_record)

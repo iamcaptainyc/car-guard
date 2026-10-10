@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from pathlib import Path
 import numpy as np
+import cv2
 import pytest
 
 from camping_guard.types import ThreatLevel, ActionType, ThreatEventRecord, OperatingMode, ClockSource
@@ -288,3 +289,61 @@ def test_tamper_evident_sha256_hash_chain():
         assert "哈希链断裂" in del_report or "不符" in del_report
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_evidence_recorder_30s_30fps_normal_flow_playback():
+    """验证事件录像标准化：严格生成 30 FPS、30秒 (事前10s+事后20s=900帧) 且正常 1.0x 物理流速的视频"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        recorder = EvidenceRecorder(
+            buffer_duration_sec=15.0,
+            fps=30.0,
+            storage_dir=temp_dir,
+            clock_source=ClockSource.GNSS_PPS_SYNC
+        )
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(dummy_frame, "TEST_FRAME", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        base_t = 1000.0
+
+        # 模拟 25 FPS 的输入流持续推流 35 秒 (总计 875 帧输入)
+        # 验证自适应重采样引擎能否平滑将 25 FPS 输入标准化为标准的 30 FPS、900 帧 1.0x 流速视频
+        for i in range(250): # 事前 10 秒
+            t = base_t - 10.0 + i * (1.0 / 25.0)
+            recorder.push_frame(dummy_frame, t)
+
+        # 在 base_t 触发事件
+        recorder.lock_event_clip(
+            event_id="EVT_STD_30S_TEST",
+            threat_level_str="L3 紧急",
+            trigger_time=base_t,
+            pre_duration_sec=10.0,
+            post_duration_sec=20.0
+        )
+
+        # 持续推送事后 20 秒 (500 帧输入)
+        for i in range(505):
+            t = base_t + i * (1.0 / 25.0)
+            recorder.push_frame(dummy_frame, t)
+
+        assert len(recorder.locked_evidence) == 1
+        ev = recorder.locked_evidence[0]
+        assert ev["event_id"] == "EVT_STD_30S_TEST"
+
+        video_path = ev["video_path"]
+        assert Path(video_path).exists()
+        assert ev["total_frames"] == 900 # 30s * 30fps = 900 帧整
+
+        # 使用 OpenCV 读取生成的视频属性核验
+        cap = cv2.VideoCapture(video_path)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        assert abs(actual_fps - 30.0) < 0.1 # 容器帧率精确为 30 FPS
+        assert frame_count == 900 # 严格 900 帧
+        # 实际播放时长 = 900 / 30 = 30.0 秒整，彻底解决倍速快进或抽帧慢放
+        playback_duration_sec = frame_count / actual_fps
+        assert abs(playback_duration_sec - 30.0) < 0.1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+

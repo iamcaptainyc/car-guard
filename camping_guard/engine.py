@@ -106,7 +106,7 @@ class CampingGuardEngine:
         self.fusion_engine = MultiSourceFusionEngine()
         self.fire_monitor = CampfireMonitor()
         self.vlm_reviewer = AsyncVLMReviewer()
-        self.recorder = EvidenceRecorder(async_encoding=True)
+        self.recorder = EvidenceRecorder(fps=30.0, buffer_duration_sec=15.0, async_encoding=True)
         self.vehicle_bus = MockVehicleBus()
         self.actuator = VehicleActuator()
 
@@ -520,9 +520,8 @@ class CampingGuardEngine:
             if self._last_locked_event_id:
                 pending_clip = self.recorder.pending_clips.get(self._last_locked_event_id)
                 if pending_clip and not pending_clip.is_finalized:
-                    # 当前事件切片仍在事后录像窗口内：平滑延长事后录制时长（单段最长上限 60 秒）
-                    max_end_time = pending_clip.trigger_time + 60.0
-                    pending_clip.post_end_time = min(max_end_time, max(pending_clip.post_end_time, current_time + 10.0))
+                    # 保持以首个触发报警事件 A 为原点的标准 30s 视窗 (事前 10s + 事后 20s)，
+                    # 在事后 20 秒窗口期内的新伴随事件均被该 30s 黄金证据链完整覆盖，避免切片被不可控拉长
                     need_new_clip = False
                     event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
                 elif current_time - self._last_locked_time < 15.0:

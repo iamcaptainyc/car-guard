@@ -877,11 +877,12 @@ def run_video_pipeline(
     print(f"[*] 系统激活状态: {msg}")
     engine.vehicle_bus.uwb_key_pos = None # 默认钥匙不在现场
 
-    # 4. 同步引擎证据录像器的帧率与原视频对齐 (防止离线视频测试时时间戳脱水失真)
+    # 4. 规范化引擎证据录像器：统一设置为标准 30 FPS，环形缓冲容量确保满足事前 10s (450 帧)
     import collections
     if hasattr(engine, 'recorder') and engine.recorder is not None:
-        engine.recorder.fps = fps
-        engine.recorder.buffer_size = int(15.0 * fps)
+        target_rec_fps = 30.0
+        engine.recorder.fps = target_rec_fps
+        engine.recorder.buffer_size = int(15.0 * target_rec_fps)
         engine.recorder.ring_buffer = collections.deque(maxlen=engine.recorder.buffer_size)
 
     # 看板与视图配置 (默认启用右侧看板，0% 遮挡原始视频区域)
@@ -1267,12 +1268,7 @@ def run_video_pipeline(
             target_wall_time = start_wall_time + (frame_idx * target_frame_interval)
             remaining_sec = target_wall_time - now_render
             wait_ms = max(1, int(remaining_sec * 1000.0)) if remaining_sec > 0 else 1
-            # 追赶物理时钟: 若落后物理时间超过 1 帧 (例如偶发卡顿)，快速 grab 跳过陈旧帧保持与物理时钟严格对齐
-            if remaining_sec < -0.04:
-                lag_frames = min(int((-remaining_sec) / target_frame_interval), 3)
-                for _ in range(lag_frames):
-                    cap.grab()
-                    frame_idx += 1
+            # 严禁使用 cap.grab() 物理抽帧丢帧，确保 100% 原始帧送入录制缓冲与感知流水线
         else:
             # 同步模式: 减去当帧算法处理耗时
             e2e_ms = tick_res.get("e2e_ms", 0.0)
