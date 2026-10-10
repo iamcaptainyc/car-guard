@@ -74,7 +74,8 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
         "pose": None,
         "reid": None,
         "face_det": None,
-        "face_rec": None
+        "face_rec": None,
+        "vlm": None
     }
 
     # 1. YOLO 目标检测
@@ -114,6 +115,17 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     face_rec_cand = models_dir / "insightface" / "w600k_mbf.engine"
     if face_rec_cand.is_file():
         engine_status["face_rec"] = face_rec_cand
+
+    # 6. 端侧 Qwen-VLM 按需多模态复核大模型
+    vlm_cands = [
+        models_dir / "vlm" / "qwen3.5-2b.engine",
+        models_dir / "vlm" / "qwen2.5-vl-2b.engine",
+        Path("qwen3.5-2b.engine")
+    ]
+    for c in vlm_cands:
+        if c.is_file():
+            engine_status["vlm"] = c
+            break
 
     return engine_status
 
@@ -172,8 +184,9 @@ def main():
                         help="显式指定 RTMPose .engine 模型路径 (如 models/pose/rtmpose-s.engine)")
     parser.add_argument("--conf", type=float, default=0.25, help="检测置信度阈值 (默认 0.25)")
     parser.add_argument("--headless", action="store_true", help="无头模式运行 (适用于车载后台守护进程或 SSH 调试)")
-    parser.add_argument("--realtime", action="store_true", default=True, help="启用实时异步流式调度 (默认开启)")
+    parser.add_argument("--sidebar", action="store_true", default=False, help="保留旧版 OpenCV 绘制的 CPU 侧边栏 (默认已禁用以提升性能)")
     parser.add_argument("--no-sidebar", action="store_true", help="关闭右侧看板，使用极简纯画面显示")
+    parser.add_argument("--vlm-engine", type=str, default=None, help="显式指定端侧 Qwen-VLM .engine 模型路径 (如 models/vlm/qwen3.5-2b.engine)")
     parser.add_argument("--output", type=str, default=None, help="保存渲染好的视频文件至路径 (如 output.mp4)")
     parser.add_argument("--loop", dest="loop_video", action="store_true", default=None,
                         help="强制循环播放视频")
@@ -235,6 +248,9 @@ def main():
     if loop_val is None:
         loop_val = False if args.output else True
 
+    vlm_eng = args.vlm_engine or (str(engines["vlm"]) if engines.get("vlm") else None)
+    show_sb = args.sidebar and not args.no_sidebar
+
     print("\n[*] 正在启动车载露营守卫 (TensorRT 模式)...")
     run_video_pipeline(
         video_path=video_source,
@@ -243,14 +259,15 @@ def main():
         detector_onnx_path=args.detector or (str(engines["yolo"]) if engines["yolo"] else None),
         pose_onnx_path=args.pose or (str(engines["pose"]) if engines["pose"] else None),
         conf_threshold=args.conf,
-        show_sidebar=not args.no_sidebar,
+        show_sidebar=show_sb,
         headless=args.headless,
         realtime=args.realtime,
         use_trt=True,
         loop_video=loop_val,
         output_path=args.output,
         enable_web=args.web and not args.no_web,
-        web_port=args.web_port
+        web_port=args.web_port,
+        vlm_engine_path=vlm_eng
     )
 
 

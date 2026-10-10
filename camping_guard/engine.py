@@ -128,6 +128,7 @@ class CampingGuardEngine:
         self.executed_actions: List[str] = []
         self.active_targets: List[TrackedEntity] = []
         self.active_roi_disturbances: List[dict] = []
+        self.historical_threat_events: List[ThreatEventRecord] = [] # 全流程高危威胁事件审计档案
         self.vlm_summaries: List[dict] = []
 
         # 标志位与事件锁存防抖状态
@@ -480,6 +481,16 @@ class CampingGuardEngine:
         self.current_threat_level = highest_threat
         self.latest_event_description = threat_description
 
+        # 提取目标全生命周期画像 (类别、ID、空间距离、关键滞留时长)
+        tgt_cat = target_for_threat.category if target_for_threat else "unknown"
+        tgt_dist = target_for_threat.ground_dist if target_for_threat else 0.0
+        tgt_dwell = target_for_threat.cumulative_dwell_time if target_for_threat else 0.0
+        tgt_vr = target_for_threat.radial_speed if target_for_threat else 0.0
+        tgt_zone = target_for_threat.zone.value if target_for_threat and hasattr(target_for_threat.zone, 'value') else str(target_for_threat.zone if target_for_threat else "")
+        tgt_sess = getattr(target_for_threat, 'person_session_id', None)
+        tgt_white = target_for_threat.is_whitelisted if target_for_threat else False
+        disturbed_rois = [d['name'] if 'name' in d else str(d) for d in self.active_roi_disturbances]
+
         # 11. 构建事件记录
         event_record = ThreatEventRecord(
             event_id=f"EVT_{int(current_time * 1000)}",
@@ -489,7 +500,15 @@ class CampingGuardEngine:
             action_type=highest_action,
             description=threat_description,
             target_id=target_for_threat.track_id if target_for_threat else None,
-            has_contact_signal=has_contact_confirmed
+            has_contact_signal=has_contact_confirmed,
+            target_category=tgt_cat,
+            target_distance=tgt_dist,
+            target_dwell_time=tgt_dwell,
+            target_radial_speed=tgt_vr,
+            target_zone=tgt_zone,
+            person_session_id=tgt_sess,
+            is_whitelisted=tgt_white,
+            disturbed_rois=disturbed_rois
         )
 
         # 12. 慢通路异步 VLM 复核 (阶段 2.2 / 阶段 4)
@@ -510,7 +529,15 @@ class CampingGuardEngine:
                 event_record.final_threat_level = vlm_res["final_threat"]
                 highest_threat = vlm_res["final_threat"]
 
-        # 13. 存证与录像锁存 (阶段 4)
+        # 13. 响应执行器输出动作 (阶段 3)
+        self.executed_actions = self.actuator.execute_response(
+            record=event_record,
+            current_time=current_time,
+            is_fire_event=(highest_action == ActionType.FIRE_SMOKE)
+        )
+        event_record.executed_actions = list(self.executed_actions)
+
+        # 14. 存证与录像锁存 (阶段 4)
         if event_record.threat_level in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL] or highest_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
             self.state_machine.last_high_threat_time = current_time
 
@@ -524,6 +551,13 @@ class CampingGuardEngine:
                     # 在事后 20 秒窗口期内的新伴随事件均被该 30s 黄金证据链完整覆盖，避免切片被不可控拉长
                     need_new_clip = False
                     event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
+                    # 持续动态更新当前活跃切片的最新语义 (更新驻留时长、动作与 VLM 战报)
+                    if hasattr(self.recorder, 'update_clip_metadata'):
+                        self.recorder.update_clip_metadata(self._last_locked_event_id, {
+                            "target_dwell_time_sec": tgt_dwell,
+                            "vlm_summary": event_record.vlm_summary or "",
+                            "executed_actions": list(self.executed_actions)
+                        })
                 elif current_time - self._last_locked_time < 15.0:
                     # 距离上次事件录像完成不足 15 秒冷却窗口，跳过重复创建
                     need_new_clip = False
@@ -533,18 +567,15 @@ class CampingGuardEngine:
                 sig = self.recorder.lock_event_clip(
                     event_id=event_record.event_id,
                     threat_level_str=event_record.threat_level.value,
-                    trigger_time=current_time
+                    trigger_time=current_time,
+                    event_record=event_record
                 )
                 self._last_locked_event_id = event_record.event_id
                 self._last_locked_time = current_time
                 event_record.hash_signature = sig
-
-        # 14. 响应执行器输出动作 (阶段 3)
-        self.executed_actions = self.actuator.execute_response(
-            record=event_record,
-            current_time=current_time,
-            is_fire_event=(highest_action == ActionType.FIRE_SMOKE)
-        )
+                video_filename = f"{event_record.event_id}_{event_record.threat_level.value.replace(' ', '_')}.mp4"
+                event_record.video_clip_path = str(self.recorder.storage_dir / video_filename)
+                self.historical_threat_events.append(event_record)
 
         # 15. 结束当帧性能统计并生成指标快照
         frame_metrics = self.profiler.end_frame(

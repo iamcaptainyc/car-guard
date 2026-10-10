@@ -29,7 +29,8 @@ class PendingClip:
         pre_frames: List[Tuple[float, np.ndarray]],
         clock_source: ClockSource,
         pre_duration_sec: float = 10.0,
-        post_duration_sec: float = 20.0
+        post_duration_sec: float = 20.0,
+        event_metadata: Optional[Dict[str, Any]] = None
     ):
         self.event_id = event_id
         self.threat_level_str = threat_level_str
@@ -41,6 +42,7 @@ class PendingClip:
         self.pre_duration_sec = pre_duration_sec
         self.post_duration_sec = post_duration_sec
         self.is_finalized = False
+        self.event_metadata: Dict[str, Any] = event_metadata or {}
 
 
 def normalize_clip_frames_to_target_fps(
@@ -203,7 +205,9 @@ class EvidenceRecorder:
         trigger_time: float,
         pre_duration_sec: float = 10.0,
         post_duration_sec: float = 20.0,
-        clock_source: Optional[ClockSource] = None
+        clock_source: Optional[ClockSource] = None,
+        event_record: Optional[Any] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         触发事件录像锁存：
@@ -220,6 +224,29 @@ class EvidenceRecorder:
             if t >= pre_start_time and t <= trigger_time
         ]
 
+        # 提取事件完整感知上下文 (目标类别、ID、测距、关键滞留时长等)
+        meta = {}
+        if event_record is not None:
+            meta = {
+                "target_category": getattr(event_record, "target_category", "unknown"),
+                "target_id": getattr(event_record, "target_id", None),
+                "person_session_id": getattr(event_record, "person_session_id", None),
+                "target_distance_m": getattr(event_record, "target_distance", 0.0),
+                "target_dwell_time_sec": getattr(event_record, "target_dwell_time", 0.0),
+                "target_radial_speed_mps": getattr(event_record, "target_radial_speed", 0.0),
+                "target_zone": getattr(event_record, "target_zone", ""),
+                "is_whitelisted": getattr(event_record, "is_whitelisted", False),
+                "action_type": getattr(getattr(event_record, "action_type", None), "value", str(getattr(event_record, "action_type", ""))),
+                "description": getattr(event_record, "description", ""),
+                "has_contact_signal": getattr(event_record, "has_contact_signal", False),
+                "disturbed_rois": list(getattr(event_record, "disturbed_rois", [])),
+                "vlm_summary": getattr(event_record, "vlm_summary", ""),
+                "executed_actions": list(getattr(event_record, "executed_actions", [])),
+                "operating_mode": getattr(getattr(event_record, "operating_mode", None), "value", str(getattr(event_record, "operating_mode", "")))
+            }
+        if metadata:
+            meta.update(metadata)
+
         pending = PendingClip(
             event_id=event_id,
             threat_level_str=threat_level_str,
@@ -228,7 +255,8 @@ class EvidenceRecorder:
             pre_frames=pre_frames,
             clock_source=actual_clock,
             pre_duration_sec=pre_duration_sec,
-            post_duration_sec=post_duration_sec
+            post_duration_sec=post_duration_sec,
+            event_metadata=meta
         )
         self.pending_clips[event_id] = pending
 
@@ -237,6 +265,13 @@ class EvidenceRecorder:
             f"{event_id}|{threat_level_str}|{trigger_time:.3f}|{len(pre_frames)}|{self.prev_hash}".encode('utf-8')
         ).hexdigest()
         return pre_hash
+
+    def update_clip_metadata(self, event_id: str, updates: Dict[str, Any]):
+        """在事后录制窗口期内动态增量更新事件元数据 (例如 VLM 复核结果或执行动作回调)"""
+        with self._lock:
+            pending = self.pending_clips.get(event_id)
+            if pending and hasattr(pending, 'event_metadata'):
+                pending.event_metadata.update(updates)
 
     def finalize_clip(self, event_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -299,7 +334,12 @@ class EvidenceRecorder:
         video_bytes = video_path.read_bytes()
         video_file_hash = hashlib.sha256(video_bytes).hexdigest()
 
-        # 3. 构造防篡改哈希区块 (Hash Chain Block) - 线程安全写入
+        # 3. 构造防篡改哈希区块 (Hash Chain Block) - 包含完整目标画像与语义上下文
+        meta = getattr(pending, 'event_metadata', {}) or {}
+        dwell_sec = round(float(meta.get("target_dwell_time_sec", 0.0)), 1)
+        dist_m = round(float(meta.get("target_distance_m", 0.0)), 2)
+        vr_mps = round(float(meta.get("target_radial_speed_mps", 0.0)), 2)
+
         with self._lock:
             block_index = len(self.manifest)
             formatted_iso_time = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(pending.trigger_time))
@@ -317,7 +357,27 @@ class EvidenceRecorder:
                 "total_frame_count": len(resampled_frames),
                 "video_file_name": video_filename,
                 "video_file_sha256": video_file_hash,
-                "prev_hash": self.prev_hash
+                "prev_hash": self.prev_hash,
+                # 语义审计核心字段
+                "target": {
+                    "category": meta.get("target_category", "unknown"),
+                    "track_id": meta.get("target_id"),
+                    "session_id": meta.get("person_session_id"),
+                    "is_whitelisted": meta.get("is_whitelisted", False),
+                    "distance_m": dist_m,
+                    "dwell_time_sec": dwell_sec,      # 关键指标：在防区内持续累积徘徊/滞留时间 (秒)
+                    "radial_speed_mps": vr_mps,
+                    "zone": meta.get("target_zone", "")
+                },
+                "behavior": {
+                    "action_type": meta.get("action_type", ""),
+                    "description": meta.get("description", ""),
+                    "has_contact_signal": meta.get("has_contact_signal", False),
+                    "disturbed_rois": list(meta.get("disturbed_rois", [])),
+                    "operating_mode": meta.get("operating_mode", "")
+                },
+                "vlm_summary": meta.get("vlm_summary", ""),
+                "executed_actions": list(meta.get("executed_actions", []))
             }
 
             # 严格按字段排序序列化计算区块哈希
@@ -337,6 +397,41 @@ class EvidenceRecorder:
             with open(self.manifest_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(manifest_entry, ensure_ascii=False) + "\n")
 
+            # 写入单事件结构化 JSON 卡片
+            card_file = self.storage_dir / f"{pending.event_id}_event_card.json"
+            try:
+                with open(card_file, "w", encoding="utf-8") as cf:
+                    cf.write(json.dumps(block_payload, indent=2, ensure_ascii=False))
+            except Exception:
+                pass
+
+            clip_duration_sec = len(resampled_frames) / max(self.fps, 1.0)
+            log_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(pending.trigger_time))
+            human_log = (
+                f"\n================================================================================\n"
+                f" 🛡️ 车载露营守卫 - 事件审计卡片 (Block #{block_index})\n"
+                f"================================================================================\n"
+                f" 事件编号       : {pending.event_id}\n"
+                f" 触发时间       : {log_time_str} ({formatted_iso_time})\n"
+                f" 威胁等级       : {pending.threat_level_str} | 运行模式: {meta.get('operating_mode', '未知')}\n"
+                f" 目标主体       : {meta.get('target_category', 'unknown')} (Track ID: {meta.get('target_id', '-')}, 会话: {meta.get('person_session_id') or '无'}) | 白名单: {'是' if meta.get('is_whitelisted') else '否'}\n"
+                f" 空间与测距     : 距离: {dist_m:.1f}m ({meta.get('target_zone', '防区内')}) | 相对速度: {vr_mps:+.1f} m/s\n"
+                f" 徘徊/滞留时间  : {dwell_sec:.1f} 秒 (防区内持续累积)\n"
+                f" 行为与接触     : {meta.get('action_type', '')} ({meta.get('description', '')}) | 物理接触: {'是 (已联合确认)' if meta.get('has_contact_signal') else '否'}\n"
+                f" 车身扰动部位   : {', '.join(meta.get('disturbed_rois', [])) if meta.get('disturbed_rois') else '无'}\n"
+                f" VLM 语义复核   : \"{meta.get('vlm_summary', '')}\"\n"
+                f" 整车联动动作   : {', '.join(meta.get('executed_actions', [])) if meta.get('executed_actions') else '无'}\n"
+                f" 存证录像文件   : {video_path} ({self.fps:.1f} FPS, {clip_duration_sec:.1f}s, 共 {len(resampled_frames)} 帧)\n"
+                f" 视频 SHA-256   : {video_file_hash}\n"
+                f" 防篡改区块哈希 : {block_hash}\n"
+                f"================================================================================\n"
+            )
+            try:
+                with open(self.storage_dir / "guard_events.log", "a", encoding="utf-8") as lf:
+                    lf.write(human_log)
+            except Exception:
+                pass
+
             evidence_record = {
                 "event_id": pending.event_id,
                 "threat_level": pending.threat_level_str,
@@ -346,7 +441,12 @@ class EvidenceRecorder:
                 "block_hash": block_hash,
                 "clock_source": pending.clock_source.value,
                 "total_frames": len(resampled_frames),
-                "is_locked": True
+                "is_locked": True,
+                "target": block_payload["target"],
+                "behavior": block_payload["behavior"],
+                "vlm_summary": block_payload["vlm_summary"],
+                "executed_actions": block_payload["executed_actions"],
+                "payload": block_payload
             }
             self.locked_evidence.append(evidence_record)
             return evidence_record

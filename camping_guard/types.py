@@ -157,7 +157,7 @@ class ClockSource(Enum):
 
 @dataclass
 class ThreatEventRecord:
-    """威胁事件审计记录"""
+    """威胁事件全生命周期审计与推送记录"""
     event_id: str
     timestamp: float
     threat_level: ThreatLevel
@@ -172,6 +172,105 @@ class ThreatEventRecord:
     hash_signature: Optional[str] = None
     final_threat_level: Optional[ThreatLevel] = None
     clock_source: ClockSource = ClockSource.GNSS_PPS_SYNC
+    # 扩展审计与目标语义字段
+    target_category: str = "unknown"
+    target_distance: float = 0.0
+    target_dwell_time: float = 0.0                 # 关键指标：在防区内持续累积徘徊/滞留时间 (秒)
+    target_radial_speed: float = 0.0
+    target_zone: str = ""
+    person_session_id: Optional[str] = None
+    is_whitelisted: bool = False
+    disturbed_rois: List[str] = field(default_factory=list)
+    executed_actions: List[str] = field(default_factory=list)
+
+    def to_push_payload(self) -> Dict[str, Any]:
+        """生成面向车主手机 App / 车联网云端 / Webhook 的标准高效推送报文格式"""
+        iso_str = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(self.timestamp))
+        iso_str += f".{int((self.timestamp % 1) * 1000):03d}Z"
+
+        urgency_map = {
+            ThreatLevel.L0_SAFE: "NORMAL",
+            ThreatLevel.L1_NOTICE: "INFO",
+            ThreatLevel.L2_WARNING: "WARNING",
+            ThreatLevel.L3_CRITICAL: "EMERGENCY"
+        }
+
+        title = f"【露营守卫 {self.threat_level.value}】车周安全警报"
+        if self.threat_level == ThreatLevel.L3_CRITICAL:
+            title = "🚨【紧急高危】车周检测到异常侵入与接触！"
+        elif self.threat_level == ThreatLevel.L2_WARNING:
+            title = "⚠️【预警提示】车周检测到人员可疑逗留徘徊"
+
+        dwell_txt = f"{self.target_dwell_time:.1f}s" if self.target_dwell_time > 0 else "刚出现"
+        body = (
+            f"目标: {self.target_category} (ID:{self.target_id or '-'}) | "
+            f"距离: {self.target_distance:.1f}m ({self.target_zone or '防区内'}) | "
+            f"滞留徘徊: {dwell_txt} | "
+            f"行为: {self.description}"
+        )
+        if self.vlm_summary:
+            body += f" | AI研判: {self.vlm_summary}"
+
+        return {
+            "version": "1.0",
+            "event_id": self.event_id,
+            "timestamp": round(self.timestamp, 3),
+            "iso_time": iso_str,
+            "threat_level": self.threat_level.value,
+            "urgency": urgency_map.get(self.threat_level, "WARNING"),
+            "notification": {
+                "title": title,
+                "body": body,
+                "vlm_summary": self.vlm_summary or ""
+            },
+            "target": {
+                "category": self.target_category,
+                "track_id": self.target_id,
+                "session_id": self.person_session_id,
+                "distance_m": round(self.target_distance, 2),
+                "dwell_time_sec": round(self.target_dwell_time, 1),
+                "radial_speed_mps": round(self.target_radial_speed, 2),
+                "zone": self.target_zone,
+                "is_whitelisted": self.is_whitelisted
+            },
+            "context": {
+                "operating_mode": self.operating_mode.value,
+                "action_type": self.action_type.value,
+                "description": self.description,
+                "has_contact_signal": self.has_contact_signal,
+                "disturbed_rois": list(self.disturbed_rois),
+                "executed_actions": list(self.executed_actions)
+            },
+            "evidence": {
+                "video_clip_path": self.video_clip_path or "",
+                "hash_signature": self.hash_signature or ""
+            }
+        }
+
+    def format_audit_card(self) -> str:
+        """生成人类一目了然的高可读性事件审计卡片"""
+        time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.timestamp))
+        lines = [
+            f"┌─【事件报告: {self.event_id}】" + "─" * 45,
+            f"│ 威胁等级     : {self.threat_level.value} (模式: {self.operating_mode.value})",
+            f"│ 触发时间     : {time_str} (时间戳: {self.timestamp:.3f})",
+            f"│ 目标属性     : 类别={self.target_category} | ID={self.target_id} | 会话={self.person_session_id or '无'} | 白名单={'是' if self.is_whitelisted else '否'}",
+            f"│ 空间与运动   : 距离={self.target_distance:.1f}m ({self.target_zone}) | 径向速度={self.target_radial_speed:+.1f}m/s",
+            f"│ 徘徊滞留时长 : {self.target_dwell_time:.1f} 秒 (防区内持续累积)",
+            f"│ 行为与接触   : 动作={self.action_type.value} | 物理接触={'是 (已联合确认)' if self.has_contact_signal else '否 (纯视觉)'}",
+            f"│ 车身扰动部位 : {', '.join(self.disturbed_rois) if self.disturbed_rois else '无'}",
+            f"│ 事件详述     : {self.description}",
+        ]
+        if self.vlm_summary:
+            lines.append(f"│ VLM 语义复核 : \"{self.vlm_summary}\"")
+        if self.executed_actions:
+            lines.append(f"│ 整车联动动作 : {', '.join(self.executed_actions)}")
+        if self.video_clip_path:
+            lines.append(f"│ 存证视频文件 : {self.video_clip_path}")
+        if self.hash_signature:
+            lines.append(f"│ 防篡改哈希   : {self.hash_signature}")
+        lines.append("└" + "─" * 68)
+        return "\n".join(lines)
 
 @dataclass
 class CameraCalib:

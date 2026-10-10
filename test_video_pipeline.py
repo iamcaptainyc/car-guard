@@ -12,6 +12,15 @@ import threading
 import time
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
+
+if sys.platform.startswith("win"):
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import cv2
 import numpy as np
 
@@ -690,11 +699,12 @@ def run_video_pipeline(
     max_frames: int = None,
     realtime: bool = False,
     conf_threshold: float = 0.25,
-    show_sidebar: bool = True,
+    show_sidebar: bool = False,
     detect_interval: int = 1,
     use_trt: bool = False,
     enable_web: bool = False,
-    web_port: int = 8080
+    web_port: int = 8080,
+    vlm_engine_path: Optional[str] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -876,6 +886,12 @@ def run_video_pipeline(
     success, msg = engine.activate()
     print(f"[*] 系统激活状态: {msg}")
     engine.vehicle_bus.uwb_key_pos = None # 默认钥匙不在现场
+
+    # 挂载端侧按需低功耗 Qwen-VLM 后端 (若指定)
+    if vlm_engine_path:
+        from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+        engine.vlm_reviewer.backend = TRTEdgeLLMOnDemandBackend(engine_path=vlm_engine_path)
+        print(f"[*] 成功挂载端侧按需低功耗 Qwen-VLM 引擎: {vlm_engine_path}")
 
     # 4. 规范化引擎证据录像器：统一设置为标准 30 FPS，环形缓冲容量确保满足事前 10s (450 帧)
     import collections
@@ -1201,7 +1217,8 @@ def run_video_pipeline(
             cv2.rectangle(render_frame, (bx, by), (bx + bw, by + bh), color, 2)
 
             sess_suffix = f"({t.person_session_id})" if t.person_session_id else ""
-            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {t.ground_dist:.1f}m ({z_short}) | vr:{t.radial_speed:+.1f}m/s"
+            dwell_s = getattr(t, "cumulative_dwell_time", 0.0)
+            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {t.ground_dist:.1f}m ({z_short}) | 驻留:{dwell_s:.1f}s | vr:{t.radial_speed:+.1f}m/s"
             cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
@@ -1209,8 +1226,8 @@ def run_video_pipeline(
             if t.keypoints:
                 draw_skeleton(render_frame, t.keypoints, bbox=t.bbox)
 
-        # 画面组合输出: 采用独立侧边栏展示指标，彻底避免遮挡视频画面主体 (0% 遮挡原视频)
-        if view_mode == "SIDEBAR":
+        # 画面组合输出: 默认直通 1080P 原始画面 (0% CPU 绘图损耗，所有遥测指标实时推流至 Web 仪表盘)
+        if show_sidebar and view_mode == "SIDEBAR":
             display_frame = draw_telemetry_sidebar(
                 video_frame=render_frame,
                 engine=engine,
@@ -1230,15 +1247,7 @@ def run_video_pipeline(
                 is_realtime_mode=realtime
             )
         else:
-            # MINIMAL 极简模式: 仅纯视频画面，右上角极小单行半透明状态徽章
-            display_frame = render_frame.copy()
-            ai_badge = f" | AI {ai_e2e_ms:.0f}ms" if realtime else ""
-            status_pill = f"[{tick_res.get('threat_level', 'L0')[:2]}] {real_fps:.1f}FPS{ai_badge} | Frame {frame_idx}"
-            cv2.putText(display_frame, status_pill, (video_w - 250, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
-            if sim_event_msg:
-                draw_text_utf8(display_frame, f"[EVENT] {sim_event_msg}", (20, 25),
-                               font_size=15, color=(50, 255, 255))
+            display_frame = render_frame
 
         # 显示与保存
         if not headless:
@@ -1251,14 +1260,22 @@ def run_video_pipeline(
         if writer:
             writer.write(display_frame)
 
-        # 网页端实时推流与遥测指标同步 (展示的视频 100% 为带有算法标注的实时处理帧)
+        # 网页端实时推流与全维度遥测指标同步 (视频 100% 直通 1080P 原画，指标交由 Web DOM 渲染)
         if web_streamer:
-            web_streamer.push_frame(display_frame)
-            web_streamer.update_meta(
+            web_streamer.push_frame(render_frame)
+            web_streamer.update_telemetry(
+                active_targets=active_targets,
+                active_rois=active_rois,
+                latest_event=engine.historical_threat_events[-1] if getattr(engine, "historical_threat_events", None) else None,
                 threat_level=f"{tick_res.get('threat_level', 'L0')}",
                 state=f"{tick_res.get('state', 'S0')}",
+                mode=f"{tick_res.get('mode', '车内模式')}",
                 fps=real_fps,
-                e2e_ms=ai_e2e_ms or 0.0
+                ai_fps=ai_fps,
+                e2e_ms=ai_e2e_ms or 0.0,
+                frame_idx=frame_idx,
+                total_frames=total_frames,
+                uwb_online=(engine.vehicle_bus.uwb_key_pos is not None)
             )
 
         # 6. 交互按键监听与动态帧率步调控制
@@ -1398,6 +1415,9 @@ def run_video_pipeline(
     # 打印视频全流程端到端与各模型综合性能统计报告
     print("\n" + engine.profiler.format_summary_table())
 
+    # 打印全维度守卫事件审计报告与 App 标准推送 JSON
+    print_guard_event_summary(engine, str(video_path), frame_idx, fps)
+
     # 若指定导出路径，保存为标准化 JSON 报告
     if stats_json_path:
         import json
@@ -1405,6 +1425,59 @@ def run_video_pipeline(
         with open(stats_json_path, "w", encoding="utf-8") as f:
             json.dump(summary_data, f, indent=2, ensure_ascii=False)
         print(f"[OK] 性能评估指标已成功保存为 JSON: {Path(stats_json_path).resolve()}")
+
+
+def print_guard_event_summary(engine: CampingGuardEngine, video_source: str, total_frames: int, fps: float):
+    """
+    打印视频全流程守卫事件审计全貌报告与 App 标准推送 JSON
+    涵盖：事件ID、威胁等级、触发目标类别/ID、距离、滞留时间(驻留秒数)、联动执行动作、VLM 复核战报、证据视频与哈希签名
+    """
+    import json
+    events = getattr(engine, "historical_threat_events", [])
+    duration_sec = total_frames / max(fps, 1.0)
+
+    print("\n" + "=" * 78)
+    print(" [CAMPING GUARD] 露营守卫 - 事件审计与推送全貌报告 (AUDIT REPORT)")
+    print("=" * 78)
+    print(f" 视频源文件 : {video_source}")
+    print(f" 评估时长   : {total_frames} 帧 (约 {duration_sec:.1f} 秒 @ {fps:.1f} FPS)")
+    print(f" 捕获事件数 : 共记录 {len(events)} 次威胁事件")
+    print("-" * 78)
+
+    if not events:
+        print("  [OK] 监控期间未触发任何 L1/L2/L3 威胁事件，车身周围安全无虞。")
+    else:
+        for idx, evt in enumerate(events, 1):
+            print(f"\n【事件 #{idx}】")
+            print(evt.format_audit_card())
+
+        # 打印最高威胁等级事件的移动端/云端标准推送 JSON 格式
+        highest_evt = max(events, key=lambda e: (
+            3 if "L3" in str(e.threat_level) else (
+                2 if "L2" in str(e.threat_level) else (
+                    1 if "L1" in str(e.threat_level) else 0
+                )
+            )
+        ))
+        push_json = highest_evt.to_push_payload()
+
+        print("\n" + "-" * 78)
+        print(" [APP PUSH NOTIFICATION] 【标准移动端 / 云端平台推送通知格式 (JSON)】")
+        print("    (可直接对接车机后台 MQTT、车主手机端推送 FCM/APNs 或座舱大屏卡片)")
+        print("-" * 78)
+        print(json.dumps(push_json, indent=2, ensure_ascii=False))
+
+    # 防篡改哈希链审计
+    if hasattr(engine, "recorder") and engine.recorder is not None:
+        try:
+            is_valid, msg, tampered_idx = engine.recorder.verify_hash_chain()
+            block_count = len(getattr(engine.recorder, "manifest", []))
+            status_tag = "[PASS] 完整合规" if is_valid else f"[FAIL] 区块 #{tampered_idx} 受损"
+            print("-" * 78)
+            print(f" [EVIDENCE CHAIN] 证据链防篡改审计: [{status_tag}] {msg} (共 {block_count} 个区块签名)")
+        except Exception as e:
+            print(f" [!] 证据链校验异常: {e}")
+    print("=" * 78 + "\n")
 
 
 def main():
@@ -1424,8 +1497,12 @@ def main():
                         help="YOLO 目标检测 ONNX 模型文件或名称 (支持自动在 models/yolo/ 查找，如 yolo11n-fisheye.onnx / yolo11s.onnx / yolov8m.onnx / yolo11x-fisheye.onnx)")
     parser.add_argument("--conf", "--conf-threshold", dest="conf_threshold", type=float, default=0.25,
                         help="目标检测置信度阈值 (默认 0.25，鱼眼边缘大畸变视角可调低至 0.15~0.20)")
+    parser.add_argument("--sidebar", action="store_true", default=False,
+                        help="保留旧版 OpenCV 绘制的 CPU 侧边栏 (默认已禁用以降低延迟，推荐使用 Web 仪表盘以获得零开销体验)")
     parser.add_argument("--no-sidebar", action="store_true",
-                        help="关闭右侧独立遥测数据面板，使用纯画面极简模式 (运行时也可按 [v] 键随时切换)")
+                        help="显式关闭右侧独立遥测数据面板 (默认即为关闭)")
+    parser.add_argument("--vlm-engine", type=str, default=None,
+                        help="显式挂载端侧 Qwen-VLM .engine 引擎文件路径 (如 models/vlm/qwen3.5-2b.engine)")
     parser.add_argument("--pose", type=str, default=None,
                         help="RTMPose 姿态估计 ONNX 模型文件路径 (如 rtmpose-s.onnx)")
     parser.add_argument("--reid", type=str, default="models/reid/osnet_x0_25.onnx",
@@ -1455,6 +1532,8 @@ def main():
     if loop_val is None:
         loop_val = False if args.output else True
 
+    show_sb = args.sidebar and not args.no_sidebar
+
     run_video_pipeline(
         video_path=args.video,
         config_path=args.config,
@@ -1472,11 +1551,12 @@ def main():
         max_frames=args.max_frames,
         realtime=args.realtime,
         conf_threshold=args.conf_threshold,
-        show_sidebar=not args.no_sidebar,
+        show_sidebar=show_sb,
         detect_interval=args.detect_interval,
         use_trt=args.use_trt,
         enable_web=args.web,
-        web_port=args.web_port
+        web_port=args.web_port,
+        vlm_engine_path=args.vlm_engine
     )
 
 
