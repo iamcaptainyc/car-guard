@@ -260,8 +260,9 @@ cv::Mat letterbox(const cv::Mat& src, int target_w, int target_h, float& scale, 
     return out;
 }
 
-// 快速归一化与 HWC->CHW 打包
-void blobFromImage(const cv::Mat& bgr, float* blob, float scale_val = 1.0f / 255.0f, bool rgb = true) {
+// 快速归一化与 HWC->CHW 打包 (支持可选均值与方差归一化)
+void blobFromImage(const cv::Mat& bgr, float* blob, float scale_val = 1.0f / 255.0f, bool rgb = true,
+                   const float* mean = nullptr, const float* std = nullptr) {
     int h = bgr.rows;
     int w = bgr.cols;
     int channel_size = h * w;
@@ -273,15 +274,19 @@ void blobFromImage(const cv::Mat& bgr, float* blob, float scale_val = 1.0f / 255
             float g = ptr[x * 3 + 1] * scale_val;
             float r = ptr[x * 3 + 2] * scale_val;
 
-            if (rgb) {
-                blob[0 * channel_size + y * w + x] = r;
-                blob[1 * channel_size + y * w + x] = g;
-                blob[2 * channel_size + y * w + x] = b;
-            } else {
-                blob[0 * channel_size + y * w + x] = b;
-                blob[1 * channel_size + y * w + x] = g;
-                blob[2 * channel_size + y * w + x] = r;
+            float c0 = rgb ? r : b;
+            float c1 = g;
+            float c2 = rgb ? b : r;
+
+            if (mean != nullptr && std != nullptr) {
+                c0 = (c0 - mean[0]) / std[0];
+                c1 = (c1 - mean[1]) / std[1];
+                c2 = (c2 - mean[2]) / std[2];
             }
+
+            blob[0 * channel_size + y * w + x] = c0;
+            blob[1 * channel_size + y * w + x] = c1;
+            blob[2 * channel_size + y * w + x] = c2;
         }
     }
 }
@@ -565,18 +570,37 @@ int main(int argc, char** argv) {
             if (pose_roi.area() > 100) {
                 cv::Mat pose_img;
                 cv::resize(frame(pose_roi), pose_img, cv::Size(192, 256));
-                blobFromImage(pose_img, blob_pose.data());
+                const float mean_pose[3] = {0.485f, 0.456f, 0.406f};
+                const float std_pose[3] = {0.229f, 0.224f, 0.225f};
+                blobFromImage(pose_img, blob_pose.data(), 1.0f / 255.0f, true, mean_pose, std_pose);
                 m_pose = eng_pose.infer(blob_pose.data(), blob_pose.size() * sizeof(float));
 
-                // SimCC 解码关键点
-                const float* sim_x = eng_pose.h_outputs[0].data();
-                const float* sim_y = eng_pose.h_outputs[1].data();
-                for (int k = 0; k < 17; ++k) {
-                    int max_x = std::max_element(sim_x + k * 384, sim_x + (k + 1) * 384) - (sim_x + k * 384);
-                    int max_y = std::max_element(sim_y + k * 512, sim_y + (k + 1) * 512) - (sim_y + k * 512);
-                    int px = target_bbox.x + (max_x / 2.0f / 192.0f) * target_bbox.width;
-                    int py = target_bbox.y + (max_y / 2.0f / 256.0f) * target_bbox.height;
-                    kpts_pts.push_back(cv::Point(px, py));
+                // SimCC 解码关键点: 根据输出缓冲区尺寸严格自适应匹配 simcc_x (17*384) 与 simcc_y (17*512)，杜绝 X/Y 错位
+                const float* sim_x = nullptr;
+                const float* sim_y = nullptr;
+                if (eng_pose.h_outputs.size() >= 2) {
+                    if (eng_pose.h_outputs[0].size() == 17 * 384) {
+                        sim_x = eng_pose.h_outputs[0].data();
+                        sim_y = eng_pose.h_outputs[1].data();
+                    } else if (eng_pose.h_outputs[0].size() == 17 * 512) {
+                        sim_y = eng_pose.h_outputs[0].data();
+                        sim_x = eng_pose.h_outputs[1].data();
+                    } else {
+                        sim_x = eng_pose.h_outputs[0].data();
+                        sim_y = eng_pose.h_outputs[1].data();
+                    }
+                }
+
+                if (sim_x != nullptr && sim_y != nullptr) {
+                    for (int k = 0; k < 17; ++k) {
+                        int max_x = std::max_element(sim_x + k * 384, sim_x + (k + 1) * 384) - (sim_x + k * 384);
+                        int max_y = std::max_element(sim_y + k * 512, sim_y + (k + 1) * 512) - (sim_y + k * 512);
+                        float norm_x = std::min(1.0f, std::max(0.0f, (max_x / 2.0f) / 192.0f));
+                        float norm_y = std::min(1.0f, std::max(0.0f, (max_y / 2.0f) / 256.0f));
+                        int px = target_bbox.x + static_cast<int>(norm_x * target_bbox.width);
+                        int py = target_bbox.y + static_cast<int>(norm_y * target_bbox.height);
+                        kpts_pts.push_back(cv::Point(px, py));
+                    }
                 }
             }
         }

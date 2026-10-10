@@ -488,6 +488,9 @@ def main():
         stat_frec["d2h"].append(m_frec["d2h_ms"])
         stat_frec["trt"].append(m_frec["trt_latency_ms"])
 
+        norm_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        norm_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
         # =====================================================================
         # 4. 人员重识别 (OSNet ReID 原生 TensorRT)
         # =====================================================================
@@ -498,9 +501,7 @@ def main():
             if body_crop.size > 0:
                 body_resized = cv2.resize(body_crop, (128, 256))
                 inp_reid = body_resized[:, :, ::-1].astype(np.float32) / 255.0
-                mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-                std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-                inp_reid = (inp_reid - mean) / std
+                inp_reid = (inp_reid - norm_mean) / norm_std
                 inp_reid = inp_reid.transpose(2, 0, 1)[np.newaxis, ...]
                 if engine_reid.fixed_batch > 1:
                     inp_reid = np.repeat(inp_reid, engine_reid.fixed_batch, axis=0)
@@ -522,16 +523,25 @@ def main():
             if crop_pose.size > 0:
                 pose_resized = cv2.resize(crop_pose, (192, 256))
                 inp_pose = pose_resized[:, :, ::-1].astype(np.float32) / 255.0
-                inp_pose = (inp_pose - mean) / std
+                inp_pose = (inp_pose - norm_mean) / norm_std
                 inp_pose = np.ascontiguousarray(inp_pose.transpose(2, 0, 1)[np.newaxis, ...])
                 out_pose, m_pose = engine_pose.infer(inp_pose)
-                # SimCC 假定骨骼解码
-                simcc_x = out_pose[0][0]
-                simcc_y = out_pose[1][0]
+                # SimCC 骨骼解码 (严格按最后一维特征自适应匹配 simcc_x:384 与 simcc_y:512)
+                out0 = out_pose[0][0]
+                out1 = out_pose[1][0]
+                if out0.shape[-1] == 384 and out1.shape[-1] == 512:
+                    simcc_x, simcc_y = out0, out1
+                elif out0.shape[-1] == 512 and out1.shape[-1] == 384:
+                    simcc_x, simcc_y = out1, out0
+                else:
+                    simcc_x, simcc_y = out0, out1
+
                 for k_i in range(17):
-                    kx = (float(np.argmax(simcc_x[k_i])) / 2.0) / 192.0 * tw + tx
-                    ky = (float(np.argmax(simcc_y[k_i])) / 2.0) / 256.0 * th + ty
-                    kpts_pts.append((int(kx), int(ky)))
+                    norm_x = (float(np.argmax(simcc_x[k_i])) / 2.0) / 192.0
+                    norm_y = (float(np.argmax(simcc_y[k_i])) / 2.0) / 256.0
+                    kx = int(tx + np.clip(norm_x, 0.0, 1.0) * tw)
+                    ky = int(ty + np.clip(norm_y, 0.0, 1.0) * th)
+                    kpts_pts.append((kx, ky))
         stat_pose["h2d"].append(m_pose["h2d_ms"])
         stat_pose["gpu"].append(m_pose["gpu_ms"])
         stat_pose["d2h"].append(m_pose["d2h_ms"])

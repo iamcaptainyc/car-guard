@@ -262,10 +262,19 @@ class TRTInferenceSession:
                 else:
                     data = input_feed[name]
 
+                # 映射并严格保障输入类型对齐模型要求
+                inp_torch_dtype = torch.float32
+                if meta.dtype == np.float16:
+                    inp_torch_dtype = torch.float16
+                elif meta.dtype == np.int32:
+                    inp_torch_dtype = torch.int32
+                elif meta.dtype == np.int64:
+                    inp_torch_dtype = torch.int64
+
                 if not isinstance(data, torch.Tensor):
-                    tensor = torch.from_numpy(np.ascontiguousarray(data)).cuda()
+                    tensor = torch.from_numpy(np.ascontiguousarray(data)).to(device="cuda", dtype=inp_torch_dtype)
                 else:
-                    tensor = data.cuda()
+                    tensor = data.to(device="cuda", dtype=inp_torch_dtype)
 
                 # 动态输入尺寸设置
                 if self.is_trt10:
@@ -278,10 +287,7 @@ class TRTInferenceSession:
                     tensor_ptrs[name] = tensor.data_ptr()
 
             # 2. 为输出分配显存
-            out_tensors = []
-            selected_outputs = self.outputs
-            if output_names:
-                selected_outputs = [m for m in self.outputs if m.name in output_names]
+            out_buffers_dict = {}
 
             for meta in self.outputs:
                 name = meta.name
@@ -310,8 +316,7 @@ class TRTInferenceSession:
                 if self.is_trt10:
                     self.context.set_tensor_address(name, out_buf.data_ptr())
 
-                if meta in selected_outputs:
-                    out_tensors.append(out_buf)
+                out_buffers_dict[name] = out_buf
 
             # 3. 组织 TRT 8 顺序 bindings
             if not self.is_trt10:
@@ -334,6 +339,13 @@ class TRTInferenceSession:
             self.last_gpu_compute_ms = float(start_event.elapsed_time(end_event))
         except Exception:
             self.last_gpu_compute_ms = 0.0
+
+        # 严格按照 output_names 请求顺序返回结果，完全对齐 ONNXRuntime 规范
+        if output_names:
+            out_tensors = [out_buffers_dict[name] for name in output_names if name in out_buffers_dict]
+        else:
+            out_tensors = [out_buffers_dict[meta.name] for meta in self.outputs]
+
         return [t.cpu().numpy() for t in out_tensors]
 
     def _run_cuda_python(self, input_feed: Dict[str, np.ndarray], output_names: Optional[List[str]]) -> List[np.ndarray]:

@@ -216,10 +216,15 @@ class RTMPoseEstimator(BasePoseEstimator):
                 norm_img = (norm_img - mean) / std
                 blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...] # [1, 3, 256, 192]
 
-                outputs = self.session.run(None, {self.input_name: blob})
+                # 优先显式按顺序索取 simcc_x 与 simcc_y，若底层不支持则传 None
+                avail_outputs = [o.name for o in self.session.get_outputs()] if hasattr(self.session, "get_outputs") else []
+                req_names = ["simcc_x", "simcc_y"] if ("simcc_x" in avail_outputs and "simcc_y" in avail_outputs) else None
+
+                outputs = self.session.run(req_names, {self.input_name: blob})
                 out0 = outputs[0][0]
                 out1 = outputs[1][0]
-                # 动态自适应 simcc_x (最后一维 384) 与 simcc_y (最后一维 512)，防止不同平台/TRT顺序错位
+                # 无论底层是 ONNXRuntime 还是 TensorRT Engine，无论底层枚举顺序如何，
+                # 双重校验：通过最后一维严格区分 simcc_x (最后一维 384) 与 simcc_y (最后一维 512)，杜绝 X/Y 错位
                 if out0.shape[-1] == 384 and out1.shape[-1] == 512:
                     simcc_x, simcc_y = out0, out1
                 elif out0.shape[-1] == 512 and out1.shape[-1] == 384:
