@@ -195,6 +195,10 @@ def main():
                         help="显式指定端侧 Qwen-VLM LLM 引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/llm)")
     parser.add_argument("--vlm-visual-engine", type=str, default=None,
                         help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
+    parser.add_argument("--vlm-timeout", type=float, default=35.0,
+                        help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
+    parser.add_argument("--vlm-max-tokens", type=int, default=128,
+                        help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
     parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
 
     args = parser.parse_args()
@@ -270,7 +274,9 @@ def main():
         vlm_engine_path=args.vlm_engine,
         vlm_visual_engine_path=args.vlm_visual_engine,
         edgellm_dir=args.edgellm_dir,
-        build_dir=args.edgellm_dir
+        build_dir=args.edgellm_dir,
+        vlm_timeout=args.vlm_timeout,
+        vlm_max_tokens=args.vlm_max_tokens
     )
 
 

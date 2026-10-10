@@ -247,9 +247,16 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         build_dir: Optional[str] = None,
         edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
-        timeout: float = 8.0,
+        timeout: float = 35.0,
         max_tokens: int = 128
     ):
+        env_timeout = os.environ.get("VLM_TIMEOUT") or os.environ.get("EDGELLM_TIMEOUT")
+        if env_timeout:
+            try:
+                timeout = float(env_timeout)
+            except ValueError:
+                pass
+
         self.model_dir_arg = model_dir
         self.engine_path_arg = engine_path
         self.visual_engine_path_arg = visual_engine_path
@@ -532,6 +539,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         return parsed
             else:
                 print(f"[!] [TRT-Edge-LLM] 二进制推理非零退出 (code {res.returncode}): {res.stderr[:200]}")
+        except subprocess.TimeoutExpired as e:
+            print(f"[!] [TRT-Edge-LLM] 原生推理超时 (耗时超过 {self.timeout:.1f} 秒，可传入 --vlm-timeout 调大门限): {e}")
         except Exception as e:
             print(f"[!] [TRT-Edge-LLM] 原生推理过程捕获异常: {e}")
         finally:
@@ -677,9 +686,12 @@ class AsyncVLMReviewer:
     ) -> str:
         """
         非阻塞提交复核任务至后台工作线程队列 (耗时 < 1ms)
+        包含防任务积压节流保护：当队列中已有未消费的积压任务时，避免持续高频帧流导致任务无休止堆积
         """
         task_id = f"VLM_TASK_{event_record.event_id}_{int(time.time() * 1000)}"
         with self._lock:
+            if self.task_queue.qsize() >= 2:
+                return task_id
             self._active_tasks_count += 1
         self.task_queue.put((task_id, event_record, keyframes, callback))
         return task_id
@@ -701,14 +713,29 @@ class AsyncVLMReviewer:
         keyframes: Optional[List[Any]] = None
     ) -> Dict[str, Any]:
         """
-        向后兼容接口：提交异步队列，同时立即计算并返回仲裁结构
-        确保既不阻塞快通路，又使外部调用能立即获取有效语义摘要
+        向后兼容接口：提交异步队列由后台执行真实大模型推理，
+        快通路主线程立即返回轻量仲裁快照，绝对禁止阻塞主视频与快通路渲染管线，
+        同时杜绝主线程与后台工作线程双重重复拉起 C++ 推理进程的资源竞争。
         """
-        # 1. 提交至异步队列由后台工作线程执行（若工作线程开启）
+        # 1. 提交至异步队列由后台工作线程排队独占执行真实大模型
         if self._is_running:
             self.submit_review_async(event_record, keyframes)
+            # 快通路立即返回端侧保底仲裁（< 1ms），真实 Qwen-VLM 战报将在后台完成后就地更新 event_record
+            fallback = getattr(self.backend, "fallback_mock", None)
+            if fallback:
+                provisional_out = fallback.infer(event_record, keyframes)
+            else:
+                provisional_out = {
+                    "action_category": str(event_record.action_type.value),
+                    "confidence": 0.8,
+                    "is_human_contact": event_record.has_contact_signal,
+                    "is_false_alarm": False,
+                    "threat_escalation": "MAINTAIN",
+                    "summary_text": "端侧 Qwen-VLM 正在异步复核中..."
+                }
+            return self._arbitrate_and_finalize(event_record, provisional_out)
 
-        # 2. 立即产出当前仲裁快照
+        # 2. 若后台工作线程未开启（如纯离线测试），则同步执行复核
         raw_vlm_out = self.backend.infer(event_record, keyframes)
         return self._arbitrate_and_finalize(event_record, raw_vlm_out)
 
