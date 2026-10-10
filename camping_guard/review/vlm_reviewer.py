@@ -274,7 +274,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self._paths_probed = True
 
         # 1. 显式构建目录校验 (build_dir)
+        default_jetson_build = Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build")
         raw_build = self.build_dir_arg or os.environ.get("EDGELLM_BUILD_DIR")
+        if not raw_build and (default_jetson_build / "examples" / "llm" / "llm_inference").is_file():
+            raw_build = str(default_jetson_build)
+
         if raw_build:
             b_path = Path(raw_build).resolve()
             if b_path.is_file() and os.access(b_path, os.X_OK):
@@ -305,17 +309,29 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         # 优先方式 A: 用户显式传入模型总目录 (--model-dir / MODEL_DIR)
         # 按照 TensorRT-Edge-LLM 官方标准目录规范要求：
-        # <model_dir>/engines/llm/llm.engine 与 config.json
-        # <model_dir>/engines/visual/visual.engine 与 config.json
+        # <model_dir>/engines/llm 或 <model_dir>/llm (包含 llm.engine 与 config.json)
+        # <model_dir>/engines/visual 或 <model_dir>/visual (包含 visual.engine 与 config.json)
         if raw_model_dir:
             m_path = Path(raw_model_dir).resolve()
             if not m_path.exists():
                 print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 --model-dir 不存在: {m_path}")
             else:
-                llm_cand = m_path / "engines" / "llm"
-                vis_cand = m_path / "engines" / "visual"
-                if not llm_cand.is_dir():
-                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少 LLM 引擎目录: {llm_cand}")
+                llm_cand = None
+                vis_cand = None
+                if (m_path / "engines" / "llm").is_dir():
+                    llm_cand = m_path / "engines" / "llm"
+                elif (m_path / "llm").is_dir():
+                    llm_cand = m_path / "llm"
+                elif self._is_valid_engine_dir(m_path):
+                    llm_cand = m_path
+
+                if (m_path / "engines" / "visual").is_dir():
+                    vis_cand = m_path / "engines" / "visual"
+                elif (m_path / "visual").is_dir():
+                    vis_cand = m_path / "visual"
+
+                if not llm_cand:
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 模型目录下缺少 LLM 引擎目录 (需包含 engines/llm 或 llm): {m_path}")
                 elif not (llm_cand / "config.json").is_file():
                     print(f"[!] [TRT-Edge-LLM][配置错误] 缺少配置文件: {llm_cand / 'config.json'}")
                 elif not ((llm_cand / "llm.engine").is_file() or any(llm_cand.glob("*.engine"))):
@@ -323,8 +339,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 else:
                     self._resolved_engine_dir = llm_cand
 
-                if not vis_cand.is_dir():
-                    print(f"[i] [TRT-Edge-LLM] 模型目录下未找到独立视觉编码器目录: {vis_cand}")
+                if not vis_cand:
+                    print(f"[i] [TRT-Edge-LLM] 模型目录下未找到独立视觉编码器目录 (engines/visual 或 visual)")
                 elif not (vis_cand / "config.json").is_file():
                     print(f"[!] [TRT-Edge-LLM][配置错误] 缺少视觉配置文件: {vis_cand / 'config.json'}")
                 elif not ((vis_cand / "visual.engine").is_file() or any(vis_cand.glob("*.engine"))):

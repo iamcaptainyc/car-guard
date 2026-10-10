@@ -178,8 +178,6 @@ def main():
     parser.add_argument("--headless", action="store_true", help="无头模式运行 (适用于车载后台守护进程或 SSH 调试)")
     parser.add_argument("--sidebar", action="store_true", default=False, help="保留旧版 OpenCV 绘制的 CPU 侧边栏 (默认已禁用以提升性能)")
     parser.add_argument("--no-sidebar", action="store_true", help="关闭右侧看板，使用极简纯画面显示")
-    parser.add_argument("--vlm-engine", type=str, default=None, help="显式指定端侧 Qwen-VLM LLM 语言模型引擎目录或路径")
-    parser.add_argument("--vlm-visual-engine", type=str, default=None, help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (默认自动推导关联)")
     parser.add_argument("--output", type=str, default=None, help="保存渲染好的视频文件至路径 (如 output.mp4)")
     parser.add_argument("--loop", dest="loop_video", action="store_true", default=None,
                         help="强制循环播放视频")
