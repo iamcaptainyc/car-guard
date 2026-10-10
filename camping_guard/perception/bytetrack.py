@@ -8,7 +8,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 import time
 
-from camping_guard.types import TrackedEntity, BoundingBox, VehicleZone
+from camping_guard.types import TrackedEntity, BoundingBox, VehicleZone, FaceIDState
 from camping_guard.config import GuardConfig
 
 class KalmanFilter2D:
@@ -125,6 +125,14 @@ class STrack:
         self.radial_speed = 0.0
         self.zone = VehicleZone.ZONE_1_OUTER
         self.is_whitelisted = False
+        self.track_uid: str = ""
+        self.person_session_id: Optional[str] = None
+        self.face_state: FaceIDState = FaceIDState.PENDING
+        self.face_id_name: Optional[str] = None
+        self.reid_feature: Optional[Any] = None
+        self.keypoints: Optional[Dict[str, Tuple[float, float]]] = None
+        self.last_pose_time: float = 0.0
+        self.association_version: int = 1
 
     @property
     def tlwh(self) -> Tuple[float, float, float, float]:
@@ -285,14 +293,32 @@ class ByteTracker:
                 ground_dist=st.ground_dist,
                 radial_speed=st.radial_speed,
                 zone=st.zone,
+                is_whitelisted=st.is_whitelisted,
                 first_seen_time=st.first_seen_time,
                 last_seen_time=st.last_seen_time,
                 cumulative_dwell_time=st.cumulative_dwell_time,
+                keypoints=st.keypoints,
+                track_uid=st.track_uid or f"cam1_trk{st.track_id}",
+                person_session_id=st.person_session_id,
+                face_state=st.face_state,
+                face_id_name=st.face_id_name,
+                reid_feature=st.reid_feature,
+                association_version=st.association_version,
                 velocity_pixel=(vx, vy)
             )
             output_entities.append(entity)
 
         return output_entities
+
+    def get_track(self, track_id: int) -> Optional[STrack]:
+        """获取底层 STrack 轨迹对象，用于业务层状态双向同步与结果持久化"""
+        for st in self.tracked_stracks:
+            if st.track_id == track_id:
+                return st
+        for st in self.lost_stracks:
+            if st.track_id == track_id:
+                return st
+        return None
 
     def _linear_assignment(self, tracks: List[STrack], dets: List[STrack], iou_thresh: float) -> Tuple[List[int], List[int], List[Tuple[int, int]]]:
         """贪心/IoU 快速关联算法"""

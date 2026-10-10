@@ -43,8 +43,8 @@ class ModelStats:
     def record_call(self, duration_ms: float, condition: str = "", gpu_ms: Optional[float] = None):
         self.call_count += 1
         self.durations_ms.append(duration_ms)
-        if gpu_ms is not None and gpu_ms > 0:
-            self.gpu_durations_ms.append(gpu_ms)
+        if gpu_ms is not None and isinstance(gpu_ms, (int, float)) and gpu_ms > 0:
+            self.gpu_durations_ms.append(float(gpu_ms))
         if condition and condition not in self.conditions:
             self.conditions.append(condition)
 

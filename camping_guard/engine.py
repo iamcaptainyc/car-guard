@@ -232,7 +232,15 @@ class CampingGuardEngine:
                     t.radial_speed = vr
                     if not t.track_uid:
                         t.track_uid = f"cam{cam_id}_trk{t.track_id}"
-                    # 人员 ReID 特征建档
+
+                    st = self.bytetracker.get_track(t.track_id)
+                    if st is not None:
+                        st.ground_dist = dist
+                        st.zone = zone
+                        st.radial_speed = vr
+                        st.track_uid = t.track_uid
+
+                    # 人员 ReID 特征建档 (仅在首次入场且无特征时建档 1 次)
                     if t.category == 'person' and self.reid_extractor and primary_frame is not None and t.reid_feature is None:
                         reid_sess = getattr(self.reid_extractor, 'session', None)
                         with self.profiler.profile_model("OSNet-ReID", condition=f"ID:{t.track_id} ByteTrack建档", session=reid_sess):
@@ -248,6 +256,13 @@ class CampingGuardEngine:
                                 t.is_whitelisted = True
                                 t.face_state = FaceIDState.VERIFIED
                                 t.face_id_name = sess.whitelist_name
+                        # 持久化同步写回底层 STrack 缓存，杜绝下帧重复推理
+                        if st is not None:
+                            st.reid_feature = t.reid_feature
+                            st.person_session_id = t.person_session_id
+                            st.is_whitelisted = t.is_whitelisted
+                            st.face_state = t.face_state
+                            st.face_id_name = t.face_id_name
                 self.active_targets = tracked_entities
             else:
                 # 使用基础 TrackManager 流程 (向下兼容)
@@ -290,6 +305,13 @@ class CampingGuardEngine:
             current_time=current_time,
             frame=primary_frame
         )
+        if self.bytetracker is not None:
+            for t in self.active_targets:
+                st = self.bytetracker.get_track(t.track_id)
+                if st is not None:
+                    st.is_whitelisted = t.is_whitelisted
+                    st.face_state = t.face_state
+                    st.face_id_name = t.face_id_name
 
         # 8. 统计防区状态用于状态机调度
         has_zone1 = any(t.zone == VehicleZone.ZONE_1_OUTER and not t.is_whitelisted for t in self.active_targets)
@@ -339,19 +361,35 @@ class CampingGuardEngine:
 
             # 若目标进入核心研判区 (Zone 2) 且为人员，按需触发 RTMPose 局部切片骨骼点提取 (Top-Down 节能范式)
             if target.category == 'person' and target.zone == VehicleZone.ZONE_2_INNER:
-                if primary_frame is not None and self.pose_estimator is not None:
+                st = self.bytetracker.get_track(target.track_id) if self.bytetracker else None
+                last_pose_t = getattr(st, 'last_pose_time', 0.0) if st else 0.0
+                # 姿态时序限频：在 Zone 2 维持 10 FPS (100ms 间隔) 研判刷新率，避免 30 FPS 饱和挤占边缘算力
+                need_pose_infer = (current_time - last_pose_t >= 0.10) or (target.keypoints is None)
+
+                if need_pose_infer and primary_frame is not None and self.pose_estimator is not None:
                     bx = int(target.bbox.x if hasattr(target.bbox, 'x') else target.bbox[0])
                     by = int(target.bbox.y if hasattr(target.bbox, 'y') else target.bbox[1])
                     bw = int(target.bbox.w if hasattr(target.bbox, 'w') else target.bbox[2])
                     bh = int(target.bbox.h if hasattr(target.bbox, 'h') else target.bbox[3])
                     pose_sess = getattr(self.pose_estimator, 'session', None)
-                    with self.profiler.profile_model("RTMPose-s", condition=f"ID:{target.track_id} Zone 2 姿态骨骼提取", session=pose_sess):
+                    with self.profiler.profile_model("RTMPose-s", condition=f"ID:{target.track_id} Zone 2 姿态骨骼提取 (10FPS)", session=pose_sess):
                         kpts_list = self.pose_estimator.estimate_keypoints(primary_frame, [(bx, by, bw, bh)])
                     if kpts_list:
                         target.keypoints = kpts_list[0]
+                    if st is not None:
+                        st.keypoints = target.keypoints
+                        st.last_pose_time = current_time
+                else:
+                    # 复用上一帧提取的骨骼点，保持动作分类器时序连贯性
+                    if st is not None and st.keypoints is not None:
+                        target.keypoints = st.keypoints
             elif target.category == 'person' and target.zone != VehicleZone.ZONE_2_INNER:
                 # 退出 Zone 2 时及时清理姿态关键点，避免远距离依然残留陈旧姿态
                 target.keypoints = None
+                if self.bytetracker:
+                    st = self.bytetracker.get_track(target.track_id)
+                    if st is not None:
+                        st.keypoints = None
 
             # 动作与姿态分类 (传入门把手与车窗 ROI 空间多边形)
             action, visual_threat, v_desc = self.pose_classifier.classify_action(

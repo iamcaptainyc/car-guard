@@ -57,7 +57,7 @@ class PoseActionClassifier:
         if kpts:
             la = kpts.get("left_ankle")
             ra = kpts.get("right_ankle")
-            active_ankle = la if (la and la[2] > 0.5) else ra
+            active_ankle = la if (la and (len(la) < 3 or la[2] > 0.5)) else (ra if (ra and (len(ra) < 3 or ra[2] > 0.5)) else None)
             if active_ankle:
                 if tid not in self.ankle_history:
                     self.ankle_history[tid] = []
@@ -117,7 +117,7 @@ class PoseActionClassifier:
         if kpts and handle_roi_polygons:
             lw = kpts.get("left_wrist")
             rw = kpts.get("right_wrist")
-            wrists = [w for w in [lw, rw] if w and w[2] > 0.4]
+            wrists = [w for w in [lw, rw] if w and (len(w) < 3 or w[2] > 0.4)]
 
             for h_poly in handle_roi_polygons:
                 pts = np.array(h_poly, dtype=np.int32)

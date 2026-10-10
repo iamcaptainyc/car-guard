@@ -388,9 +388,9 @@ class FaceIDPipeline:
             ctx["last_version"] = target.association_version
             target.face_state = FaceIDState.RECHECK
 
-        # 3. 机会主义频控检查 (若上次因无条件 UNAVAILABLE，限频重试)
-        if target.face_state in [FaceIDState.UNAVAILABLE, FaceIDState.NO_MATCH]:
-            if current_time - ctx["last_check_time"] < self.retry_interval_sec:
+        # 3. 机会主义频控检查 (未匹配或不可用时限频重试，避免每帧重复调用 SCRFD 挤占算力)
+        if target.face_state in [FaceIDState.PENDING, FaceIDState.UNAVAILABLE, FaceIDState.NO_MATCH]:
+            if ctx["last_check_time"] > 0 and (current_time - ctx["last_check_time"] < self.retry_interval_sec):
                 return target.face_state
 
         ctx["last_check_time"] = current_time
