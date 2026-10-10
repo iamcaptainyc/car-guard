@@ -465,3 +465,42 @@ def test_trt_edgellm_native_cpp_ipc_mocked(monkeypatch):
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+def test_trt_edgellm_split_engine_discovery():
+    """测试 VLM 多模态 LLM 语言引擎与 Visual 视觉编码器引擎的分离目录探测与组装"""
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    temp_dir = tempfile.mkdtemp(prefix="test_split_engine_")
+    try:
+        model_root = Path(temp_dir) / "qwen3.5-2b"
+        llm_dir = model_root / "llm"
+        llm_dir.mkdir(parents=True)
+        visual_dir = model_root / "visual"
+        visual_dir.mkdir(parents=True)
+
+        # 1. 传入模型总根目录 -> 自动细化识别出 llm 和 visual
+        backend = TRTEdgeLLMOnDemandBackend(engine_path=str(model_root))
+        backend._probe_paths()
+        assert backend._resolved_engine_dir == llm_dir
+        assert backend._resolved_visual_dir == visual_dir
+
+        # 2. 传入 llm 目录 -> 自动推导同级 sibling visual 目录
+        backend_sibling = TRTEdgeLLMOnDemandBackend(engine_path=str(llm_dir))
+        backend_sibling._probe_paths()
+        assert backend_sibling._resolved_engine_dir == llm_dir
+        assert backend_sibling._resolved_visual_dir == visual_dir
+
+        # 3. 显式指定 visual_engine_path
+        custom_vis = Path(temp_dir) / "custom_visual"
+        custom_vis.mkdir()
+        backend_explicit = TRTEdgeLLMOnDemandBackend(
+            engine_path=str(llm_dir),
+            visual_engine_path=str(custom_vis)
+        )
+        backend_explicit._probe_paths()
+        assert backend_explicit._resolved_engine_dir == llm_dir
+        assert backend_explicit._resolved_visual_dir == custom_vis
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+

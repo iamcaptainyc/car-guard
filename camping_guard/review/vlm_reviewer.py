@@ -242,12 +242,14 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
     def __init__(
         self,
         engine_path: Optional[str] = None,
+        visual_engine_path: Optional[str] = None,
         edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
         timeout: float = 8.0,
         max_tokens: int = 128
     ):
         self.engine_path_arg = engine_path
+        self.visual_engine_path_arg = visual_engine_path
         self.edgellm_dir_arg = edgellm_dir
         self.model_name = model_name
         self.timeout = timeout
@@ -307,7 +309,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             self._resolved_edgellm_bin = bin_candidates[0]
             print(f"[*] [TRT-Edge-LLM] 定位到 C++ 推理二进制: {self._resolved_edgellm_bin}")
 
-        # 2. 探测 Qwen 模型引擎路径
+        # 2. 探测 Qwen 模型引擎路径 (包括 LLM 语言引擎与 Visual 视觉编码器引擎)
         engine_candidates = []
         if self.engine_path_arg:
             engine_candidates.append(Path(self.engine_path_arg))
@@ -332,29 +334,60 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         ]
         engine_candidates.extend(default_model_paths)
 
+        # 显式视觉引擎参数
+        if self.visual_engine_path_arg and Path(self.visual_engine_path_arg).exists():
+            self._resolved_visual_dir = Path(self.visual_engine_path_arg)
+
         for ep in engine_candidates:
             if ep and ep.exists():
-                # 若为目录，细化 llm 和 visual 引擎
                 if ep.is_dir():
-                    llm_sub = ep / "llm"
-                    visual_sub = ep / "visual"
-                    if not visual_sub.exists():
-                        visual_sub = ep / "visual_engines"
-                    if not visual_sub.exists():
-                        visual_sub = ep / "multimodal"
+                    # 场景 1: 传入总目录，内部拆分了 llm 与 visual / visual_engines
+                    llm_sub = None
+                    for cand_llm in ["llm", "engines", "text", "llm_engines"]:
+                        if (ep / cand_llm).is_dir():
+                            llm_sub = ep / cand_llm
+                            break
 
-                    if llm_sub.is_dir():
+                    visual_sub = None
+                    if self._resolved_visual_dir is None:
+                        for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
+                            if (ep / cand_vis).is_dir():
+                                visual_sub = ep / cand_vis
+                                break
+
+                    # 场景 2: 传入的是 llm 目录本身 (如 .../qwen3.5-2b/llm)，寻找同级 visual 目录
+                    if not visual_sub and self._resolved_visual_dir is None:
+                        for cand_vis in ["visual", "visual_engines", "vision", "multimodal"]:
+                            if (ep.parent / cand_vis).is_dir():
+                                visual_sub = ep.parent / cand_vis
+                                break
+                            # 平行目录 (如 engines/qwen3.5-2b 对照 visual_engines/qwen3.5-2b)
+                            if (ep.parent.parent / cand_vis / ep.name).is_dir():
+                                visual_sub = ep.parent.parent / cand_vis / ep.name
+                                break
+
+                    # 场景 3: 目录下直接包含 visual*.engine 或 visual_encoder 权重文件
+                    if not visual_sub and self._resolved_visual_dir is None:
+                        has_visual_file = any("visual" in f.name.lower() or "multimodal" in f.name.lower() for f in ep.iterdir() if f.is_file())
+                        if has_visual_file:
+                            visual_sub = ep
+
+                    if llm_sub:
                         self._resolved_engine_dir = llm_sub
-                        self._resolved_visual_dir = visual_sub if visual_sub.is_dir() else None
                     else:
                         self._resolved_engine_dir = ep
-                        self._resolved_visual_dir = visual_sub if visual_sub.is_dir() else None
+
+                    if visual_sub and self._resolved_visual_dir is None:
+                        self._resolved_visual_dir = visual_sub
                 else:
+                    # 单文件 .engine 输入
                     self._resolved_engine_dir = ep.parent if ep.is_file() else ep
-                    self._resolved_visual_dir = None
-                print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM 引擎: {self._resolved_engine_dir}")
+
+                print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM LLM 引擎: {self._resolved_engine_dir}")
                 if self._resolved_visual_dir:
-                    print(f"[*] [TRT-Edge-LLM] 定位到视觉编码器引擎: {self._resolved_visual_dir}")
+                    print(f"[*] [TRT-Edge-LLM] 定位到端侧 Qwen-VLM Visual 视觉编码器引擎: {self._resolved_visual_dir}")
+                else:
+                    print(f"[i] [TRT-Edge-LLM] 未检测到独立 visual 引擎子目录 (若为纯多模态一体或单引擎，将默认共用引擎目录)")
                 break
 
     def _infer_native_cpp(
