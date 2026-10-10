@@ -116,22 +116,8 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     if face_rec_cand.is_file():
         engine_status["face_rec"] = face_rec_cand
 
-    # 6. 端侧 Qwen-VLM 按需多模态复核大模型
-    vlm_cands = [
-        models_dir / "vlm" / "qwen3.5-2b.engine",
-        models_dir / "vlm" / "qwen2.5-vl-2b.engine",
-        Path("/home/nvidia/qwen35-orin/models/vlm/qwen3.5-2b"),
-        Path("/home/nvidia/qwen35-orin/engines/qwen3.5-2b"),
-        Path("/home/nvidia/qwen35-orin/engines"),
-        Path("/home/nvidia/qwen35-orin/qwen3.5-2b"),
-        Path("/home/nvidia/qwen35-orin/qwen35-2b"),
-        Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/engines"),
-        Path("qwen3.5-2b.engine")
-    ]
-    for c in vlm_cands:
-        if c.is_file() or c.is_dir():
-            engine_status["vlm"] = c
-            break
+    # 6. 端侧 Qwen-VLM 按需多模态复核大模型 (严格由用户显式指定，不进行盲目推测)
+    engine_status["vlm"] = None
 
     return engine_status
 
@@ -203,7 +189,14 @@ def main():
                         help="启用内置 Web 实时流仪表盘 (默认开启，远程浏览器直接查看效果)")
     parser.add_argument("--no-web", action="store_true", help="关闭 Web 实时推流仪表盘")
     parser.add_argument("--web-port", type=int, default=8080, help="Web 实时流端口号 (默认: 8080)")
-    parser.add_argument("--edgellm-dir", type=str, default=None, help="TensorRT-Edge-LLM 构建目录 (默认自动推导)")
+    parser.add_argument("--model-dir", "--vlm-model-dir", dest="vlm_model_dir", type=str, default=None,
+                        help="显式指定端侧 Qwen-VLM 模型总目录 (内部须包含 engines/llm 与 engines/visual，如 /home/nvidia/models/Qwen3.5-0.8B)")
+    parser.add_argument("--build-dir", "--edgellm-build-dir", "--edgellm-dir", dest="edgellm_dir", type=str, default=None,
+                        help="显式指定 TensorRT-Edge-LLM build 目录 (包含 examples/llm/llm_inference，如 /home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build)")
+    parser.add_argument("--vlm-engine", type=str, default=None,
+                        help="显式指定端侧 Qwen-VLM LLM 引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/llm)")
+    parser.add_argument("--vlm-visual-engine", type=str, default=None,
+                        help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
     parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
 
     args = parser.parse_args()
@@ -257,7 +250,6 @@ def main():
     if loop_val is None:
         loop_val = False if args.output else True
 
-    vlm_eng = args.vlm_engine or (str(engines["vlm"]) if engines.get("vlm") else None)
     show_sb = args.sidebar and not args.no_sidebar
 
     print("\n[*] 正在启动车载露营守卫 (TensorRT 模式)...")
@@ -276,9 +268,11 @@ def main():
         output_path=args.output,
         enable_web=args.web and not args.no_web,
         web_port=args.web_port,
-        vlm_engine_path=vlm_eng,
+        vlm_model_dir=args.vlm_model_dir,
+        vlm_engine_path=args.vlm_engine,
         vlm_visual_engine_path=args.vlm_visual_engine,
-        edgellm_dir=args.edgellm_dir
+        edgellm_dir=args.edgellm_dir,
+        build_dir=args.edgellm_dir
     )
 
 

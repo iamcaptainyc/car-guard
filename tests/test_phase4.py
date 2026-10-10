@@ -478,26 +478,29 @@ def test_trt_edgellm_split_engine_discovery():
         llm_dir = model_root / "engines" / "llm"
         llm_dir.mkdir(parents=True)
         (llm_dir / "config.json").touch()
+        (llm_dir / "llm.engine").touch()
         visual_dir = model_root / "engines" / "visual"
         visual_dir.mkdir(parents=True)
         (visual_dir / "config.json").touch()
+        (visual_dir / "visual.engine").touch()
 
-        # 1. 传入模型总根目录 -> 自动细化识别出 engines/llm 和 engines/visual
-        backend = TRTEdgeLLMOnDemandBackend(engine_path=str(model_root))
+        # 1. 显式传入模型总根目录 (--model-dir) -> 严格校验并解析出 engines/llm 和 engines/visual
+        backend = TRTEdgeLLMOnDemandBackend(model_dir=str(model_root))
         backend._probe_paths()
         assert backend._resolved_engine_dir == llm_dir
         assert backend._resolved_visual_dir == visual_dir
 
-        # 2. 传入 llm 目录 -> 自动推导同级 sibling visual 目录
+        # 2. 显式传入 llm 目录 (--vlm-engine) -> 关联同级 sibling visual 目录
         backend_sibling = TRTEdgeLLMOnDemandBackend(engine_path=str(llm_dir))
         backend_sibling._probe_paths()
         assert backend_sibling._resolved_engine_dir == llm_dir
         assert backend_sibling._resolved_visual_dir == visual_dir
 
-        # 3. 显式指定 visual_engine_path
+        # 3. 显式分别指定 visual_engine_path
         custom_vis = Path(temp_dir) / "custom_visual"
         custom_vis.mkdir()
         (custom_vis / "config.json").touch()
+        (custom_vis / "visual.engine").touch()
         backend_explicit = TRTEdgeLLMOnDemandBackend(
             engine_path=str(llm_dir),
             visual_engine_path=str(custom_vis)
@@ -512,6 +515,12 @@ def test_trt_edgellm_split_engine_discovery():
         backend_empty = TRTEdgeLLMOnDemandBackend(engine_path=str(empty_root))
         backend_empty._probe_paths()
         assert backend_empty._resolved_engine_dir is None
+
+        # 5. 未显式传入任何参数 -> 完全保持休眠状态，不猜测路径，不调度 C++ 运行时
+        backend_none = TRTEdgeLLMOnDemandBackend()
+        backend_none._probe_paths()
+        assert backend_none._resolved_engine_dir is None
+        assert backend_none._resolved_edgellm_bin is None
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 

@@ -241,15 +241,19 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
     def __init__(
         self,
+        model_dir: Optional[str] = None,
         engine_path: Optional[str] = None,
         visual_engine_path: Optional[str] = None,
+        build_dir: Optional[str] = None,
         edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
         timeout: float = 8.0,
         max_tokens: int = 128
     ):
+        self.model_dir_arg = model_dir
         self.engine_path_arg = engine_path
         self.visual_engine_path_arg = visual_engine_path
+        self.build_dir_arg = build_dir or edgellm_dir
         self.edgellm_dir_arg = edgellm_dir
         self.model_name = model_name
         self.timeout = timeout
@@ -264,166 +268,117 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self._paths_probed = False
 
     def _probe_paths(self):
-        """自动推导并探测 TensorRT-Edge-LLM 运行目录与 Qwen 模型路径"""
+        """严格按显式设置校验路径，不进行任何猜测和候选目录推断"""
         if self._paths_probed:
             return
         self._paths_probed = True
 
-        # 1. 探测 TensorRT-Edge-LLM build 目录与 llm_inference 二进制
-        bin_candidates = []
-        dir_candidates = []
-
-        if self.edgellm_dir_arg:
-            dir_candidates.append(Path(self.edgellm_dir_arg))
-        for env_var in ["EDGELLM_BUILD_DIR", "EDGELLM_DIR", "TRT_EDGELLM_DIR"]:
-            val = os.environ.get(env_var)
-            if val:
-                dir_candidates.append(Path(val))
-
-        # Jetson Orin 默认常见构建路径
-        default_jetson_builds = [
-            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build"),
-            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM"),
-            Path("/home/nvidia/TensorRT-Edge-LLM/build"),
-            Path("/home/nvidia/TensorRT-Edge-LLM"),
-            Path.home() / "qwen35-orin/TensorRT-Edge-LLM/build",
-            Path("../TensorRT-Edge-LLM/build"),
-            Path("TensorRT-Edge-LLM/build"),
-        ]
-        dir_candidates.extend(default_jetson_builds)
-
-        for d in dir_candidates:
-            if d and d.exists():
-                cands = [
-                    d / "examples" / "llm" / "llm_inference",
-                    d / "bin" / "llm_inference",
-                    d / "llm_inference",
-                ]
-                for c in cands:
-                    if c.is_file() and os.access(c, os.X_OK):
-                        bin_candidates.append(c)
-
-        which_bin = shutil.which("llm_inference")
-        if which_bin:
-            bin_candidates.append(Path(which_bin))
-
-        if bin_candidates:
-            self._resolved_edgellm_bin = bin_candidates[0]
-            # 向上推导 build 目录并定位 libNvInfer_edgellm_plugin.so
-            b_cand = self._resolved_edgellm_bin.parent
-            if (b_cand / "libNvInfer_edgellm_plugin.so").exists():
-                self._resolved_build_dir = b_cand
-            elif (b_cand.parent / "libNvInfer_edgellm_plugin.so").exists():
-                self._resolved_build_dir = b_cand.parent
-            elif (b_cand.parent.parent / "libNvInfer_edgellm_plugin.so").exists():
-                self._resolved_build_dir = b_cand.parent.parent
+        # 1. 显式构建目录校验 (build_dir)
+        raw_build = self.build_dir_arg or os.environ.get("EDGELLM_BUILD_DIR")
+        if raw_build:
+            b_path = Path(raw_build).resolve()
+            if b_path.is_file() and os.access(b_path, os.X_OK):
+                self._resolved_edgellm_bin = b_path
+                self._resolved_build_dir = b_path.parent
+            elif b_path.is_dir():
+                cand_bin = b_path / "examples" / "llm" / "llm_inference"
+                if cand_bin.is_file() and os.access(cand_bin, os.X_OK):
+                    self._resolved_edgellm_bin = cand_bin
+                    self._resolved_build_dir = b_path
+                elif (b_path / "llm_inference").is_file() and os.access(b_path / "llm_inference", os.X_OK):
+                    self._resolved_edgellm_bin = b_path / "llm_inference"
+                    self._resolved_build_dir = b_path
+                else:
+                    print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 build 目录中找不到可执行程序 llm_inference: {cand_bin}")
 
             if self._resolved_build_dir:
-                plugin_file = self._resolved_build_dir / "libNvInfer_edgellm_plugin.so"
-                if plugin_file.exists():
-                    self._resolved_plugin_path = plugin_file
-            print(f"[*] [TRT-Edge-LLM] 定位到 C++ 推理二进制: {self._resolved_edgellm_bin}")
-            if self._resolved_plugin_path:
-                print(f"[*] [TRT-Edge-LLM] 定位到专用 SM87 插件: {self._resolved_plugin_path}")
+                plugin = self._resolved_build_dir / "libNvInfer_edgellm_plugin.so"
+                if plugin.is_file():
+                    self._resolved_plugin_path = plugin
+                else:
+                    print(f"[!] [TRT-Edge-LLM][警告] 未在 build 目录找到专用插件库: {plugin}")
 
-        # 2. 探测 Qwen 模型引擎路径 (包括 LLM 语言引擎与 Visual 视觉编码器引擎)
-        engine_candidates = []
-        if self.engine_path_arg:
-            engine_candidates.append(Path(self.engine_path_arg))
+        # 2. 显式模型引擎路径校验
+        raw_model_dir = self.model_dir_arg or os.environ.get("MODEL_DIR")
+        raw_llm = self.engine_path_arg or os.environ.get("VLM_ENGINE_DIR")
+        raw_vis = self.visual_engine_path_arg or os.environ.get("VLM_VISUAL_ENGINE_DIR")
 
-        for env_var in ["MODEL_DIR", "VLM_MODEL_DIR", "QWEN_MODEL_DIR", "QWEN_ENGINE_DIR", "VLM_ENGINE_DIR", "EDGELLM_ENGINE_DIR"]:
-            val = os.environ.get(env_var)
-            if val:
-                engine_candidates.append(Path(val))
+        # 优先方式 A: 用户显式传入模型总目录 (--model-dir / MODEL_DIR)
+        # 按照 TensorRT-Edge-LLM 官方标准目录规范要求：
+        # <model_dir>/engines/llm/llm.engine 与 config.json
+        # <model_dir>/engines/visual/visual.engine 与 config.json
+        if raw_model_dir:
+            m_path = Path(raw_model_dir).resolve()
+            if not m_path.exists():
+                print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 --model-dir 不存在: {m_path}")
+            else:
+                llm_cand = m_path / "engines" / "llm"
+                vis_cand = m_path / "engines" / "visual"
+                if not llm_cand.is_dir():
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少 LLM 引擎目录: {llm_cand}")
+                elif not (llm_cand / "config.json").is_file():
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少配置文件: {llm_cand / 'config.json'}")
+                elif not ((llm_cand / "llm.engine").is_file() or any(llm_cand.glob("*.engine"))):
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少引擎文件: {llm_cand / 'llm.engine'}")
+                else:
+                    self._resolved_engine_dir = llm_cand
 
-        default_model_paths = [
-            Path("/home/nvidia/models"),
-            Path("/home/nvidia/models/Qwen3.5-0.8B"),
-            Path("/home/nvidia/models/Qwen3.5-2B"),
-            Path("/home/nvidia/models/qwen3.5-2b"),
-            Path("/home/nvidia/qwen35-orin/models"),
-            Path("/home/nvidia/qwen35-orin/engines"),
-            Path("models/vlm/qwen3.5-2b.engine"),
-            Path("models/vlm/qwen3.5-2b"),
-            Path("models/vlm/qwen2.5-vl-2b.engine"),
-            Path("models/vlm/qwen2.5-vl-2b"),
-            Path("models"),
-            Path("qwen3.5-2b.engine"),
-        ]
-        engine_candidates.extend(default_model_paths)
+                if not vis_cand.is_dir():
+                    print(f"[i] [TRT-Edge-LLM] 模型目录下未找到独立视觉编码器目录: {vis_cand}")
+                elif not (vis_cand / "config.json").is_file():
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少视觉配置文件: {vis_cand / 'config.json'}")
+                elif not ((vis_cand / "visual.engine").is_file() or any(vis_cand.glob("*.engine"))):
+                    print(f"[!] [TRT-Edge-LLM][配置错误] 缺少视觉引擎文件: {vis_cand / 'visual.engine'}")
+                else:
+                    self._resolved_visual_dir = vis_cand
 
-        # 显式视觉引擎参数
-        if self.visual_engine_path_arg and Path(self.visual_engine_path_arg).exists():
-            self._resolved_visual_dir = Path(self.visual_engine_path_arg)
+        # 若用户显式指定了独立的视觉引擎路径，最高优先级挂载
+        if raw_vis and not self._resolved_visual_dir:
+            v_path = Path(raw_vis).resolve()
+            if not v_path.exists():
+                print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 Visual 引擎路径不存在: {v_path}")
+            elif not self._is_valid_engine_dir(v_path):
+                print(f"[!] [TRT-Edge-LLM][配置错误] Visual 引擎路径 {v_path} 不包含 config.json 或 .engine 文件")
+            else:
+                self._resolved_visual_dir = v_path if v_path.is_dir() else v_path.parent
 
-        for ep in engine_candidates:
-            if ep and ep.exists():
-                llm_dir, vis_dir = self._resolve_model_engines(ep)
-                if llm_dir:
-                    self._resolved_engine_dir = llm_dir
-                    if not self._resolved_visual_dir and vis_dir:
-                        self._resolved_visual_dir = vis_dir
-                    print(f"[*] [TRT-Edge-LLM] 成功解析并验证端侧 LLM 引擎目录: {self._resolved_engine_dir}")
-                    if self._resolved_visual_dir:
-                        print(f"[*] [TRT-Edge-LLM] 成功解析并验证端侧 Visual 视觉编码器目录: {self._resolved_visual_dir}")
-                    break
+        # 方式 B: 用户通过 --vlm-engine 显式指定 LLM 引擎路径
+        if raw_llm and not self._resolved_engine_dir:
+            l_path = Path(raw_llm).resolve()
+            if not l_path.exists():
+                print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 LLM 引擎路径不存在: {l_path}")
+            else:
+                # 若用户传入的是包含 engines/llm 的目录
+                if (l_path / "engines" / "llm").is_dir() and self._is_valid_engine_dir(l_path / "engines" / "llm"):
+                    self._resolved_engine_dir = l_path / "engines" / "llm"
+                    if not self._resolved_visual_dir and (l_path / "engines" / "visual").is_dir() and self._is_valid_engine_dir(l_path / "engines" / "visual"):
+                        self._resolved_visual_dir = l_path / "engines" / "visual"
+                elif self._is_valid_engine_dir(l_path):
+                    self._resolved_engine_dir = l_path if l_path.is_dir() else l_path.parent
+                    sibling_vis = self._resolved_engine_dir.parent / "visual"
+                    if not self._resolved_visual_dir and sibling_vis.is_dir() and self._is_valid_engine_dir(sibling_vis):
+                        self._resolved_visual_dir = sibling_vis
+                else:
+                    print(f"[!] [TRT-Edge-LLM][配置错误] {l_path} 既不包含 config.json 也不包含 .engine 文件，拒绝挂载")
 
-        if not self._resolved_engine_dir:
-            print("[i] [TRT-Edge-LLM] 未检测到合规的 Qwen-VLM 引擎 (需包含 config.json 或 *.engine)，已挂载端侧高保真语义保底引擎")
+        # 汇总状态提示
+        if self._resolved_edgellm_bin and self._resolved_engine_dir:
+            print(f"[*] [TRT-Edge-LLM] 显式配置挂载就绪: LLM={self._resolved_engine_dir}, Visual={self._resolved_visual_dir}, bin={self._resolved_edgellm_bin}")
+        else:
+            print("[i] [TRT-Edge-LLM] 未显式配置完整引擎路径 (--model-dir 或 --vlm-engine + --build-dir)，VLM 保持休眠（不启动 C++ 推理，使用端侧语义保底）")
 
     @staticmethod
     def _is_valid_engine_dir(d: Optional[Path]) -> bool:
-        """检查目录是否为合法的 TensorRT 引擎目录 (必须包含 config.json 或 *.engine)"""
-        if not d or not d.is_dir():
+        """检查路径是否为合法的 TensorRT 引擎目录或文件 (必须包含 config.json 或 *.engine)"""
+        if not d:
+            return False
+        if d.is_file() and d.suffix == ".engine":
+            return True
+        if not d.is_dir():
             return False
         has_config = (d / "config.json").is_file()
         has_engine = (d / "llm.engine").is_file() or (d / "visual.engine").is_file() or any(d.glob("*.engine"))
         return has_config or has_engine
-
-    def _resolve_model_engines(self, root: Path) -> Tuple[Optional[Path], Optional[Path]]:
-        """从模型路径根目录智能推导并验证合规的 (llm_engine_dir, visual_engine_dir)"""
-        if not root or not root.exists():
-            return None, None
-
-        # 场景 1: <root>/engines/llm 与 <root>/engines/visual 结构 (用户官方标准结构)
-        llm_cand = root / "engines" / "llm"
-        vis_cand = root / "engines" / "visual"
-        if self._is_valid_engine_dir(llm_cand):
-            vis = vis_cand if self._is_valid_engine_dir(vis_cand) else None
-            return llm_cand, vis
-
-        # 场景 2: <root>/llm 与 <root>/visual 结构
-        llm_cand2 = root / "llm"
-        vis_cand2 = root / "visual"
-        if self._is_valid_engine_dir(llm_cand2):
-            vis = vis_cand2 if self._is_valid_engine_dir(vis_cand2) else None
-            return llm_cand2, vis
-
-        # 场景 3: root 本身就是一个合法的引擎目录 (直接包含 config.json 或 *.engine)
-        if self._is_valid_engine_dir(root):
-            vis = None
-            for cand_name in ["visual", "visual_engines", "vision", "multimodal"]:
-                if self._is_valid_engine_dir(root.parent / cand_name):
-                    vis = root.parent / cand_name
-                    break
-            return root, vis
-
-        # 场景 4: root 是单文件 .engine
-        if root.is_file() and root.suffix == ".engine":
-            return root.parent, None
-
-        # 场景 5: root 是模型仓库总目录 (如 /home/nvidia/models)，递归扫描其一层子目录
-        if root.is_dir():
-            try:
-                for sub in sorted(root.iterdir()):
-                    if sub.is_dir() and sub.name not in ["__pycache__", ".git"]:
-                        l, v = self._resolve_model_engines(sub)
-                        if l:
-                            return l, v
-            except Exception:
-                pass
-
-        return None, None
 
     def _infer_native_cpp(
         self,

@@ -704,9 +704,11 @@ def run_video_pipeline(
     use_trt: bool = False,
     enable_web: bool = False,
     web_port: int = 8080,
+    vlm_model_dir: Optional[str] = None,
     vlm_engine_path: Optional[str] = None,
     vlm_visual_engine_path: Optional[str] = None,
-    edgellm_dir: Optional[str] = None
+    edgellm_dir: Optional[str] = None,
+    build_dir: Optional[str] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -889,19 +891,16 @@ def run_video_pipeline(
     print(f"[*] 系统激活状态: {msg}")
     engine.vehicle_bus.uwb_key_pos = None # 默认钥匙不在现场
 
-    # 挂载端侧按需低功耗 Qwen-VLM 后端 (支持 TensorRT-Edge-LLM C++ 原生运行与路径自发现)
+    # 挂载端侧按需低功耗 Qwen-VLM 后端 (严格显式配置，无常驻后台服务)
     from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
     vlm_backend = TRTEdgeLLMOnDemandBackend(
+        model_dir=vlm_model_dir,
         engine_path=vlm_engine_path,
         visual_engine_path=vlm_visual_engine_path,
-        edgellm_dir=edgellm_dir
+        build_dir=build_dir or edgellm_dir
     )
     engine.vlm_reviewer.backend = vlm_backend
     vlm_backend._probe_paths()
-    if vlm_backend._resolved_edgellm_bin or vlm_backend._resolved_engine_dir:
-        print(f"[*] 成功挂载端侧按需低功耗 Qwen-VLM: LLM={vlm_backend._resolved_engine_dir}, Visual={vlm_backend._resolved_visual_dir}, bin={vlm_backend._resolved_edgellm_bin}")
-    elif vlm_engine_path:
-        print(f"[*] 成功挂载端侧按需 Qwen-VLM (离线语义兜底): {vlm_engine_path}")
 
     # 4. 规范化引擎证据录像器：统一设置为标准 30 FPS，环形缓冲容量确保满足事前 10s (450 帧)
     import collections
@@ -1511,8 +1510,6 @@ def main():
                         help="保留旧版 OpenCV 绘制的 CPU 侧边栏 (默认已禁用以降低延迟，推荐使用 Web 仪表盘以获得零开销体验)")
     parser.add_argument("--no-sidebar", action="store_true",
                         help="显式关闭右侧独立遥测数据面板 (默认即为关闭)")
-    parser.add_argument("--vlm-engine", type=str, default=None,
-                        help="显式挂载端侧 Qwen-VLM .engine 引擎文件路径 (如 models/vlm/qwen3.5-2b.engine)")
     parser.add_argument("--pose", type=str, default=None,
                         help="RTMPose 姿态估计 ONNX 模型文件路径 (如 rtmpose-s.onnx)")
     parser.add_argument("--reid", type=str, default="models/reid/osnet_x0_25.onnx",
@@ -1536,12 +1533,14 @@ def main():
                         help="启用内置 Web 实时流仪表盘 (无头设备/远程服务器专属，浏览器访问即可实时查看视频与遥测)")
     parser.add_argument("--web-port", type=int, default=8080,
                         help="Web 实时流端口号 (默认 8080)")
+    parser.add_argument("--model-dir", "--vlm-model-dir", dest="vlm_model_dir", type=str, default=None,
+                        help="显式指定端侧 Qwen-VLM 模型总目录 (内部须包含 engines/llm 与 engines/visual，如 /home/nvidia/models/Qwen3.5-0.8B)")
+    parser.add_argument("--build-dir", "--edgellm-build-dir", "--edgellm-dir", dest="edgellm_dir", type=str, default=None,
+                        help="显式指定 TensorRT-Edge-LLM build 目录 (包含 examples/llm/llm_inference，如 /home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build)")
     parser.add_argument("--vlm-engine", type=str, default=None,
-                        help="显式指定端侧 Qwen-VLM LLM 语言模型引擎目录或路径")
+                        help="显式指定端侧 Qwen-VLM LLM 语言模型引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/llm)")
     parser.add_argument("--vlm-visual-engine", type=str, default=None,
-                        help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (默认自动推导关联)")
-    parser.add_argument("--edgellm-dir", type=str, default=None,
-                        help="TensorRT-Edge-LLM 构建目录 (默认自动探测)")
+                        help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1572,9 +1571,11 @@ def main():
         use_trt=args.use_trt,
         enable_web=args.web,
         web_port=args.web_port,
+        vlm_model_dir=args.vlm_model_dir,
         vlm_engine_path=args.vlm_engine,
         vlm_visual_engine_path=args.vlm_visual_engine,
-        edgellm_dir=args.edgellm_dir
+        edgellm_dir=args.edgellm_dir,
+        build_dir=args.edgellm_dir
     )
 
 
