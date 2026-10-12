@@ -866,26 +866,35 @@ def run_video_pipeline(
             if eng_cand.is_file():
                 chosen_detector_path = str(eng_cand)
 
-    # 1.1 二级动物细分类器初始化 (按需用于 MegaDetector 检出 animal 时的物种研判)
-    chosen_cls_path = cls_onnx_path
-    if chosen_cls_path and not os.path.exists(chosen_cls_path):
-        for search_dir in ["models/cls", "models"]:
-            sub_cand = os.path.join(search_dir, chosen_cls_path)
-            if os.path.exists(sub_cand):
-                chosen_cls_path = sub_cand
-                break
+    # 1. 目标检测器选择与主检测模式判定
+    is_md = False
+    if chosen_detector_path:
+        det_str = str(chosen_detector_path).lower()
+        is_md = ("mdv" in det_str or "megadetector" in det_str)
 
+    # 1.1 二级动物细分类器初始化 (核心规范：仅在加载 MegaDetector 时才激活生效，YOLO 模式下绝不加载)
     animal_classifier = None
-    try:
-        from camping_guard.perception.animal_classifier import AnimalClassifier
-        animal_classifier = AnimalClassifier(model_path=chosen_cls_path, use_trt=use_trt)
-    except Exception as e:
-        pass
+    if is_md:
+        chosen_cls_path = cls_onnx_path
+        if chosen_cls_path and not os.path.exists(chosen_cls_path):
+            for search_dir in ["models/cls", "models"]:
+                sub_cand = os.path.join(search_dir, chosen_cls_path)
+                if os.path.exists(sub_cand):
+                    chosen_cls_path = sub_cand
+                    break
+        if chosen_cls_path and os.path.exists(chosen_cls_path):
+            try:
+                from camping_guard.perception.animal_classifier import AnimalClassifier
+                animal_classifier = AnimalClassifier(model_path=chosen_cls_path, use_trt=use_trt)
+            except Exception as e:
+                pass
+    else:
+        # 当前为主流人车 YOLO 检测器，二级物种细分类模型 (cls) 保持休眠，不加载进显存
+        animal_classifier = None
 
     if chosen_detector_path and os.path.exists(chosen_detector_path):
         tag = "[TensorRT Engine]" if str(chosen_detector_path).endswith(".engine") else "[ONNX]"
-        is_md = "mdv" in str(chosen_detector_path).lower() or "megadetector" in str(chosen_detector_path).lower()
-        model_type_str = "MegaDetector" if is_md else "YOLO"
+        model_type_str = "MegaDetector (野生动物监测模式)" if is_md else "YOLO (人车防卫模式)"
         print(f"[*] 正在挂载 {model_type_str} 目标检测模型 {tag}: {chosen_detector_path} (置信度阈值: {conf_threshold:.2f})")
         detector = ONNXObjectDetector(
             model_path=chosen_detector_path,

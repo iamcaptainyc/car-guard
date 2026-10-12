@@ -284,13 +284,60 @@ def main():
         custom_cls=args.cls_model,
         custom_pose=args.pose
     )
+    # 判定当前主检测模式 (YOLO 与 MegaDetector 互斥二选一)
+    is_md = False
+    if args.megadetector:
+        chosen_det = args.megadetector
+        is_md = True
+    elif args.detector:
+        chosen_det = args.detector
+        is_md = ("mdv" in str(chosen_det).lower() or "megadetector" in str(chosen_det).lower())
+    else:
+        # 默认模式：优先选用 YOLO 通用人车检测器；若无 YOLO 则回退 MegaDetector
+        if engines["yolo"]:
+            chosen_det = str(engines["yolo"])
+            is_md = False
+        elif engines["megadetector"]:
+            chosen_det = str(engines["megadetector"])
+            is_md = True
+        else:
+            chosen_det = None
+            is_md = False
+
+    # 核心准则：二级动物细分类器 (cls) 仅在检测器为 MegaDetector 时按需加载，YOLO 模式下绝不加载
+    if is_md:
+        chosen_cls = args.cls_model or (str(engines["cls"]) if engines["cls"] else None)
+    else:
+        chosen_cls = None
+
     print("\n[*] 检查 TensorRT Engine 模型挂载状态:")
     for k, p in engines.items():
-        if k == "vlm":
+        if k == "yolo":
+            if not is_md and p:
+                status = f"✅ 已激活 (主检测器: 人车防卫模式): {p}"
+            elif p:
+                status = f"⏸️ 待命休眠: {p} (当前已选用 MegaDetector)"
+            else:
+                status = "⚠️ 未找到对应 .engine 文件"
+        elif k == "megadetector":
+            if is_md and p:
+                status = f"✅ 已激活 (主检测器: 野生动物监测模式): {p}"
+            elif p:
+                status = f"⏸️ 待命休眠: {p} (当前使用 YOLO，传入 --megadetector 切换)"
+            else:
+                status = "⚠️ 未找到对应 .engine 文件"
+        elif k == "cls":
+            if is_md and p:
+                status = f"✅ 已激活 (配合 MegaDetector 级联细分类): {p}"
+            elif p:
+                status = f"⏸️ 待命休眠: {p} (仅在启用 MegaDetector 时按需加载)"
+            else:
+                status = "⚠️ 未找到对应 .engine 文件"
+        elif k == "vlm":
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未指定/未挂载 (可传入 --model-dir 指定，当前使用端侧离线保底)"
         else:
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
-        print(f"    - {k:<10}: {status}")
+        print(f"    - {k:<12}: {status}")
 
     if not engines["yolo"] and not args.detector:
         print("\n[!] 提示: 检测到尚未编译 YOLO TensorRT Engine。")
@@ -328,9 +375,6 @@ def main():
         loop_val = False if args.output else True
 
     show_sb = args.sidebar and not args.no_sidebar
-
-    chosen_det = args.megadetector or args.detector or (str(engines["yolo"]) if engines["yolo"] else (str(engines["megadetector"]) if engines["megadetector"] else None))
-    chosen_cls = args.cls_model or (str(engines["cls"]) if engines["cls"] else None)
 
     print("\n[*] 正在启动车载露营守卫 (TensorRT 模式)...")
     run_video_pipeline(

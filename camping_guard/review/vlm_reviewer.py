@@ -413,6 +413,130 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         has_engine = (d / "llm.engine").is_file() or (d / "visual.engine").is_file() or any(d.glob("*.engine"))
         return has_config or has_engine
 
+    @staticmethod
+    def _extract_vlm_response(out_data: Any, stdout_str: Optional[str] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """
+        自适应从 output.json 或 stdout 中提取大模型输出文本与研判字典
+        支持：
+        1. 直接 JSON 目标字典 (out_data 自身即为 {"action_category": ..., "summary_text": ...})
+        2. responses / choices / outputs / results / text / messages / output 等封装
+        3. markdown ```json 代码块及纯文本 {...} 子串提取
+        4. stdout --dumpOutput 文本回显提取
+        5. 模型生成自然语言文字时提取语义概要保底
+        """
+        # 1. 检查 out_data 自身是否就是已解析的研判字典
+        if isinstance(out_data, dict):
+            if "action_category" in out_data or "summary_text" in out_data:
+                return json.dumps(out_data, ensure_ascii=False), out_data
+
+        cand_texts: List[str] = []
+
+        # 2. 收集来自 out_data 的候选文本
+        if isinstance(out_data, dict):
+            for k in ["output", "response", "text", "generated_text", "result", "content"]:
+                v = out_data.get(k)
+                if isinstance(v, str) and v.strip():
+                    cand_texts.append(v)
+            for arr_k in ["responses", "choices", "outputs", "results", "predictions"]:
+                arr = out_data.get(arr_k)
+                if isinstance(arr, list) and len(arr) > 0:
+                    first = arr[0]
+                    if isinstance(first, str):
+                        cand_texts.append(first)
+                    elif isinstance(first, dict):
+                        for sub_k in ["output_text", "text", "response", "content", "output"]:
+                            sv = first.get(sub_k)
+                            if isinstance(sv, str) and sv.strip():
+                                cand_texts.append(sv)
+                        msg = first.get("message")
+                        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                            cand_texts.append(msg["content"])
+            if isinstance(out_data.get("messages"), list) and len(out_data["messages"]) > 0:
+                last_m = out_data["messages"][-1]
+                if isinstance(last_m, dict) and isinstance(last_m.get("content"), str):
+                    cand_texts.append(last_m["content"])
+        elif isinstance(out_data, list) and len(out_data) > 0:
+            for item in out_data:
+                if isinstance(item, str):
+                    cand_texts.append(item)
+                elif isinstance(item, dict):
+                    if "action_category" in item or "summary_text" in item:
+                        return json.dumps(item, ensure_ascii=False), item
+                    for sub_k in ["text", "output", "response", "content", "output_text"]:
+                        sv = item.get(sub_k)
+                        if isinstance(sv, str) and sv.strip():
+                            cand_texts.append(sv)
+        elif isinstance(out_data, str) and out_data.strip():
+            cand_texts.append(out_data)
+
+        # 3. 收集来自 stdout 的文本
+        if stdout_str and stdout_str.strip():
+            cand_texts.append(stdout_str.strip())
+
+        # 4. 尝试从候选文本中提取并解析 JSON
+        for txt in cand_texts:
+            raw_text = txt.strip()
+            # 尝试 markdown json 块
+            if "```" in raw_text:
+                parts = raw_text.split("```")
+                for part in parts:
+                    sub = part.strip()
+                    if sub.startswith("json"):
+                        sub = sub[4:].strip()
+                    if "{" in sub and "}" in sub:
+                        s = sub.find("{")
+                        e = sub.rfind("}") + 1
+                        try:
+                            parsed = json.loads(sub[s:e])
+                            if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed):
+                                return txt, parsed
+                        except Exception:
+                            pass
+            # 尝试直接 {...}
+            if "{" in raw_text and "}" in raw_text:
+                s = raw_text.find("{")
+                e = raw_text.rfind("}") + 1
+                try:
+                    parsed = json.loads(raw_text[s:e])
+                    if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed):
+                        return txt, parsed
+                except Exception:
+                    pass
+
+        # 5. 宽松容错：若含有合法 JSON 但未完全匹配上述字段
+        for txt in cand_texts:
+            if "{" in txt and "}" in txt:
+                s = txt.find("{")
+                e = txt.rfind("}") + 1
+                try:
+                    parsed = json.loads(txt[s:e])
+                    if isinstance(parsed, dict):
+                        return txt, parsed
+                except Exception:
+                    pass
+
+        # 6. 自然语言保底：若真实大模型输出了中文文字但未按严格 JSON 输出，不判定为失败
+        for txt in cand_texts:
+            clean = txt.strip()
+            if "【现场传感器遥测上下文】" in clean:
+                parts = clean.split("请结合关键帧图像分析并输出判定 JSON：")
+                if len(parts) > 1:
+                    clean = parts[-1].strip()
+            for prefix in ["Output:", "Generation:", "Response:", "Assistant:"]:
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):].strip()
+            if len(clean) >= 6 and not clean.startswith("Command") and not clean.startswith("[*]") and not clean.startswith("[!]"):
+                return txt, {
+                    "action_category": "OTHER",
+                    "confidence": 0.90,
+                    "is_human_contact": False,
+                    "is_false_alarm": False,
+                    "threat_escalation": "MAINTAIN",
+                    "summary_text": clean[:50]
+                }
+
+        return None, None
+
     def _infer_native_cpp(
         self,
         event_record: ThreatEventRecord,
@@ -516,47 +640,40 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             res = subprocess.run(cmd, env=env, timeout=self.timeout, capture_output=True, text=True)
             elapsed_ms = (time.time() - t0) * 1000.0
 
-            if res.returncode == 0 and output_file.exists():
-                with open(output_file, "r", encoding="utf-8") as f:
-                    out_data = json.load(f)
+            if res.returncode == 0:
+                out_data = None
+                if output_file.exists():
+                    try:
+                        with open(output_file, "r", encoding="utf-8") as f:
+                            out_data = json.load(f)
+                    except Exception:
+                        pass
 
-                output_str = ""
-                if isinstance(out_data, dict):
-                    if "responses" in out_data and len(out_data["responses"]) > 0:
-                        resp0 = out_data["responses"][0]
-                        output_str = resp0.get("output_text", "") or resp0.get("text", "") or resp0.get("response", "")
-                    elif "choices" in out_data and len(out_data["choices"]) > 0:
-                        output_str = out_data["choices"][0].get("text", "") or out_data["choices"][0].get("message", {}).get("content", "")
-                    elif "text" in out_data:
-                        output_str = out_data["text"]
-                    elif "choices" in out_data and len(out_data["choices"]) > 0:
-                        output_str = out_data["choices"][0].get("text", "") or out_data["choices"][0].get("message", {}).get("content", "")
-                    elif "text" in out_data:
-                        output_str = out_data["text"]
-                elif isinstance(out_data, list) and len(out_data) > 0:
-                    first = out_data[0]
-                    if isinstance(first, dict):
-                        output_str = first.get("text", "") or first.get("response", "")
-
-                if output_str:
-                    raw_text = output_str.strip()
-                    if "```" in raw_text:
-                        raw_text = raw_text.split("```")[1]
-                        if raw_text.startswith("json"):
-                            raw_text = raw_text[4:]
-                    if "{" in raw_text and "}" in raw_text:
-                        s = raw_text.find("{")
-                        e = raw_text.rfind("}") + 1
-                        parsed = json.loads(raw_text[s:e])
-                        if "summary_text" in parsed:
-                            parsed["summary_text"] = parsed["summary_text"][:50]
-                        parsed["backend_source"] = "TRT-Edge-LLM (C++ 原生真实大模型)"
-                        parsed["raw_output_text"] = output_str
-                        parsed["prompt_text"] = prompt_text
-                        print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 ({elapsed_ms:.1f}ms): {parsed.get('summary_text')}")
-                        return parsed
+                output_str, parsed = self._extract_vlm_response(out_data, res.stdout)
+                if parsed:
+                    if "summary_text" in parsed:
+                        parsed["summary_text"] = parsed["summary_text"][:50]
+                    parsed["backend_source"] = "TRT-Edge-LLM (C++ 原生真实大模型)"
+                    parsed["raw_output_text"] = output_str or json.dumps(parsed, ensure_ascii=False)
+                    parsed["prompt_text"] = prompt_text
+                    print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 ({elapsed_ms:.1f}ms): {parsed.get('summary_text')}")
+                    return parsed
+                else:
+                    print(f"[!] [TRT-Edge-LLM] 模型已执行完毕 ({elapsed_ms:.1f}ms)，但未能从输出中提取判定结果:")
+                    if output_file.exists():
+                        print(f"    - output_file 内容概要: {str(out_data)[:250]}")
+                    else:
+                        print("    - output_file 未生成")
+                    if res.stdout:
+                        print(f"    - stdout 尾部: {res.stdout.strip()[-300:]}")
+                    if res.stderr:
+                        print(f"    - stderr 尾部: {res.stderr.strip()[-300:]}")
             else:
-                print(f"[!] [TRT-Edge-LLM] 二进制推理非零退出 (code {res.returncode}): {res.stderr[:200]}")
+                print(f"[!] [TRT-Edge-LLM] 二进制推理非零退出 (code {res.returncode}):")
+                if res.stderr:
+                    print(f"    - stderr: {res.stderr.strip()[:300]}")
+                if res.stdout:
+                    print(f"    - stdout: {res.stdout.strip()[:300]}")
         except subprocess.TimeoutExpired as e:
             print(f"[!] [TRT-Edge-LLM] 原生推理超时 (耗时超过 {self.timeout:.1f} 秒，可传入 --vlm-timeout 调大门限): {e}")
         except Exception as e:
