@@ -241,6 +241,7 @@ def build_single_engine(
     max_dim=1280,
     skip_existing=False,
     benchmark_only=False,
+    force=False,
 ):
     """编译单个 ONNX 模型为 TensorRT Engine 并返回性能指标"""
     onnx_path = Path(onnx_path).resolve()
@@ -259,7 +260,7 @@ def build_single_engine(
         for_load_engine=True,
     )
 
-    if benchmark_only and engine_path.is_file():
+    if not force and benchmark_only and engine_path.is_file():
         # 仅基准测试已有 engine
         cmd = [
             trtexec_bin,
@@ -269,7 +270,7 @@ def build_single_engine(
             "--verbose=false",
         ]
         cmd.extend(shape_args_load)
-    elif skip_existing and engine_path.is_file():
+    elif not force and skip_existing and engine_path.is_file():
         # 跳过编译直接测试已有 engine
         cmd = [
             trtexec_bin,
@@ -362,8 +363,9 @@ def generate_markdown_report(results, report_file, root_dir):
     dev_name = hw_info.get("device_name", "NVIDIA Jetson Orin")
     sms = hw_info.get("device_sms", 8)
     trt_ver = hw_info.get("trt_version", "10.3.0")
+    precision_str = hw_info.get("precision", "fp16").upper()
 
-    lines.append(f"> **测试平台**: `{dev_name}` (SMs: {sms}) | **TensorRT 版本**: `v{trt_ver}` | **精度**: `FP16`\n")
+    lines.append(f"> **测试平台**: `{dev_name}` (SMs: {sms}) | **TensorRT 版本**: `v{trt_ver}` | **精度**: `{precision_str}`\n")
     lines.append("---\n")
 
     lines.append("## 一、 全模型推理性能汇总一览表\n")
@@ -481,10 +483,15 @@ def main():
     parser.add_argument("--max-dim", type=int, default=1280, help="动态模型最大支持长宽尺寸（默认: 1280）")
     parser.add_argument("--skip-existing", action="store_true", help="如果对应 .engine 已存在，跳过重新编译直接测试")
     parser.add_argument("--benchmark-only", action="store_true", help="不重新编译，直接加载已有 .engine 进行基准测速")
+    parser.add_argument("--force", action="store_true", help="强制全量重新编译（覆盖已有 .engine，忽略历史缓存）")
     parser.add_argument("--output-md", default="", help="输出 Markdown 报告路径（默认: <models_dir>/benchmark_report.md）")
     parser.add_argument("--output-json", default="", help="输出 JSON 结果路径（默认: <models_dir>/benchmark_results.json）")
 
     args = parser.parse_args()
+
+    if args.force:
+        args.skip_existing = False
+        args.benchmark_only = False
 
     input_target = Path(args.models_dir).resolve()
     is_single_file = input_target.is_file() and input_target.suffix.lower() == ".onnx"
@@ -513,10 +520,12 @@ def main():
     print(f"📂 模型根目录 : {models_dir}")
     if is_single_file:
         print(f"🎯 单模型追加 : {input_target.name}")
-    print(f"⚙️  编译精度   : {args.precision}")
+    print(f"⚙️  编译精度   : {args.precision.upper()}")
     print(f"🧠 工作区显存 : {args.workspace} MiB")
     print(f"⚡ 优化档位   : Level {args.builder_level}")
     print(f"📐 动态长宽范围: min={args.min_dim}, opt={args.opt_dim}, max={args.max_dim}")
+    if args.force:
+        print(f"💥 强制重构模式: 开启 (将全量覆盖旧引擎并全新测速)")
     print(f"🛠️  trtexec    : {trtexec_bin}")
     print("=" * 70)
 
@@ -529,7 +538,7 @@ def main():
 
     # 读取已有历史记录（用于增量跳过与单文件追加）
     cached_dict = {}
-    if json_path.is_file():
+    if not args.force and json_path.is_file():
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 old_list = json.load(f)
@@ -541,7 +550,7 @@ def main():
         except Exception as e:
             print(f"⚠️ 读取历史数据缓存失败，将全新统计: {e}")
 
-    timing_cache = models_dir / "trt_timing.cache"
+    timing_cache = models_dir / f"trt_timing_{args.precision}.cache"
     processed_results = []
 
     print(f"🔍 本次待检验/处理模型数：{len(onnx_files)} 个")
@@ -555,7 +564,7 @@ def main():
 
         # 检查是否可以命中缓存直接复用已有指标（避免无谓的重复测速）
         cached_item = cached_dict.get(str(onnx_path)) or cached_dict.get(onnx_path.stem)
-        if args.skip_existing and engine_path.is_file() and cached_item and cached_item.get("success"):
+        if not args.force and args.skip_existing and engine_path.is_file() and cached_item and cached_item.get("success"):
             print(f"\n⚡ [{idx}/{len(onnx_files)}] 已编译且有完整指标，直接复用: {rel_name} (FPS: {cached_item.get('throughput_fps')})")
             processed_results.append(cached_item)
             continue
@@ -577,6 +586,7 @@ def main():
             max_dim=args.max_dim,
             skip_existing=args.skip_existing,
             benchmark_only=args.benchmark_only,
+            force=args.force,
         )
 
         processed_results.append(res)
