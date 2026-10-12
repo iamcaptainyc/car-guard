@@ -107,6 +107,24 @@ class ONNXObjectDetector(BaseObjectDetector):
                 else:
                     print(f"[ObjectDetector] 初始化模型失败: {e}")
 
+        # 自动读取并自适应对齐模型期望输入分辨率 (支持静态固化尺寸与动态自适应)
+        if self.session is not None and hasattr(self.session, "get_inputs"):
+            try:
+                inps = self.session.get_inputs()
+                if inps and len(inps) > 0:
+                    inp_shape = inps[0].shape
+                    if len(inp_shape) == 4:
+                        # [Batch, Channel, Height, Width]
+                        eh, ew = inp_shape[2], inp_shape[3]
+                        if isinstance(eh, int) and isinstance(ew, int) and eh > 0 and ew > 0:
+                            if (eh, ew) != self.input_size:
+                                print(f"[ObjectDetector] ⚡ 模型要求固定静态输入分辨率 ({ew}x{eh})，自动对齐 input_size: {self.input_size} -> ({ew}, {eh})")
+                                self.input_size = (eh, ew)
+                        else:
+                            print(f"[ObjectDetector] ℹ️ 模型具有动态输入维度 (H={eh}, W={ew})，当前运行分辨率配置为: {self.input_size}")
+            except Exception as e:
+                pass
+
         # 补充通过 metadata 探测 MegaDetector
         if not self.is_megadetector and self.session is not None and hasattr(self.session, "get_modelmeta"):
             try:

@@ -280,11 +280,27 @@ class TRTInferenceSession:
                 if self.is_trt10:
                     engine_shape = tuple(self.engine.get_tensor_shape(name))
                     if any(d < 0 for d in engine_shape):
-                        self.context.set_input_shape(name, tuple(tensor.shape))
+                        ok = self.context.set_input_shape(name, tuple(tensor.shape))
+                        if not ok:
+                            prof_str = ""
+                            try:
+                                min_s, opt_s, max_s = self.engine.get_tensor_profile_shape(name, 0)
+                                prof_str = f" 当前 Profile 允许范围为: min={min_s}, opt={opt_s}, max={max_s}。"
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                f"TensorRT Engine 动态尺寸设置失败: 模型 '{Path(self.engine_path).name}' 输入 '{name}' "
+                                f"无法应用尺寸 {tuple(tensor.shape)}。{prof_str}"
+                            )
                     elif engine_shape != tuple(tensor.shape):
                         raise RuntimeError(
                             f"TensorRT Engine 静态输入尺寸不匹配: 模型 '{Path(self.engine_path).name}' 输入 '{name}' 期望 {engine_shape}，"
-                            f"但实际传入了 {tuple(tensor.shape)}。请重新以正确的动态维度 (--minShapes/--optShapes/--maxShapes) 编译该 Engine！"
+                            f"但实际传入了 {tuple(tensor.shape)}。\n"
+                            f"解决提示:\n"
+                            f"1. 运行时自适应: 检测器现已支持自动对齐静态模型尺寸；\n"
+                            f"2. 编译时动态化: 若需该模型原生支持 640~1280 动态输入，请以动态 Profile 编译:\n"
+                            f"   trtexec --onnx={Path(self.engine_path).stem}.onnx --saveEngine={Path(self.engine_path).name} --fp16 "
+                            f"--minShapes={name}:1x3x640x640 --optShapes={name}:1x3x640x640 --maxShapes={name}:1x3x1280x1280"
                         )
                     tensor_ptrs[name] = tensor.data_ptr()
                     self.context.set_tensor_address(name, tensor.data_ptr())
@@ -292,11 +308,15 @@ class TRTInferenceSession:
                     idx = self.engine.get_binding_index(name)
                     binding_shape = tuple(self.engine.get_binding_shape(idx))
                     if any(d < 0 for d in binding_shape):
-                        self.context.set_binding_shape(idx, tuple(tensor.shape))
+                        ok = self.context.set_binding_shape(idx, tuple(tensor.shape))
+                        if not ok:
+                            raise RuntimeError(
+                                f"TensorRT Engine 动态尺寸设置失败: 模型 '{Path(self.engine_path).name}' 无法应用尺寸 {tuple(tensor.shape)}。"
+                            )
                     elif binding_shape != tuple(tensor.shape):
                         raise RuntimeError(
                             f"TensorRT Engine 静态输入尺寸不匹配: 模型 '{Path(self.engine_path).name}' 期望 {binding_shape}，"
-                            f"但实际传入了 {tuple(tensor.shape)}。请重新以正确的动态维度 (--minShapes/--optShapes/--maxShapes) 编译该 Engine！"
+                            f"但实际传入了 {tuple(tensor.shape)}。"
                         )
                     tensor_ptrs[name] = tensor.data_ptr()
 

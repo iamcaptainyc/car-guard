@@ -725,7 +725,9 @@ def run_video_pipeline(
     vlm_max_tokens: int = 128,
     cls_onnx_path: Optional[str] = None,
     fire_detector_path: Optional[str] = None,
-    enable_fire: bool = True
+    enable_fire: bool = True,
+    detector_size: Optional[int] = None,
+    fire_size: Optional[int] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -898,8 +900,10 @@ def run_video_pipeline(
         tag = "[TensorRT Engine]" if str(chosen_detector_path).endswith(".engine") else "[ONNX]"
         model_type_str = "MegaDetector (野生动物监测模式)" if is_md else "YOLO (人车防卫模式)"
         print(f"[*] 正在挂载 {model_type_str} 目标检测模型 {tag}: {chosen_detector_path} (置信度阈值: {conf_threshold:.2f})")
+        det_input_size = (detector_size, detector_size) if detector_size else (640, 640)
         detector = ONNXObjectDetector(
             model_path=chosen_detector_path,
+            input_size=det_input_size,
             conf_threshold=conf_threshold,
             use_trt=use_trt,
             animal_classifier=animal_classifier
@@ -921,8 +925,8 @@ def run_video_pipeline(
         if not chosen_fire_path:
             fire_cands = []
             if use_trt:
-                fire_cands.extend(["models/fire/fire.engine", "models/fire/yolov8n-fire.engine", "models/fire/fire_detector.engine"])
-            fire_cands.extend(["models/fire/fire.onnx", "models/fire/yolov8n-fire.onnx", "models/fire/fire_detector.onnx"])
+                fire_cands.extend(["models/fire/fire.engine", "models/fire/yolov8n-fire.engine", "models/fire/yolo11n_fire.engine", "models/fire/fire_detector.engine"])
+            fire_cands.extend(["models/fire/fire.onnx", "models/fire/yolov8n-fire.onnx", "models/fire/yolo11n_fire.onnx", "models/fire/fire_detector.onnx"])
             for fc in fire_cands:
                 if os.path.exists(fc):
                     chosen_fire_path = fc
@@ -936,8 +940,10 @@ def run_video_pipeline(
                     chosen_fire_path = str(eng_cand)
             ftag = "[TensorRT Engine]" if str(chosen_fire_path).endswith(".engine") else "[ONNX]"
             print(f"[*] 正在挂载火灾/浓烟检测模型 {ftag}: {chosen_fire_path}")
+            fire_input_size = (fire_size, fire_size) if fire_size else (640, 640)
             fire_det_obj = ONNXObjectDetector(
                 model_path=chosen_fire_path,
+                input_size=fire_input_size,
                 conf_threshold=conf_threshold,
                 use_trt=use_trt
             )
@@ -1706,6 +1712,10 @@ def main():
                         help="火灾/浓烟专用目标检测模型文件或路径 (默认已启用火焰检测并发)")
     parser.add_argument("--no-fire", action="store_true",
                         help="显式关闭火焰检测 (默认开启自适应视觉火焰检测或专用模型并发)")
+    parser.add_argument("--detector-size", type=int, default=None,
+                        help="目标检测模型输入分辨率 (默认自动适配模型，如 640 或 1280)")
+    parser.add_argument("--fire-size", type=int, default=None,
+                        help="火灾检测模型输入分辨率 (默认自动适配模型，如 640 或 1280)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1745,7 +1755,9 @@ def main():
         vlm_max_tokens=args.vlm_max_tokens,
         cls_onnx_path=args.cls_model,
         fire_detector_path=args.fire_detector,
-        enable_fire=not args.no_fire
+        enable_fire=not args.no_fire,
+        detector_size=args.detector_size,
+        fire_size=args.fire_size
     )
 
 
