@@ -67,7 +67,15 @@ def check_and_recommend_power_mode():
         pass
 
 
-def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optional[Path]]:
+def check_required_engines(
+    models_dir: Path = Path("models"),
+    vlm_model_dir: Optional[str] = None,
+    vlm_engine: Optional[str] = None,
+    custom_detector: Optional[str] = None,
+    custom_megadetector: Optional[str] = None,
+    custom_cls: Optional[str] = None,
+    custom_pose: Optional[str] = None
+) -> Dict[str, Optional[Path]]:
     """检查系统所需的各核心 TensorRT Engine / ONNX 模型文件"""
     engine_status = {
         "yolo": None,
@@ -81,51 +89,63 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     }
 
     # 1. YOLO 目标检测
-    yolo_cands = [
-        models_dir / "yolo" / "yolo11s.engine",
-        models_dir / "yolo" / "yolo11n.engine",
-        models_dir / "yolo" / "yolo11n-fisheye.engine",
-        models_dir / "yolo" / "yolo26n.engine",
-        models_dir / "yolo" / "yolov8n.engine",
-    ]
-    for c in yolo_cands:
-        if c.is_file():
-            engine_status["yolo"] = c
-            break
+    if custom_detector and Path(custom_detector).is_file():
+        engine_status["yolo"] = Path(custom_detector)
+    else:
+        yolo_cands = [
+            models_dir / "yolo" / "yolo11s.engine",
+            models_dir / "yolo" / "yolo11n.engine",
+            models_dir / "yolo" / "yolo11n-fisheye.engine",
+            models_dir / "yolo" / "yolo26n.engine",
+            models_dir / "yolo" / "yolov8n.engine",
+        ]
+        for c in yolo_cands:
+            if c.is_file():
+                engine_status["yolo"] = c
+                break
 
     # 1.1 MegaDetector 野生动物与人车检测器
-    md_cands = [
-        models_dir / "megadetector" / "MDV6-yolov10-c.engine",
-        models_dir / "yolo" / "MDV6-yolov10-c.engine",
-        models_dir / "megadetector" / "MDV6-yolov10-c.onnx",
-        models_dir / "yolo" / "MDV6-yolov10-c.onnx",
-    ]
-    for c in md_cands:
-        if c.is_file():
-            engine_status["megadetector"] = c
-            break
+    if custom_megadetector and Path(custom_megadetector).is_file():
+        engine_status["megadetector"] = Path(custom_megadetector)
+    else:
+        md_cands = [
+            models_dir / "megadetector" / "MDV6-yolov10-c.engine",
+            models_dir / "yolo" / "MDV6-yolov10-c.engine",
+            models_dir / "megadetector" / "MDV6-yolov10-c.onnx",
+            models_dir / "yolo" / "MDV6-yolov10-c.onnx",
+        ]
+        for c in md_cands:
+            if c.is_file():
+                engine_status["megadetector"] = c
+                break
 
     # 1.2 二级动物细分类器 (MobileNetV3)
-    cls_cands = [
-        models_dir / "cls" / "mobilenetv3-large.engine",
-        models_dir / "cls" / "mobilenetv3.engine",
-        models_dir / "cls" / "mobilenetv3-large.onnx",
-        models_dir / "cls" / "mobilenetv3.onnx",
-    ]
-    for c in cls_cands:
-        if c.is_file():
-            engine_status["cls"] = c
-            break
+    if custom_cls and Path(custom_cls).is_file():
+        engine_status["cls"] = Path(custom_cls)
+    else:
+        cls_cands = [
+            models_dir / "cls" / "mobilenetv3-large.engine",
+            models_dir / "cls" / "mobilenetv3.engine",
+            models_dir / "cls" / "mobilenetv3-large.onnx",
+            models_dir / "cls" / "mobilenetv3.onnx",
+        ]
+        for c in cls_cands:
+            if c.is_file():
+                engine_status["cls"] = c
+                break
 
     # 2. RTMPose 人体姿态
-    pose_cands = [
-        models_dir / "pose" / "rtmpose-s.engine",
-        models_dir / "pose" / "yolo26n-pose.engine",
-    ]
-    for c in pose_cands:
-        if c.is_file():
-            engine_status["pose"] = c
-            break
+    if custom_pose and Path(custom_pose).is_file():
+        engine_status["pose"] = Path(custom_pose)
+    else:
+        pose_cands = [
+            models_dir / "pose" / "rtmpose-s.engine",
+            models_dir / "pose" / "yolo26n-pose.engine",
+        ]
+        for c in pose_cands:
+            if c.is_file():
+                engine_status["pose"] = c
+                break
 
     # 3. OSNet 人员重识别
     reid_cand = models_dir / "reid" / "osnet_x0_25.engine"
@@ -142,8 +162,23 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     if face_rec_cand.is_file():
         engine_status["face_rec"] = face_rec_cand
 
-    # 6. 端侧 Qwen-VLM 按需多模态复核大模型 (严格由用户显式指定，不进行盲目推测)
-    engine_status["vlm"] = None
+    # 6. 端侧 Qwen-VLM 按需多模态复核大模型
+    if vlm_engine:
+        ve_p = Path(vlm_engine).resolve()
+        if ve_p.is_file() and ve_p.suffix == ".engine":
+            engine_status["vlm"] = ve_p
+        elif ve_p.is_dir() and ((ve_p / "config.json").is_file() or (ve_p / "llm.engine").is_file() or any(ve_p.glob("*.engine"))):
+            engine_status["vlm"] = ve_p
+    elif vlm_model_dir:
+        vm_p = Path(vlm_model_dir).resolve()
+        for cand in [vm_p / "engines" / "llm", vm_p / "llm", vm_p]:
+            if cand.is_dir() and ((cand / "config.json").is_file() or (cand / "llm.engine").is_file() or any(cand.glob("*.engine"))):
+                engine_status["vlm"] = cand
+                break
+    else:
+        vlm_default = models_dir / "vlm"
+        if vlm_default.is_dir() and (vlm_default / "engines" / "llm").is_dir():
+            engine_status["vlm"] = vlm_default / "engines" / "llm"
 
     return engine_status
 
@@ -241,10 +276,20 @@ def main():
     if args.compile:
         auto_compile_engines()
 
-    engines = check_required_engines()
+    engines = check_required_engines(
+        vlm_model_dir=args.vlm_model_dir,
+        vlm_engine=args.vlm_engine,
+        custom_detector=args.detector,
+        custom_megadetector=args.megadetector,
+        custom_cls=args.cls_model,
+        custom_pose=args.pose
+    )
     print("\n[*] 检查 TensorRT Engine 模型挂载状态:")
     for k, p in engines.items():
-        status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
+        if k == "vlm":
+            status = f"✅ 已就绪: {p}" if p else "⚠️ 未指定/未挂载 (可传入 --model-dir 指定，当前使用端侧离线保底)"
+        else:
+            status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
         print(f"    - {k:<10}: {status}")
 
     if not engines["yolo"] and not args.detector:
