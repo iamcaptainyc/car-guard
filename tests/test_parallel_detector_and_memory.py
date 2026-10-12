@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from camping_guard.perception.detector import BaseObjectDetector, ParallelEnsembleDetector, SyntheticDetector
+from camping_guard.perception.detector import BaseObjectDetector, ParallelEnsembleDetector, SyntheticDetector, VisualFlameDetector
 from camping_guard.evidence.recorder import EvidenceRecorder
 from camping_guard.types import ClockSource
 
@@ -234,3 +234,51 @@ def test_onnx_object_detector_detect_cls_mapping():
     res_fire = det.detect(dummy_frame)
     assert len(res_fire) == 1
     assert res_fire[0]["category"] == "fire"
+
+
+def test_visual_flame_detector_and_ensemble():
+    """测试内置自适应视觉火焰检测器 (VisualFlameDetector) 零权重秒级检出与多流并发集成"""
+    v_flame = VisualFlameDetector(min_area=30, conf_threshold=0.25)
+
+    # 1. 负样本测试：全黑画面与白昼日光画面不应误报火焰
+    black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert len(v_flame.detect(black_frame)) == 0
+
+    white_frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+    assert len(v_flame.detect(white_frame)) == 0
+
+    green_lawn = np.full((480, 640, 3), (30, 120, 30), dtype=np.uint8)
+    assert len(v_flame.detect(green_lawn)) == 0
+
+    # 2. 正样本测试：夜幕营地中燃烧的橙红营火 (BGR: B=20, G=100, R=240)
+    fire_frame = np.full((480, 640, 3), (20, 25, 20), dtype=np.uint8)
+    # 在画面中心绘制一块 80x60 的火焰区域
+    fire_frame[200:260, 280:360] = (25, 110, 245)
+
+    dets = v_flame.detect(fire_frame)
+    assert len(dets) >= 1
+    fire_det = dets[0]
+    assert fire_det["category"] == "fire"
+    assert fire_det["conf"] >= 0.60
+
+    bx, by, bw, bh = fire_det["bbox"]
+    # 验证检出框大致覆盖注入的火焰坐标 (允许缩放与形态学边界微差)
+    assert 260 <= bx <= 300
+    assert 180 <= by <= 220
+    assert bw >= 50 and bh >= 40
+
+    # 3. 验证与主检测器 (SyntheticDetector) 构建 ParallelEnsembleDetector 双流并发集成
+    main_det = SyntheticDetector()
+    main_det.set_injected_detections([
+        {"bbox": (100, 100, 50, 100), "category": "person", "conf": 0.92}
+    ])
+
+    ensemble = ParallelEnsembleDetector(main_detector=main_det, fire_detector=v_flame)
+    combined = ensemble.detect(fire_frame)
+
+    cats = [d["category"] for d in combined]
+    assert "person" in cats
+    assert "fire" in cats
+    assert len(combined) == 2
+    ensemble.close()
+

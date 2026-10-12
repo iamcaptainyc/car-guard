@@ -16,14 +16,24 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-def get_shape_args(onnx_path, opt_batch=1, max_batch=1, for_load_engine=False):
+def get_shape_args(
+    onnx_path,
+    opt_batch=1,
+    max_batch=1,
+    min_dim=320,
+    opt_dim=640,
+    max_dim=1280,
+    for_load_engine=False,
+):
     """
     检查 ONNX 是否包含动态维度：
     - 若全为固定尺寸(Static)，在 TRT 10 下返回空列表（无需且不应传 --shapes）
     - 若包含动态维度(Dynamic)：
       * 编译模式下返回 --minShapes, --optShapes, --maxShapes
       * --loadEngine 测速模式下返回 --shapes=<optShapes>，避免被默认 1x3x1x1 导致 profile 校验失败
+    - 具备缺失 onnx 模块与已知模型（det_500m, fire 等）的自适应保底机制
     """
+    p_name = Path(onnx_path).name.lower()
     try:
         import onnx
         model = onnx.load(str(onnx_path), load_external_data=False)
@@ -48,10 +58,19 @@ def get_shape_args(onnx_path, opt_batch=1, max_batch=1, for_load_engine=False):
                         opt_d.append(d)
                         max_d.append(d)
                     else:
-                        # 针对人脸检测 det_500m (SCRFD) 等动态长宽，缺省按 640x640 处理
-                        min_d.append(320)
-                        opt_d.append(640)
-                        max_d.append(640)
+                        # 空间动态长宽 (H/W)
+                        if "det_500m" in p_name:
+                            min_d.append(320)
+                            opt_d.append(640)
+                            max_d.append(640)
+                        elif "fire" in p_name:
+                            min_d.append(320)
+                            opt_d.append(640)
+                            max_d.append(1280)
+                        else:
+                            min_d.append(min_dim)
+                            opt_d.append(opt_dim)
+                            max_d.append(max_dim)
 
             min_shapes.append(f"{name}:" + "x".join(map(str, min_d)))
             opt_shapes.append(f"{name}:" + "x".join(map(str, opt_d)))
@@ -68,7 +87,22 @@ def get_shape_args(onnx_path, opt_batch=1, max_batch=1, for_load_engine=False):
             f"--optShapes={','.join(opt_shapes)}",
             f"--maxShapes={','.join(max_shapes)}",
         ]
+    except ImportError:
+        # 针对环境中没有安装 onnx 模块时的保底规则
+        if "det_500m" in p_name:
+            if for_load_engine:
+                return ["--shapes=input.1:1x3x640x640"]
+            return ["--minShapes=input.1:1x3x320x320", "--optShapes=input.1:1x3x640x640", "--maxShapes=input.1:1x3x640x640"]
+        elif "fire" in p_name:
+            if for_load_engine:
+                return ["--shapes=images:1x3x640x640"]
+            return ["--minShapes=images:1x3x320x320", "--optShapes=images:1x3x640x640", f"--maxShapes=images:1x3x{max_dim}x{max_dim}"]
+        return []
     except Exception as e:
+        if "det_500m" in p_name:
+            if for_load_engine:
+                return ["--shapes=input.1:1x3x640x640"]
+            return ["--minShapes=input.1:1x3x320x320", "--optShapes=input.1:1x3x640x640", "--maxShapes=input.1:1x3x640x640"]
         return []
 
 def find_trtexec():
@@ -202,6 +236,9 @@ def build_single_engine(
     builder_level=2,
     opt_batch=1,
     max_batch=1,
+    min_dim=320,
+    opt_dim=640,
+    max_dim=1280,
     skip_existing=False,
     benchmark_only=False,
 ):
@@ -212,6 +249,16 @@ def build_single_engine(
 
     log_path = engine_path.with_suffix(".trtexec.log")
 
+    shape_args_load = get_shape_args(
+        onnx_path,
+        opt_batch=opt_batch,
+        max_batch=max_batch,
+        min_dim=min_dim,
+        opt_dim=opt_dim,
+        max_dim=max_dim,
+        for_load_engine=True,
+    )
+
     if benchmark_only and engine_path.is_file():
         # 仅基准测试已有 engine
         cmd = [
@@ -221,7 +268,7 @@ def build_single_engine(
             "--iterations=50",
             "--verbose=false",
         ]
-        cmd.extend(get_shape_args(onnx_path, opt_batch=opt_batch, max_batch=max_batch, for_load_engine=True))
+        cmd.extend(shape_args_load)
     elif skip_existing and engine_path.is_file():
         # 跳过编译直接测试已有 engine
         cmd = [
@@ -231,7 +278,7 @@ def build_single_engine(
             "--iterations=50",
             "--verbose=false",
         ]
-        cmd.extend(get_shape_args(onnx_path, opt_batch=opt_batch, max_batch=max_batch, for_load_engine=True))
+        cmd.extend(shape_args_load)
     else:
         # 完整编译 + 测试
         cmd = [
@@ -251,13 +298,39 @@ def build_single_engine(
             cmd.append("--int8")
 
         # 动态/静态维度配置
-        shape_args = get_shape_args(onnx_path, opt_batch=opt_batch, max_batch=max_batch)
+        shape_args = get_shape_args(
+            onnx_path,
+            opt_batch=opt_batch,
+            max_batch=max_batch,
+            min_dim=min_dim,
+            opt_dim=opt_dim,
+            max_dim=max_dim,
+        )
         cmd.extend(shape_args)
 
     print(f"\n[执行命令] {' '.join(cmd)}")
     start_t = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     cost_t = time.time() - start_t
+
+    # 自愈重试机制：如果 loadEngine 时因为缺少或不符合当前 Profile 的 --shapes 导致报错
+    if ("satisfyProfile" in proc.stdout or "does not satisfy any optimization profiles" in proc.stdout) and "--loadEngine=" in " ".join(cmd):
+        m_profile = re.search(
+            r"tensor\s+([\w\-.:]+)\s+does not satisfy any optimization profiles\.\s+Valid range for profile \d+:\s+\[([0-9,]+)\]\.\.\[([0-9,]+)\]",
+            proc.stdout,
+        )
+        if m_profile:
+            tensor_name = m_profile.group(1)
+            # 取区间中的最高或基准尺寸（如 1x3x640x640）
+            max_shape_str = m_profile.group(3).replace(",", "x")
+            opt_shape_arg = f"--shapes={tensor_name}:{max_shape_str}"
+            print(f"🔄 [动态自愈] 检测到 Profile 约束，自动注入测速参数重试: {opt_shape_arg}")
+            new_cmd = [c for c in cmd if not c.startswith("--shapes=")] + [opt_shape_arg]
+            print(f"[自愈命令] {' '.join(new_cmd)}")
+            start_t = time.time()
+            proc = subprocess.run(new_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            cost_t = time.time() - start_t
+            cmd = new_cmd
 
     # 写入完整日志到文件
     log_path.write_text(proc.stdout, encoding="utf-8")
@@ -303,14 +376,22 @@ def generate_markdown_report(results, report_file, root_dir):
         "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     )
 
+    def _fmt_safe(v, fmt="{:.2f}", unit=""):
+        if v is None:
+            return "-"
+        try:
+            return f"{fmt.format(v)}{unit}"
+        except Exception:
+            return str(v)
+
     for r in results:
         cat = r.get("category", "-")
         name = r.get("model_name", "-")
-        size = f"{r.get('engine_file_size_mb', 0):.2f} MB" if r.get("engine_file_size_mb") else "-"
-        fps = f"**{r.get('throughput_fps', 0):.1f}**" if r.get("throughput_fps") else "-"
-        mean_lat = f"{r.get('latency_mean_ms', 0):.2f} ms" if r.get("latency_mean_ms") else "-"
-        gpu_t = f"{r.get('gpu_compute_ms', 0):.2f} ms" if r.get("gpu_compute_ms") else "-"
-        p99_lat = f"{r.get('latency_p99_ms', 0):.2f} ms" if r.get("latency_p99_ms") else "-"
+        size = _fmt_safe(r.get("engine_file_size_mb"), "{:.2f}", " MB")
+        fps = f"**{r['throughput_fps']:.1f}**" if r.get("throughput_fps") is not None else "-"
+        mean_lat = _fmt_safe(r.get("latency_mean_ms"), "{:.2f}", " ms")
+        gpu_t = _fmt_safe(r.get("gpu_compute_ms"), "{:.2f}", " ms")
+        p99_lat = _fmt_safe(r.get("latency_p99_ms"), "{:.2f}", " ms")
 
         # 显存开销：激活显存 + 权重显存
         act_mem = r.get("activation_mem_mib") or 0
@@ -355,12 +436,12 @@ def generate_markdown_report(results, report_file, root_dir):
             lines.append("")
             lines.append("| 细分时延与内存指标 | 数值 | 工程含义解读 |")
             lines.append("| :--- | :--- | :--- |")
-            lines.append(f"| **最高推理吞吐量 (QPS)** | **{m.get('throughput_fps', 0):.2f} FPS** | 单模型极限满载处理能力 |")
-            lines.append(f"| **纯 GPU 计算时间** | **{m.get('gpu_compute_ms', 0):.3f} ms** | 核心神经网络前向计算耗时 |")
-            lines.append(f"| **Host to Device 拷贝** | **{m.get('h2d_latency_ms', 0):.3f} ms** | 画面从内存上传至 GPU 显存耗时 |")
-            lines.append(f"| **Device to Host 拷贝** | **{m.get('d2h_latency_ms', 0):.3f} ms** | 检测框/特征向量传回内存耗时 |")
-            lines.append(f"| **激活显存占用** | **{m.get('activation_mem_mib', 0):.2f} MiB** | 推理过程中的中间特征图内存开销 |")
-            lines.append(f"| **权重显存占用** | **{m.get('weights_mem_mib', 0):.2f} MiB** | 编译后常量参数显存开销 |")
+            lines.append(f"| **最高推理吞吐量 (QPS)** | **{_fmt_safe(m.get('throughput_fps'))} FPS** | 单模型极限满载处理能力 |")
+            lines.append(f"| **纯 GPU 计算时间** | **{_fmt_safe(m.get('gpu_compute_ms'), '{:.3f}')} ms** | 核心神经网络前向计算耗时 |")
+            lines.append(f"| **Host to Device 拷贝** | **{_fmt_safe(m.get('h2d_latency_ms'), '{:.3f}')} ms** | 画面从内存上传至 GPU 显存耗时 |")
+            lines.append(f"| **Device to Host 拷贝** | **{_fmt_safe(m.get('d2h_latency_ms'), '{:.3f}')} ms** | 检测框/特征向量传回内存耗时 |")
+            lines.append(f"| **激活显存占用** | **{_fmt_safe(m.get('activation_mem_mib'))} MiB** | 推理过程中的中间特征图内存开销 |")
+            lines.append(f"| **权重显存占用** | **{_fmt_safe(m.get('weights_mem_mib'))} MiB** | 编译后常量参数显存开销 |")
             lines.append("")
 
     lines.append("---\n")
@@ -395,6 +476,9 @@ def main():
     parser.add_argument("--precision", choices=["fp16", "fp32", "int8"], default="fp16", help="编译精度（默认: fp16）")
     parser.add_argument("--workspace", type=int, default=2048, help="工作区显存大小 MiB（默认: 2048）")
     parser.add_argument("--builder-level", type=int, default=2, help="优化级别 0~5（默认: 2，兼顾编译速度与最高性能）")
+    parser.add_argument("--min-dim", type=int, default=320, help="动态模型最小长宽尺寸（默认: 320）")
+    parser.add_argument("--opt-dim", type=int, default=640, help="动态模型主力调优长宽尺寸（默认: 640）")
+    parser.add_argument("--max-dim", type=int, default=1280, help="动态模型最大支持长宽尺寸（默认: 1280）")
     parser.add_argument("--skip-existing", action="store_true", help="如果对应 .engine 已存在，跳过重新编译直接测试")
     parser.add_argument("--benchmark-only", action="store_true", help="不重新编译，直接加载已有 .engine 进行基准测速")
     parser.add_argument("--output-md", default="", help="输出 Markdown 报告路径（默认: <models_dir>/benchmark_report.md）")
@@ -432,6 +516,7 @@ def main():
     print(f"⚙️  编译精度   : {args.precision}")
     print(f"🧠 工作区显存 : {args.workspace} MiB")
     print(f"⚡ 优化档位   : Level {args.builder_level}")
+    print(f"📐 动态长宽范围: min={args.min_dim}, opt={args.opt_dim}, max={args.max_dim}")
     print(f"🛠️  trtexec    : {trtexec_bin}")
     print("=" * 70)
 
@@ -487,6 +572,9 @@ def main():
             precision=args.precision,
             workspace_mb=args.workspace,
             builder_level=args.builder_level,
+            min_dim=args.min_dim,
+            opt_dim=args.opt_dim,
+            max_dim=args.max_dim,
             skip_existing=args.skip_existing,
             benchmark_only=args.benchmark_only,
         )
@@ -495,9 +583,13 @@ def main():
 
         if res.get("success"):
             print(f"✅ [{idx}/{len(onnx_files)}] 成功！")
-            print(f"   吞吐量   : {res.get('throughput_fps'):.1f} FPS")
-            print(f"   平均延迟 : {res.get('latency_mean_ms'):.2f} ms (GPU计算: {res.get('gpu_compute_ms'):.2f} ms)")
-            print(f"   引擎尺寸 : {res.get('engine_file_size_mb'):.2f} MB")
+            fps_str = f"{res['throughput_fps']:.1f} FPS" if res.get('throughput_fps') is not None else "-"
+            lat_str = f"{res['latency_mean_ms']:.2f} ms" if res.get('latency_mean_ms') is not None else "-"
+            gpu_str = f"{res['gpu_compute_ms']:.2f} ms" if res.get('gpu_compute_ms') is not None else "-"
+            size_str = f"{res['engine_file_size_mb']:.2f} MB" if res.get('engine_file_size_mb') is not None else "-"
+            print(f"   吞吐量   : {fps_str}")
+            print(f"   平均延迟 : {lat_str} (GPU计算: {gpu_str})")
+            print(f"   引擎尺寸 : {size_str}")
         else:
             print(f"❌ [{idx}/{len(onnx_files)}] 失败！原因: {res.get('error_msg')}")
 

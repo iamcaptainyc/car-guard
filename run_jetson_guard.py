@@ -20,7 +20,7 @@ import time
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 import cv2
 import numpy as np
 
@@ -75,8 +75,9 @@ def check_required_engines(
     custom_megadetector: Optional[str] = None,
     custom_cls: Optional[str] = None,
     custom_pose: Optional[str] = None,
-    custom_fire: Optional[str] = None
-) -> Dict[str, Optional[Path]]:
+    custom_fire: Optional[str] = None,
+    enable_fire: bool = True
+) -> Dict[str, Optional[Any]]:
     """检查系统所需的各核心 TensorRT Engine / ONNX 模型文件"""
     engine_status = {
         "yolo": None,
@@ -136,22 +137,27 @@ def check_required_engines(
                 engine_status["cls"] = c
                 break
 
-    # 1.3 辅助火灾/烟雾目标检测器 (多流并发)
-    if custom_fire and Path(custom_fire).is_file():
-        engine_status["fire_det"] = Path(custom_fire)
+    # 1.3 辅助火灾/烟雾目标检测器 (多流并发，默认开启)
+    if enable_fire:
+        if custom_fire and Path(custom_fire).is_file():
+            engine_status["fire_det"] = Path(custom_fire)
+        else:
+            fire_cands = [
+                models_dir / "fire" / "fire.engine",
+                models_dir / "fire" / "yolov8n-fire.engine",
+                models_dir / "fire" / "fire_detector.engine",
+                models_dir / "fire" / "fire.onnx",
+                models_dir / "fire" / "yolov8n-fire.onnx",
+                models_dir / "fire" / "fire_detector.onnx",
+            ]
+            for c in fire_cands:
+                if c.is_file():
+                    engine_status["fire_det"] = c
+                    break
+            if not engine_status["fire_det"]:
+                engine_status["fire_det"] = "builtin:VisualFlameDetector"
     else:
-        fire_cands = [
-            models_dir / "fire" / "fire.engine",
-            models_dir / "fire" / "yolov8n-fire.engine",
-            models_dir / "fire" / "fire_detector.engine",
-            models_dir / "fire" / "fire.onnx",
-            models_dir / "fire" / "yolov8n-fire.onnx",
-            models_dir / "fire" / "fire_detector.onnx",
-        ]
-        for c in fire_cands:
-            if c.is_file():
-                engine_status["fire_det"] = c
-                break
+        engine_status["fire_det"] = None
 
     # 2. RTMPose 人体姿态
     if custom_pose and Path(custom_pose).is_file():
@@ -285,7 +291,10 @@ def main():
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
     parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
     parser.add_argument("--fire-detector", "--fire", dest="fire_detector", type=str, default=None,
-                        help="显式指定火灾/浓烟目标检测 .engine 模型路径 (启用与主检测器的多流并发)")
+                        help="显式指定火灾/浓烟目标检测 .engine 模型路径 (默认已启用火焰检测并发)")
+    parser.add_argument("--max-frames", type=int, default=None, help="最大测试评估帧数 (达到后自动结束)")
+    parser.add_argument("--no-fire", action="store_true",
+                        help="显式关闭火焰检测并发 (默认开启)")
 
     args = parser.parse_args()
 
@@ -304,7 +313,8 @@ def main():
         custom_megadetector=args.megadetector,
         custom_cls=args.cls_model,
         custom_pose=args.pose,
-        custom_fire=args.fire_detector
+        custom_fire=args.fire_detector,
+        enable_fire=not args.no_fire
     )
     # 判定当前主检测模式 (YOLO 与 MegaDetector 互斥二选一)
     is_md = False
@@ -356,10 +366,12 @@ def main():
             else:
                 status = "⚠️ 未找到对应 .engine 文件"
         elif k == "fire_det":
-            if p:
-                status = f"✅ 已激活 (多流并发并行推理): {p}"
+            if p == "builtin:VisualFlameDetector":
+                status = "✅ 已激活 (自适应视觉火焰并发引擎, 默认开启)"
+            elif p:
+                status = f"✅ 已激活 (多流并发专用模型): {p}"
             else:
-                status = "⏸️ 待命休眠 (未指定火灾模型，传入 --fire 激活双流并发)"
+                status = "⏸️ 已禁用 (--no-fire 显式关闭)"
         elif k == "vlm":
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未指定/未挂载 (可传入 --model-dir 指定，当前使用端侧离线保底)"
         else:
@@ -413,6 +425,7 @@ def main():
         conf_threshold=args.conf,
         show_sidebar=show_sb,
         headless=args.headless,
+        max_frames=args.max_frames,
         realtime=args.realtime,
         use_trt=True,
         loop_video=loop_val,
@@ -427,7 +440,8 @@ def main():
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
         cls_onnx_path=chosen_cls,
-        fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] else None)
+        fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] and str(engines["fire_det"]) != "builtin:VisualFlameDetector" else None),
+        enable_fire=not args.no_fire
     )
 
 
