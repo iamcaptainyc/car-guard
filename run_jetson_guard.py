@@ -74,13 +74,15 @@ def check_required_engines(
     custom_detector: Optional[str] = None,
     custom_megadetector: Optional[str] = None,
     custom_cls: Optional[str] = None,
-    custom_pose: Optional[str] = None
+    custom_pose: Optional[str] = None,
+    custom_fire: Optional[str] = None
 ) -> Dict[str, Optional[Path]]:
     """检查系统所需的各核心 TensorRT Engine / ONNX 模型文件"""
     engine_status = {
         "yolo": None,
         "megadetector": None,
         "cls": None,
+        "fire_det": None,
         "pose": None,
         "reid": None,
         "face_det": None,
@@ -132,6 +134,23 @@ def check_required_engines(
         for c in cls_cands:
             if c.is_file():
                 engine_status["cls"] = c
+                break
+
+    # 1.3 辅助火灾/烟雾目标检测器 (多流并发)
+    if custom_fire and Path(custom_fire).is_file():
+        engine_status["fire_det"] = Path(custom_fire)
+    else:
+        fire_cands = [
+            models_dir / "fire" / "fire.engine",
+            models_dir / "fire" / "yolov8n-fire.engine",
+            models_dir / "fire" / "fire_detector.engine",
+            models_dir / "fire" / "fire.onnx",
+            models_dir / "fire" / "yolov8n-fire.onnx",
+            models_dir / "fire" / "fire_detector.onnx",
+        ]
+        for c in fire_cands:
+            if c.is_file():
+                engine_status["fire_det"] = c
                 break
 
     # 2. RTMPose 人体姿态
@@ -265,6 +284,8 @@ def main():
     parser.add_argument("--vlm-max-tokens", type=int, default=128,
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
     parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
+    parser.add_argument("--fire-detector", "--fire", dest="fire_detector", type=str, default=None,
+                        help="显式指定火灾/浓烟目标检测 .engine 模型路径 (启用与主检测器的多流并发)")
 
     args = parser.parse_args()
 
@@ -282,7 +303,8 @@ def main():
         custom_detector=args.detector,
         custom_megadetector=args.megadetector,
         custom_cls=args.cls_model,
-        custom_pose=args.pose
+        custom_pose=args.pose,
+        custom_fire=args.fire_detector
     )
     # 判定当前主检测模式 (YOLO 与 MegaDetector 互斥二选一)
     is_md = False
@@ -333,6 +355,11 @@ def main():
                 status = f"⏸️ 待命休眠: {p} (仅在启用 MegaDetector 时按需加载)"
             else:
                 status = "⚠️ 未找到对应 .engine 文件"
+        elif k == "fire_det":
+            if p:
+                status = f"✅ 已激活 (多流并发并行推理): {p}"
+            else:
+                status = "⏸️ 待命休眠 (未指定火灾模型，传入 --fire 激活双流并发)"
         elif k == "vlm":
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未指定/未挂载 (可传入 --model-dir 指定，当前使用端侧离线保底)"
         else:
@@ -399,7 +426,8 @@ def main():
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
-        cls_onnx_path=chosen_cls
+        cls_onnx_path=chosen_cls,
+        fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] else None)
     )
 
 

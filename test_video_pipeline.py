@@ -27,7 +27,7 @@ import numpy as np
 from camping_guard.engine import CampingGuardEngine
 from camping_guard.types import GuardState, ThreatLevel, VehicleZone, ActionType
 from camping_guard.config import load_vehicle_calibration
-from camping_guard.perception.detector import ONNXObjectDetector
+from camping_guard.perception.detector import ONNXObjectDetector, ParallelEnsembleDetector
 from camping_guard.perception.pose_estimator import RTMPoseEstimator
 from camping_guard.perception.distance import GroundDistanceEstimator
 from run_simulation import draw_skeleton, draw_vehicle_and_zones
@@ -723,7 +723,8 @@ def run_video_pipeline(
     build_dir: Optional[str] = None,
     vlm_timeout: float = 35.0,
     vlm_max_tokens: int = 128,
-    cls_onnx_path: Optional[str] = None
+    cls_onnx_path: Optional[str] = None,
+    fire_detector_path: Optional[str] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -903,8 +904,48 @@ def run_video_pipeline(
             animal_classifier=animal_classifier
         )
     else:
+        model_type_str = "未挂载"
         print("[i] 提示: 未指定且未找到 YOLO/MegaDetector 模型，系统将启用【车身固定 ROI MOG2 局部微动守护】模式")
         print("    (若需全图检测，可传入 --detector yolo11s.onnx / MDV6-yolov10-c.onnx)")
+
+    # 1.2 辅助火灾/烟雾检测模型初始化 (多模型多流并发检测)
+    chosen_fire_path = fire_detector_path
+    if chosen_fire_path and not os.path.exists(chosen_fire_path):
+        for search_dir in ["models/fire", "models/yolo", "models"]:
+            sub_cand = os.path.join(search_dir, chosen_fire_path)
+            if os.path.exists(sub_cand):
+                chosen_fire_path = sub_cand
+                break
+    if not chosen_fire_path:
+        fire_cands = []
+        if use_trt:
+            fire_cands.extend(["models/fire/fire.engine", "models/fire/yolov8n-fire.engine", "models/fire/fire_detector.engine"])
+        fire_cands.extend(["models/fire/fire.onnx", "models/fire/yolov8n-fire.onnx", "models/fire/fire_detector.onnx"])
+        for fc in fire_cands:
+            if os.path.exists(fc):
+                chosen_fire_path = fc
+                break
+
+    if chosen_fire_path and os.path.exists(chosen_fire_path):
+        if use_trt:
+            eng_cand = Path(chosen_fire_path).with_suffix(".engine")
+            if eng_cand.is_file():
+                chosen_fire_path = str(eng_cand)
+        ftag = "[TensorRT Engine]" if str(chosen_fire_path).endswith(".engine") else "[ONNX]"
+        print(f"[*] 正在挂载火灾/浓烟检测模型 {ftag}: {chosen_fire_path}")
+        fire_det_obj = ONNXObjectDetector(
+            model_path=chosen_fire_path,
+            conf_threshold=conf_threshold,
+            use_trt=use_trt
+        )
+        if detector is not None:
+            detector = ParallelEnsembleDetector(
+                main_detector=detector,
+                fire_detector=fire_det_obj
+            )
+            print(f"[ParallelEnsemble] ✅ 已构建 Orin 双流并发集成引擎: 主检测器({model_type_str}) + 火灾检测器并发执行")
+        else:
+            detector = fire_det_obj
 
     # 2. 姿态估计器初始化
     pose_estimator = None
@@ -1649,6 +1690,8 @@ def main():
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
     parser.add_argument("--cls", "--animal-cls", dest="cls_model", type=str, default=None,
                         help="二级动物细分类模型文件或路径 (支持自动在 models/cls/ 查找，如 mobilenetv3-large.onnx / mobilenetv3-large.engine)")
+    parser.add_argument("--fire-detector", "--fire", dest="fire_detector", type=str, default=None,
+                        help="火灾/浓烟专用目标检测模型文件或路径 (自动启用与主检测器的多流并发并行推理)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1686,7 +1729,8 @@ def main():
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
-        cls_onnx_path=args.cls_model
+        cls_onnx_path=args.cls_model,
+        fire_detector_path=args.fire_detector
     )
 
 

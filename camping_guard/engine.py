@@ -125,8 +125,16 @@ class CampingGuardEngine:
 
         # 注册模型元数据至 profiler (保持 key 与执行期 profile_model("...") 完全一致)
         if self.detector and hasattr(self.detector, 'model_path'):
-            det_label = "MegaDetector" if getattr(self.detector, 'is_megadetector', False) else "YOLO11n-Det"
-            self.profiler.register_model_metadata(det_label, self.detector.model_path, "S1全图目标检测初筛 (640x480)")
+            if getattr(self.detector, 'is_ensemble', False):
+                det_label = "Parallel-Ensemble-Det"
+                desc = "Orin双流并发目标检测 (主检测器+火灾检测器)"
+            elif getattr(self.detector, 'is_megadetector', False):
+                det_label = "MegaDetector"
+                desc = "S1全图目标检测初筛 (640x480)"
+            else:
+                det_label = "YOLO11n-Det"
+                desc = "S1全图目标检测初筛 (640x480)"
+            self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)
         if self.animal_classifier and getattr(self.animal_classifier, 'model_path', None) and getattr(self.animal_classifier, 'session', None) is not None:
             self.profiler.register_model_metadata("MobileNetV3-AnimalCls", self.animal_classifier.model_path, "MegaDetector二级动物细分类 (224x224)")
         if self.pose_estimator and hasattr(self.pose_estimator, 'model_path'):
@@ -239,7 +247,13 @@ class CampingGuardEngine:
             if (raw_detections is None or len(raw_detections) == 0) and self.detector is not None:
                 if primary_frame is not None:
                     det_sess = getattr(self.detector, 'session', None)
-                    with self.profiler.profile_model("YOLO11n-Det", condition="S1全图目标检测 (640x480)", session=det_sess):
+                    if getattr(self.detector, 'is_ensemble', False):
+                        det_label = "Parallel-Ensemble-Det"
+                    elif getattr(self.detector, 'is_megadetector', False):
+                        det_label = "MegaDetector"
+                    else:
+                        det_label = "YOLO11n-Det"
+                    with self.profiler.profile_model(det_label, condition="S1全图目标检测 (640x480)", session=det_sess):
                         raw_detections = self.detector.detect(primary_frame)
             if raw_detections is None:
                 raw_detections = []

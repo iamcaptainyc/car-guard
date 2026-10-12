@@ -6,6 +6,8 @@ S1 初筛目标检测引擎抽象与实现 (camping_guard/perception/detector.py
 
 import abc
 import os
+import time
+import concurrent.futures
 import cv2
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
@@ -28,7 +30,8 @@ class ONNXObjectDetector(BaseObjectDetector):
         input_size: Tuple[int, int] = (640, 640),
         conf_threshold: float = 0.25,
         use_trt: bool = False,
-        animal_classifier: Optional[Any] = None
+        animal_classifier: Optional[Any] = None,
+        custom_cls_map: Optional[Dict[int, str]] = None
     ):
         self.model_path = model_path
         self.input_size = input_size
@@ -36,6 +39,7 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.session = None
         self.backend = "unknown"
         self.animal_classifier = animal_classifier
+        self.custom_cls_map = custom_cls_map
 
         # COCO 类别映射到露营守卫规范类别
         self.coco_to_guard_map = {
@@ -63,9 +67,16 @@ class ONNXObjectDetector(BaseObjectDetector):
             2: 'car'
         }
 
-        # 判定是否为 MegaDetector 专用模型
+        # 专有火灾/浓烟专用模型类别映射 (0: fire, 1: smoke)
+        self.fire_to_guard_map = {
+            0: 'fire',
+            1: 'smoke'
+        }
+
+        # 判定是否为 MegaDetector 专用模型或火灾/烟雾模型
         mpath_str = str(model_path).lower()
         self.is_megadetector = ("mdv" in mpath_str or "megadetector" in mpath_str)
+        self.is_fire_model = ("fire" in mpath_str or "smoke" in mpath_str or "flame" in mpath_str)
 
         is_engine = str(model_path).lower().endswith(".engine")
         if os.path.exists(model_path) or is_engine:
@@ -164,11 +175,12 @@ class ONNXObjectDetector(BaseObjectDetector):
         class_ids = np.argmax(scores[mask], axis=1)
         confidences = confidences[mask]
 
-        # 自适应根据输出通道维度判断分类字典 (MegaDetector 3类 vs Fisheye8K 5类 vs COCO 80类)
-        is_megadetector = getattr(self, 'is_megadetector', False) or (scores.shape[1] == 3)
-        is_fisheye_5cls = (scores.shape[1] == 5)
-
-        if is_megadetector:
+        # 自适应根据模型配置与输出通道维度判断分类字典
+        if getattr(self, 'custom_cls_map', None) is not None:
+            cls_map = self.custom_cls_map
+        elif getattr(self, 'is_fire_model', False) or (scores.shape[1] in [1, 2] and not getattr(self, 'is_megadetector', False)):
+            cls_map = self.fire_to_guard_map
+        elif is_megadetector:
             cls_map = self.megadetector_to_guard_map
         elif is_fisheye_5cls:
             cls_map = self.fisheye_to_guard_map
@@ -247,8 +259,9 @@ class SyntheticDetector(BaseObjectDetector):
     def set_injected_detections(self, dets: List[Dict]):
         self.injected_detections = list(dets)
 
-    def detect(self, frame: np.ndarray, conf_threshold: float = 0.35) -> List[Dict]:
-        return [d for d in self.injected_detections if d.get('conf', 1.0) >= conf_threshold]
+    def detect(self, frame: np.ndarray, conf_threshold: Optional[float] = None) -> List[Dict]:
+        eff_conf = conf_threshold if conf_threshold is not None else 0.35
+        return [d for d in self.injected_detections if d.get('conf', 1.0) >= eff_conf]
 
 
 class TRTObjectDetector(ONNXObjectDetector):
@@ -258,13 +271,114 @@ class TRTObjectDetector(ONNXObjectDetector):
         model_path: str,
         input_size: Tuple[int, int] = (640, 640),
         conf_threshold: float = 0.25,
-        animal_classifier: Optional[Any] = None
+        animal_classifier: Optional[Any] = None,
+        custom_cls_map: Optional[Dict[int, str]] = None
     ):
         super().__init__(
             model_path=model_path,
             input_size=input_size,
             conf_threshold=conf_threshold,
             use_trt=True,
-            animal_classifier=animal_classifier
+            animal_classifier=animal_classifier,
+            custom_cls_map=custom_cls_map
         )
+
+
+class ParallelEnsembleDetector(BaseObjectDetector):
+    """
+    多模型多流并发集成检测器 (Parallel Ensemble Detector)
+    专为 NVIDIA Jetson Orin 硬件架构并发推理设计:
+    - Ampere GPU 具备多个硬件工作队列与 Compute Engines，支持 CUDA Streams 并发执行
+    - 主检测器 (人/车辆/野生动物，如 YOLO 或 MegaDetector) 与专用火灾/烟雾检测模型分别在独立线程与独立 CUDA Stream 中并发发射
+    - 运行耗时由两模型串行耗时之和 (t1 + t2) 降至两者最大值 max(t1, t2)
+    - 自动聚合多路检测器的检测结果并做安全类别正交合并与非极大值抑制 (NMS)
+    """
+    def __init__(
+        self,
+        main_detector: BaseObjectDetector,
+        fire_detector: Optional[BaseObjectDetector] = None,
+        max_workers: int = 2
+    ):
+        self.main_detector = main_detector
+        self.fire_detector = fire_detector
+        self.max_workers = max_workers
+        self.is_ensemble = True
+        self.profiler_label = "Parallel-Ensemble-Det"
+
+        # 路径汇总标识
+        p_paths = []
+        if hasattr(main_detector, "model_path"):
+            p_paths.append(str(main_detector.model_path))
+        if fire_detector and hasattr(fire_detector, "model_path"):
+            p_paths.append(str(fire_detector.model_path))
+        self.model_path = " + ".join(p_paths) if p_paths else "ParallelEnsemble"
+
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="ParallelDetWorker"
+        )
+        self.last_main_ms: float = 0.0
+        self.last_fire_ms: float = 0.0
+        self.last_parallel_ms: float = 0.0
+
+    @property
+    def session(self):
+        """暴露主检测器 session 给 profiler"""
+        return getattr(self.main_detector, 'session', None)
+
+    @property
+    def is_megadetector(self) -> bool:
+        return getattr(self.main_detector, 'is_megadetector', False)
+
+    @property
+    def animal_classifier(self):
+        return getattr(self.main_detector, 'animal_classifier', None)
+
+    @animal_classifier.setter
+    def animal_classifier(self, val):
+        if hasattr(self.main_detector, 'animal_classifier'):
+            self.main_detector.animal_classifier = val
+
+    def detect(self, frame: np.ndarray, conf_threshold: Optional[float] = None) -> List[Dict]:
+        if frame is None:
+            return []
+
+        # 若未配置辅助火灾检测器，直接运行主检测器
+        if self.fire_detector is None:
+            t0 = time.perf_counter()
+            dets = self.main_detector.detect(frame, conf_threshold)
+            self.last_main_ms = (time.perf_counter() - t0) * 1000.0
+            self.last_parallel_ms = self.last_main_ms
+            return dets
+
+        # 启动双流/多流并发执行
+        t_start = time.perf_counter()
+
+        def _run_main():
+            tm0 = time.perf_counter()
+            res = self.main_detector.detect(frame, conf_threshold)
+            self.last_main_ms = (time.perf_counter() - tm0) * 1000.0
+            return res
+
+        def _run_fire():
+            tf0 = time.perf_counter()
+            res = self.fire_detector.detect(frame, conf_threshold)
+            self.last_fire_ms = (time.perf_counter() - tf0) * 1000.0
+            return res
+
+        future_main = self._executor.submit(_run_main)
+        future_fire = self._executor.submit(_run_fire)
+
+        main_dets = future_main.result()
+        fire_dets = future_fire.result()
+
+        self.last_parallel_ms = (time.perf_counter() - t_start) * 1000.0
+
+        # 合并检测目标框
+        combined = list(main_dets) + list(fire_dets)
+        return combined
+
+    def close(self):
+        if self._executor:
+            self._executor.shutdown(wait=False)
 

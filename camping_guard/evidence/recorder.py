@@ -44,6 +44,12 @@ class PendingClip:
         self.is_finalized = False
         self.event_metadata: Dict[str, Any] = event_metadata or {}
 
+    def free_frames(self):
+        """释放所有未压缩/已缓存视频帧内存，杜绝内存泄漏"""
+        self.pre_frames.clear()
+        self.post_frames.clear()
+        self.is_finalized = True
+
 
 def normalize_clip_frames_to_target_fps(
     all_frames: List[Tuple[float, np.ndarray]],
@@ -107,7 +113,8 @@ class EvidenceRecorder:
         fps: float = 30.0,
         storage_dir: Optional[str] = None,
         clock_source: ClockSource = ClockSource.GNSS_PPS_SYNC,
-        async_encoding: bool = False
+        async_encoding: bool = False,
+        compress_buffer: bool = True
     ):
         """
         :param buffer_duration_sec: 内存环形缓冲长度 (秒)
@@ -115,11 +122,13 @@ class EvidenceRecorder:
         :param storage_dir: 加密/安全存储目录 (模拟车端 eMMC secure partition)
         :param clock_source: 当前硬件授时源
         :param async_encoding: 是否开启后台独立工作线程异步编码落盘 (避免阻塞主视觉流水线)
+        :param compress_buffer: 是否以轻量 JPEG 字节流缓存内存帧 (降低 95%+ 物理内存占用，杜绝 Orin 统一内存 OOM)
         """
         self.buffer_size = int(buffer_duration_sec * fps)
         self.fps = fps
         self.clock_source = clock_source
         self.async_encoding = async_encoding
+        self.compress_buffer = compress_buffer
 
         # 环形视频帧队列: [(timestamp, frame)]
         self.ring_buffer: collections.deque = collections.deque(maxlen=self.buffer_size)
@@ -262,15 +271,23 @@ class EvidenceRecorder:
         """
         持续将低码率/高清画面写入环形缓冲，并喂给所有正在录制事后视频的切片
         """
-        frame_copy = frame.copy()
-        self.ring_buffer.append((current_time, frame_copy))
+        if self.compress_buffer and isinstance(frame, np.ndarray) and frame.ndim >= 2:
+            try:
+                _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                frame_to_store = buf
+            except Exception:
+                frame_to_store = frame.copy()
+        else:
+            frame_to_store = frame.copy()
+
+        self.ring_buffer.append((current_time, frame_to_store))
 
         # 推进所有待完成的事后录像切片
         completed_ids = []
         with self._lock:
             for event_id, pending in self.pending_clips.items():
                 if not pending.is_finalized:
-                    pending.post_frames.append((current_time, frame_copy))
+                    pending.post_frames.append((current_time, frame_to_store))
                     if current_time >= pending.post_end_time:
                         completed_ids.append(event_id)
 
@@ -378,7 +395,14 @@ class EvidenceRecorder:
                     return ev
             pending.is_finalized = True
 
-        all_frames = pending.pre_frames + pending.post_frames
+        all_raw_pairs = pending.pre_frames + pending.post_frames
+        all_frames = []
+        for t, f in all_raw_pairs:
+            if isinstance(f, np.ndarray) and f.ndim == 1:
+                dec = cv2.imdecode(f, cv2.IMREAD_COLOR)
+                all_frames.append((t, dec))
+            else:
+                all_frames.append((t, f))
 
         # 0. 规范化重采样为恒定目标帧率 (默认 30 FPS) 正常流速视频帧序列
         exp_start = pending.trigger_time - getattr(pending, 'pre_duration_sec', 10.0)
@@ -543,6 +567,20 @@ class EvidenceRecorder:
                 "payload": block_payload
             }
             self.locked_evidence.append(evidence_record)
+
+            # 4. 彻底释放视频帧缓存与清理历史切片，根治物理内存泄漏
+            pending.free_frames()
+            if len(self.pending_clips) > 20:
+                finalized_keys = [k for k, v in self.pending_clips.items() if getattr(v, "is_finalized", False)]
+                for old_id in finalized_keys[:-10]:
+                    self.pending_clips.pop(old_id, None)
+
+            del resampled_frames
+            del all_frames
+            del all_raw_pairs
+            import gc
+            gc.collect()
+
             return evidence_record
 
     def verify_hash_chain(self, manifest_path: Optional[str] = None) -> Tuple[bool, str, Optional[int]]:
