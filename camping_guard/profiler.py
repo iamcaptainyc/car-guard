@@ -40,6 +40,7 @@ class ModelStats:
     gpu_durations_ms: List[float] = field(default_factory=list)
     conditions: List[str] = field(default_factory=list)
     is_async: bool = False
+    is_substream: bool = False
 
     def record_call(self, duration_ms: float, condition: str = "", gpu_ms: Optional[float] = None):
         self.call_count += 1
@@ -169,6 +170,10 @@ class PipelineProfiler:
         # 历史每帧记录
         self.frame_history: List[FrameMetrics] = []
 
+        # GPU 显存与硬件资源统计
+        self.peak_vram_allocated_mb: float = 0.0
+        self.peak_vram_reserved_mb: float = 0.0
+
         # 当前帧临时变量
         self._current_frame_idx: int = 0
         self._current_frame_start: float = 0.0
@@ -221,14 +226,22 @@ class PipelineProfiler:
             }
         }
 
-    def register_model_metadata(self, model_name: str, weight_path: str = "", condition: str = "", is_async: bool = False):
+    def register_model_metadata(
+        self,
+        model_name: str,
+        weight_path: str = "",
+        condition: str = "",
+        is_async: bool = False,
+        is_substream: bool = False
+    ):
         """注册或更新模型元信息"""
         if model_name not in self.model_stats:
             self.model_stats[model_name] = ModelStats(
                 model_name=model_name,
                 weight_path=weight_path,
                 trigger_condition=condition,
-                is_async=is_async
+                is_async=is_async,
+                is_substream=is_substream
             )
         else:
             if weight_path:
@@ -237,6 +250,8 @@ class PipelineProfiler:
                 self.model_stats[model_name].trigger_condition = condition
             if is_async:
                 self.model_stats[model_name].is_async = is_async
+            if is_substream:
+                self.model_stats[model_name].is_substream = is_substream
 
     def start_frame(self, frame_idx: int):
         """开启一帧的 E2E 计时"""
@@ -250,6 +265,19 @@ class PipelineProfiler:
         """结束一帧计时并返回当前帧指标快照"""
         t_end = time.perf_counter()
         e2e_ms = (t_end - self._current_frame_start) * 1000.0 if self._current_frame_start > 0 else 0.0
+
+        # 实时监控 GPU 显存峰值
+        try:
+            import torch
+            if torch.cuda.is_available():
+                max_alloc = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                if max_alloc > self.peak_vram_allocated_mb:
+                    self.peak_vram_allocated_mb = max_alloc
+                max_res = torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
+                if max_res > self.peak_vram_reserved_mb:
+                    self.peak_vram_reserved_mb = max_res
+        except Exception:
+            pass
 
         metrics = FrameMetrics(
             frame_idx=self._current_frame_idx,
@@ -287,7 +315,8 @@ class PipelineProfiler:
         success: bool = True,
         input_shape: Optional[Tuple] = None,
         gpu_ms: Optional[float] = None,
-        is_async: Optional[bool] = None
+        is_async: Optional[bool] = None,
+        is_substream: Optional[bool] = None
     ):
         """记录单次模型调用"""
         if model_name not in self.model_stats:
@@ -295,14 +324,21 @@ class PipelineProfiler:
             model_is_async = meta.get("is_async", False) or (meta.get("category") == "MultimodalReview") or ("vlm" in model_name.lower())
             if is_async is not None:
                 model_is_async = is_async
+            model_is_substream = meta.get("is_substream", False)
+            if is_substream is not None:
+                model_is_substream = is_substream
             self.model_stats[model_name] = ModelStats(
                 model_name=model_name,
                 weight_path=meta.get("default_weight", ""),
                 trigger_condition=condition or meta.get("condition", ""),
-                is_async=model_is_async
+                is_async=model_is_async,
+                is_substream=model_is_substream
             )
-        elif is_async is not None:
-            self.model_stats[model_name].is_async = is_async
+        else:
+            if is_async is not None:
+                self.model_stats[model_name].is_async = is_async
+            if is_substream is not None:
+                self.model_stats[model_name].is_substream = is_substream
 
         self.model_stats[model_name].record_call(duration_ms, condition=condition, gpu_ms=gpu_ms)
 
@@ -313,8 +349,8 @@ class PipelineProfiler:
             success=success,
             input_shape=input_shape
         )
-        # 仅同步模型调用才计入当前帧快照，异步慢通路模型不污染单帧同步 E2E 与帧渲染
-        if self._is_profiling_frame and not self.model_stats[model_name].is_async:
+        # 仅主同步模型调用才计入当前帧快照，异步与并发子流不污染单帧同步 E2E 列表
+        if self._is_profiling_frame and not self.model_stats[model_name].is_async and not self.model_stats[model_name].is_substream:
             self._current_frame_calls.append(rec)
 
     def record_stage_duration(self, stage_name: str, duration_ms: float):
@@ -364,7 +400,7 @@ class PipelineProfiler:
                 "last_duration_ms": stats.last_ms
             }
 
-        return {
+        summary_res = {
             "total_frames": total_frames,
             "total_time_sec": total_e2e_ms / 1000.0,
             "e2e": {
@@ -375,8 +411,56 @@ class PipelineProfiler:
                 "p95_ms": p95_e2e,
                 "fps": avg_fps
             },
-            "models": model_summaries
+            "models": model_summaries,
+            "memory": self.get_memory_stats()
         }
+        return summary_res
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """获取当前与历史峰值显存 (VRAM) 及系统物理内存使用指标"""
+        mem_info = {
+            "has_cuda": False,
+            "peak_vram_allocated_mb": self.peak_vram_allocated_mb,
+            "peak_vram_reserved_mb": self.peak_vram_reserved_mb,
+            "current_vram_allocated_mb": 0.0,
+            "current_vram_reserved_mb": 0.0,
+            "global_vram_used_mb": 0.0,
+            "global_vram_total_mb": 0.0,
+            "global_vram_pct": 0.0,
+            "process_rss_mb": 0.0,
+        }
+        try:
+            import torch
+            if torch.cuda.is_available():
+                mem_info["has_cuda"] = True
+                cur_alloc = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+                cur_res = torch.cuda.memory_reserved() / (1024.0 * 1024.0)
+                max_alloc = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                max_res = torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
+
+                mem_info["current_vram_allocated_mb"] = cur_alloc
+                mem_info["current_vram_reserved_mb"] = cur_res
+                mem_info["peak_vram_allocated_mb"] = max(self.peak_vram_allocated_mb, max_alloc)
+                mem_info["peak_vram_reserved_mb"] = max(self.peak_vram_reserved_mb, max_res)
+
+                try:
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    used_b = total_b - free_b
+                    mem_info["global_vram_used_mb"] = used_b / (1024.0 * 1024.0)
+                    mem_info["global_vram_total_mb"] = total_b / (1024.0 * 1024.0)
+                    mem_info["global_vram_pct"] = (used_b / total_b * 100.0) if total_b > 0 else 0.0
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            import psutil
+            mem_info["process_rss_mb"] = psutil.Process().memory_info().rss / (1024.0 * 1024.0)
+        except Exception:
+            pass
+
+        return mem_info
 
     def format_single_frame_report(self, frame_metrics: Optional[FrameMetrics] = None) -> str:
         """生成单张图像/单帧的指标统计报表"""
@@ -443,7 +527,7 @@ class PipelineProfiler:
         lines.append("-" * 96)
         lines.append("【各模型调用频次与每次调用耗时统计 (Per-Model Profiling Breakdown)】")
 
-        hdr = f"{'模型名称':<20} | {'总调用':<6} | {'纯GPU推理':<10} | {'前后处理':<10} | {'总计(ms)':<8} | {'P95(ms)':<8} | {'E2E占比':<8}"
+        hdr = f"{'模型名称':<22} | {'总调用':<6} | {'纯GPU推理':<10} | {'前后处理':<10} | {'总计(ms)':<8} | {'P95(ms)':<8} | {'E2E占比':<8}"
         lines.append(hdr)
         lines.append("-" * 96)
 
@@ -451,8 +535,15 @@ class PipelineProfiler:
             rate_str = f"{m['calls_per_frame']:.2f}/f"
             stats_obj = self.model_stats.get(name)
             is_async = (stats_obj.is_async if stats_obj else False) or ("vlm" in name.lower())
-            pct_str = "异步并发" if is_async else f"{m['pct_of_e2e']:.1f}%"
-            is_trt = str(m['weight_path']).lower().endswith(".engine")
+            is_substream = (stats_obj.is_substream if stats_obj else False)
+            if is_async:
+                pct_str = "异步并发"
+            elif is_substream:
+                pct_str = "并发子流"
+            else:
+                pct_str = f"{m['pct_of_e2e']:.1f}%"
+
+            is_trt = str(m['weight_path']).lower().endswith(".engine") or "engine" in str(m['weight_path']).lower()
             display_name = f"{name} (TRT)" if is_trt else name
             gpu_ms = stats_obj.avg_gpu_ms if stats_obj else 0.0
             if gpu_ms > 0:
@@ -464,12 +555,33 @@ class PipelineProfiler:
                 post_str = f"{m['avg_duration_ms']:6.2f} ms"
 
             lines.append(
-                f"{display_name:<20} | {m['total_calls']:<6} | {gpu_str:<10} | {post_str:<10} | "
+                f"{display_name:<22} | {m['total_calls']:<6} | {gpu_str:<10} | {post_str:<10} | "
                 f"{m['avg_duration_ms']:<8.2f} | {m['p95_duration_ms']:<8.2f} | {pct_str:<8}"
             )
 
+        # 显存与硬件资源统计
+        mem = self.get_memory_stats()
+        if mem["has_cuda"]:
+            lines.append("-" * 96)
+            lines.append("【检测期间显存与硬件资源开销 (VRAM & Memory Breakdown)】")
+            lines.append(f"  * 框架活跃显存峰值 (Peak VRAM Allocated)  : {mem['peak_vram_allocated_mb']:>8.2f} MB (PyTorch/TRT活跃张量与I/O缓冲区)")
+            lines.append(f"  * 显存保留缓存峰值 (Peak VRAM Reserved) : {mem['peak_vram_reserved_mb']:>8.2f} MB (CUDA Caching Allocator保留池)")
+            if mem["global_vram_total_mb"] > 0:
+                lines.append(f"  * Orin 设备总物理显存占用 (Unified VRAM) : {mem['global_vram_used_mb']:>8.2f} MB / {mem['global_vram_total_mb']:>8.2f} MB ({mem['global_vram_pct']:.1f}%)")
+            if mem["process_rss_mb"] > 0:
+                lines.append(f"  * 守卫主进程物理内存 (Host Process RSS): {mem['process_rss_mb']:>8.2f} MB")
+
         lines.append("-" * 96)
         lines.append("【模型触发机制与运行说明】")
+
+        def _format_weight_name(p_str: str) -> str:
+            if not p_str:
+                return "内置引擎"
+            if " + " in p_str:
+                parts = [p.strip() for p in p_str.split(" + ")]
+                return " + ".join(os.path.basename(p) if os.path.basename(p) else p for p in parts)
+            return os.path.basename(p_str) if os.path.basename(p_str) else p_str
+
         for name, m in models.items():
             cond = m['trigger_condition'] or "随场景目标动态触发"
             w_path = m['weight_path'] or "内置引擎"
@@ -477,12 +589,13 @@ class PipelineProfiler:
             gpu_ms = stats_obj.avg_gpu_ms if stats_obj else 0.0
             is_async = (stats_obj.is_async if stats_obj else False) or ("vlm" in name.lower())
             async_tag = " [后台异步慢通路]" if is_async else ""
-            if str(w_path).lower().endswith(".engine") or "engines" in str(w_path).lower():
+            if str(w_path).lower().endswith(".engine") or "engine" in str(w_path).lower():
                 gpu_detail = f" [纯GPU推理: {gpu_ms:.2f}ms]" if gpu_ms > 0 else ""
                 backend_desc = f"TensorRT GPU Engine{gpu_detail}{async_tag}"
             else:
                 backend_desc = f"ONNXRuntime{async_tag}"
-            lines.append(f"  * {name:<20}: {cond} (权重: {os.path.basename(w_path) if os.path.basename(w_path) else w_path}, 后端: {backend_desc})")
+            w_disp = _format_weight_name(w_path)
+            lines.append(f"  * {name:<22}: {cond} (权重: {w_disp}, 后端: {backend_desc})")
         lines.append("=" * 96)
         return "\n".join(lines)
 

@@ -78,6 +78,14 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.is_megadetector = ("mdv" in mpath_str or "megadetector" in mpath_str)
         self.is_fire_model = ("fire" in mpath_str or "smoke" in mpath_str or "flame" in mpath_str)
 
+        if self.is_megadetector:
+            self.profiler_label = "MegaDetector"
+        elif self.is_fire_model:
+            self.profiler_label = "FireSmoke-Det"
+        else:
+            base_stem = Path(model_path).stem if model_path else "YOLO"
+            self.profiler_label = f"{base_stem.upper()}-Det" if "yolo" in base_stem.lower() else "General-Det"
+
         is_engine = str(model_path).lower().endswith(".engine")
         if os.path.exists(model_path) or is_engine:
             try:
@@ -318,15 +326,17 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         self,
         main_detector: BaseObjectDetector,
         fire_detector: Optional[BaseObjectDetector] = None,
-        max_workers: int = 2
+        max_workers: int = 2,
+        profiler: Optional[Any] = None
     ):
         self.main_detector = main_detector
         self.fire_detector = fire_detector
         self.max_workers = max_workers
         self.is_ensemble = True
         self.profiler_label = "Parallel-Ensemble-Det"
+        self.profiler = profiler
 
-        # 路径汇总标识
+        # 路径汇总标识 (保留双模型完整标识，避免被单个 basename 截断)
         p_paths = []
         if hasattr(main_detector, "model_path"):
             p_paths.append(str(main_detector.model_path))
@@ -339,13 +349,22 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             thread_name_prefix="ParallelDetWorker"
         )
         self.last_main_ms: float = 0.0
+        self.last_main_gpu_ms: float = 0.0
         self.last_fire_ms: float = 0.0
+        self.last_fire_gpu_ms: float = 0.0
         self.last_parallel_ms: float = 0.0
+        self.last_gpu_compute_ms: float = 0.0
 
     @property
     def session(self):
-        """暴露主检测器 session 给 profiler"""
-        return getattr(self.main_detector, 'session', None)
+        """暴露自身作为 session 供 profiler 读取 last_gpu_compute_ms"""
+        return self
+
+    def __getattr__(self, name):
+        # 兼容代理转发未定义的属性至 main_detector
+        if "main_detector" in self.__dict__ and hasattr(self.__dict__["main_detector"], name):
+            return getattr(self.__dict__["main_detector"], name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @property
     def is_megadetector(self) -> bool:
@@ -369,7 +388,10 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             t0 = time.perf_counter()
             dets = self.main_detector.detect(frame, conf_threshold)
             self.last_main_ms = (time.perf_counter() - t0) * 1000.0
+            sess = getattr(self.main_detector, 'session', None)
+            self.last_main_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
             self.last_parallel_ms = self.last_main_ms
+            self.last_gpu_compute_ms = self.last_main_gpu_ms
             return dets
 
         # 启动双流/多流并发执行
@@ -379,12 +401,16 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             tm0 = time.perf_counter()
             res = self.main_detector.detect(frame, conf_threshold)
             self.last_main_ms = (time.perf_counter() - tm0) * 1000.0
+            sess = getattr(self.main_detector, 'session', None)
+            self.last_main_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
             return res
 
         def _run_fire():
             tf0 = time.perf_counter()
             res = self.fire_detector.detect(frame, conf_threshold)
             self.last_fire_ms = (time.perf_counter() - tf0) * 1000.0
+            sess = getattr(self.fire_detector, 'session', None)
+            self.last_fire_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
             return res
 
         future_main = self._executor.submit(_run_main)
@@ -394,6 +420,27 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         fire_dets = future_fire.result()
 
         self.last_parallel_ms = (time.perf_counter() - t_start) * 1000.0
+        # 并发执行时，GPU 真实纯推理耗时取决于两并发子流中较长的一方
+        self.last_gpu_compute_ms = max(self.last_main_gpu_ms, self.last_fire_gpu_ms)
+
+        # 若配置了 profiler，分别精准记录两路并发子模型的耗时与纯 GPU 推理指标
+        if self.profiler is not None:
+            main_label = getattr(self.main_detector, "profiler_label", "General-Det")
+            fire_label = getattr(self.fire_detector, "profiler_label", "FireSmoke-Det")
+            self.profiler.record_model_call(
+                model_name=main_label,
+                duration_ms=self.last_main_ms,
+                condition="通用人车动物目标检测 (并发主流)",
+                gpu_ms=self.last_main_gpu_ms,
+                is_substream=True
+            )
+            self.profiler.record_model_call(
+                model_name=fire_label,
+                duration_ms=self.last_fire_ms,
+                condition="火灾浓烟专用目标检测 (并发副流)",
+                gpu_ms=self.last_fire_gpu_ms,
+                is_substream=True
+            )
 
         # 合并检测目标框
         combined = list(main_dets) + list(fire_dets)

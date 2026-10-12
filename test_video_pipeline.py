@@ -925,8 +925,20 @@ def run_video_pipeline(
         if not chosen_fire_path:
             fire_cands = []
             if use_trt:
-                fire_cands.extend(["models/fire/fire.engine", "models/fire/yolov8n-fire.engine", "models/fire/yolo11n_fire.engine", "models/fire/fire_detector.engine"])
-            fire_cands.extend(["models/fire/fire.onnx", "models/fire/yolov8n-fire.onnx", "models/fire/yolo11n_fire.onnx", "models/fire/fire_detector.onnx"])
+                fire_cands.extend([
+                    "models/fire/yolo11n_fire.engine",
+                    "models/yolo/yolo11n_fire.engine",
+                    "models/fire/fire.engine",
+                    "models/fire/yolov8n-fire.engine",
+                    "models/fire/fire_detector.engine"
+                ])
+            fire_cands.extend([
+                "models/fire/yolo11n_fire.onnx",
+                "models/yolo/yolo11n_fire.onnx",
+                "models/fire/fire.onnx",
+                "models/fire/yolov8n-fire.onnx",
+                "models/fire/fire_detector.onnx"
+            ])
             for fc in fire_cands:
                 if os.path.exists(fc):
                     chosen_fire_path = fc

@@ -126,15 +126,38 @@ class CampingGuardEngine:
         # 注册模型元数据至 profiler (保持 key 与执行期 profile_model("...") 完全一致)
         if self.detector and hasattr(self.detector, 'model_path'):
             if getattr(self.detector, 'is_ensemble', False):
+                self.detector.profiler = self.profiler
                 det_label = "Parallel-Ensemble-Det"
-                desc = "Orin双流并发目标检测 (主检测器+火灾检测器)"
+                desc = "Orin双流并发目标检测 (主检测器+火灾检测器聚合)"
+                self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)
+
+                # 分别注册通用检测主流与火灾检测副流模型元数据
+                main_det = getattr(self.detector, 'main_detector', None)
+                if main_det and hasattr(main_det, 'model_path'):
+                    m_lbl = getattr(main_det, 'profiler_label', 'General-Det')
+                    self.profiler.register_model_metadata(
+                        m_lbl,
+                        main_det.model_path,
+                        "通用人车动物目标检测 (并发主流)",
+                        is_substream=True
+                    )
+                fire_det = getattr(self.detector, 'fire_detector', None)
+                if fire_det and hasattr(fire_det, 'model_path'):
+                    f_lbl = getattr(fire_det, 'profiler_label', 'FireSmoke-Det')
+                    self.profiler.register_model_metadata(
+                        f_lbl,
+                        fire_det.model_path,
+                        "火灾浓烟专用目标检测 (并发副流)",
+                        is_substream=True
+                    )
             elif getattr(self.detector, 'is_megadetector', False):
                 det_label = "MegaDetector"
                 desc = "S1全图目标检测初筛 (640x480)"
+                self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)
             else:
-                det_label = "YOLO11n-Det"
+                det_label = getattr(self.detector, 'profiler_label', 'YOLO11n-Det')
                 desc = "S1全图目标检测初筛 (640x480)"
-            self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)
+                self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)
         if self.animal_classifier and getattr(self.animal_classifier, 'model_path', None) and getattr(self.animal_classifier, 'session', None) is not None:
             self.profiler.register_model_metadata("MobileNetV3-AnimalCls", self.animal_classifier.model_path, "MegaDetector二级动物细分类 (224x224)")
         if self.pose_estimator and hasattr(self.pose_estimator, 'model_path'):
