@@ -276,14 +276,28 @@ class TRTInferenceSession:
                 else:
                     tensor = data.to(device="cuda", dtype=inp_torch_dtype)
 
-                # 动态输入尺寸设置
+                # 动态输入尺寸设置 (仅针对含动态 -1 维度的模型更新尺寸，若为静态且不匹配则抛出明确提示)
                 if self.is_trt10:
-                    self.context.set_input_shape(name, tuple(tensor.shape))
+                    engine_shape = tuple(self.engine.get_tensor_shape(name))
+                    if any(d < 0 for d in engine_shape):
+                        self.context.set_input_shape(name, tuple(tensor.shape))
+                    elif engine_shape != tuple(tensor.shape):
+                        raise RuntimeError(
+                            f"TensorRT Engine 静态输入尺寸不匹配: 模型 '{Path(self.engine_path).name}' 输入 '{name}' 期望 {engine_shape}，"
+                            f"但实际传入了 {tuple(tensor.shape)}。请重新以正确的动态维度 (--minShapes/--optShapes/--maxShapes) 编译该 Engine！"
+                        )
                     tensor_ptrs[name] = tensor.data_ptr()
                     self.context.set_tensor_address(name, tensor.data_ptr())
                 else:
                     idx = self.engine.get_binding_index(name)
-                    self.context.set_binding_shape(idx, tuple(tensor.shape))
+                    binding_shape = tuple(self.engine.get_binding_shape(idx))
+                    if any(d < 0 for d in binding_shape):
+                        self.context.set_binding_shape(idx, tuple(tensor.shape))
+                    elif binding_shape != tuple(tensor.shape):
+                        raise RuntimeError(
+                            f"TensorRT Engine 静态输入尺寸不匹配: 模型 '{Path(self.engine_path).name}' 期望 {binding_shape}，"
+                            f"但实际传入了 {tuple(tensor.shape)}。请重新以正确的动态维度 (--minShapes/--optShapes/--maxShapes) 编译该 Engine！"
+                        )
                     tensor_ptrs[name] = tensor.data_ptr()
 
             # 2. 为输出分配显存

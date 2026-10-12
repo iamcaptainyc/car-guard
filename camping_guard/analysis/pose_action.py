@@ -48,17 +48,24 @@ class PoseActionClassifier:
         state["frame_count"] += 1
         kpts = target.keypoints or {}
 
-        # ================= 1. 猛兽冲刺判定 =================
-        if target.category == 'large_beast' and target.confidence >= 0.6:
-            if target.radial_speed < -GuardConfig.RADIAL_SPEED_BEAST_L3 and target.zone == VehicleZone.ZONE_2_INNER:
+        # ================= 1. 猛兽防区出没与冲刺判定 =================
+        if target.category == 'large_beast' and target.confidence >= 0.5:
+            species_text = f"({target.species_cn})" if getattr(target, 'species_cn', None) else ""
+            # 1.1 若在 Zone 2 核心区高速径向逼近 (冲刺速度 < -1.5m/s)，连续 3 帧升级为 L3 紧急高危
+            if target.radial_speed is not None and target.radial_speed < -GuardConfig.RADIAL_SPEED_BEAST_L3 and target.zone == VehicleZone.ZONE_2_INNER:
                 if state["action"] == ActionType.BEAST_SPRINT:
                     if state["frame_count"] >= 3:
-                        return ActionType.BEAST_SPRINT, ThreatLevel.L3_CRITICAL, "大型猛兽高速径向冲刺进入警戒防区"
+                        return ActionType.BEAST_SPRINT, ThreatLevel.L3_CRITICAL, f"大型猛兽{species_text}高速径向冲刺进入警戒防区"
                 else:
                     state["action"] = ActionType.BEAST_SPRINT
                     state["start_time"] = current_time
                     state["frame_count"] = 1
-                return ActionType.BEAST_SPRINT, ThreatLevel.L2_WARNING, "大型猛兽逼近警戒"
+                return ActionType.BEAST_SPRINT, ThreatLevel.L2_WARNING, f"大型猛兽{species_text}逼近警戒"
+
+            # 1.2 防区内只要检测到大型猛兽出没 (Zone 1 或 Zone 2)，直接进入 L2 预警并触发录像存证
+            if target.zone in [VehicleZone.ZONE_1_OUTER, VehicleZone.ZONE_2_INNER] or target.ground_dist <= GuardConfig.ZONE_OUTER_DIST:
+                state["action"] = ActionType.BEAST_SPRINT
+                return ActionType.BEAST_SPRINT, ThreatLevel.L2_WARNING, f"防区内侦测到大型猛兽{species_text}出没，进入 L2 预警并录像存证"
 
         # ================= 2. 骨骼点驱动：蓄意踢踹判定 =================
         if kpts:

@@ -131,7 +131,26 @@ class SCRFDFaceDetector:
                     self.model_path = self.session.engine_path
                 elif hasattr(self.session, "model_path"):
                     self.model_path = self.session.model_path
-                self.input_name = self.session.get_inputs()[0].name
+                
+                inp_meta = self.session.get_inputs()[0]
+                self.input_name = inp_meta.name
+
+                # 校验 TensorRT Engine 输入尺寸有效性 (防止因历史直接 trtexec 缺省动态参数编译成静态 1x3x1x1)
+                if self.backend == "tensorrt":
+                    static_shape = tuple(getattr(inp_meta, "shape", ()))
+                    if len(static_shape) == 4 and (static_shape[2] == 1 or static_shape[3] == 1):
+                        print(f"[SCRFDFaceDetector] ⚠️ 检测到 {self.model_path} 静态输入为 {static_shape} (编译时缺失动态维度配置损坏)，自动平稳回退至 ONNX 模型...")
+                        onnx_fallback = str(self.model_path).replace(".engine", ".onnx")
+                        if os.path.exists(onnx_fallback):
+                            import onnxruntime as ort
+                            sess_opts = ort.SessionOptions()
+                            sess_opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+                            sess_opts.inter_op_num_threads = 1
+                            self.session = ort.InferenceSession(onnx_fallback, sess_options=sess_opts, providers=['CPUExecutionProvider'])
+                            self.backend = "onnxruntime"
+                            self.model_path = onnx_fallback
+                            self.input_name = self.session.get_inputs()[0].name
+                            print(f"[SCRFDFaceDetector] ✅ 已成功安全降级至 ONNX 模型: {onnx_fallback}")
                 print(f"[SCRFDFaceDetector] 成功加载人脸检测模型 ({self.backend}): {self.model_path}")
             except Exception as e:
                 if os.path.exists(model_path) and not is_engine:
@@ -175,7 +194,28 @@ class SCRFDFaceDetector:
         input_tensor = (det_img.astype(np.float32) - 127.5) / 128.0
         input_tensor = input_tensor.transpose(2, 0, 1)[None, ...]
 
-        outputs = self.session.run(None, {self.input_name: input_tensor})
+        try:
+            outputs = self.session.run(None, {self.input_name: input_tensor})
+        except Exception as e:
+            if not getattr(self, "_has_warned_run_err", False):
+                print(f"[SCRFDFaceDetector] ⚠️ 前向推理异常 ({e})，正在自动无缝降级至 ONNXRuntime...")
+                self._has_warned_run_err = True
+            onnx_path = str(getattr(self, 'model_path', '')).replace('.engine', '.onnx')
+            if os.path.exists(onnx_path) and self.backend != "onnxruntime":
+                try:
+                    import onnxruntime as ort
+                    sess_opts = ort.SessionOptions()
+                    sess_opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+                    sess_opts.inter_op_num_threads = 1
+                    self.session = ort.InferenceSession(onnx_path, sess_options=sess_opts, providers=['CPUExecutionProvider'])
+                    self.backend = "onnxruntime"
+                    self.model_path = onnx_path
+                    self.input_name = self.session.get_inputs()[0].name
+                    outputs = self.session.run(None, {self.input_name: input_tensor})
+                except Exception:
+                    return np.empty((0, 5)), np.empty((0, 5, 2))
+            else:
+                return np.empty((0, 5)), np.empty((0, 5, 2))
 
         scores_list = []
         bboxes_list = []
@@ -247,7 +287,24 @@ class ArcFaceRecognizer:
                     self.model_path = self.session.engine_path
                 elif hasattr(self.session, "model_path"):
                     self.model_path = self.session.model_path
-                self.input_name = self.session.get_inputs()[0].name
+                inp_meta = self.session.get_inputs()[0]
+                self.input_name = inp_meta.name
+
+                if self.backend == "tensorrt":
+                    static_shape = tuple(getattr(inp_meta, "shape", ()))
+                    if len(static_shape) == 4 and (static_shape[2] == 1 or static_shape[3] == 1):
+                        print(f"[ArcFaceRecognizer] ⚠️ 检测到 {self.model_path} 静态输入为 {static_shape} (损坏)，自动平稳回退至 ONNX 模型...")
+                        onnx_fallback = str(self.model_path).replace(".engine", ".onnx")
+                        if os.path.exists(onnx_fallback):
+                            import onnxruntime as ort
+                            sess_opts = ort.SessionOptions()
+                            sess_opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+                            sess_opts.inter_op_num_threads = 1
+                            self.session = ort.InferenceSession(onnx_fallback, sess_options=sess_opts, providers=['CPUExecutionProvider'])
+                            self.backend = "onnxruntime"
+                            self.model_path = onnx_fallback
+                            self.input_name = self.session.get_inputs()[0].name
+                            print(f"[ArcFaceRecognizer] ✅ 已成功安全降级至 ONNX 模型: {onnx_fallback}")
                 print(f"[ArcFaceRecognizer] 成功加载人脸特征提取模型 ({self.backend}): {self.model_path}")
             except Exception as e:
                 if os.path.exists(model_path) and not is_engine:
