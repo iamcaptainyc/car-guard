@@ -542,9 +542,21 @@ def draw_telemetry_sidebar(
             put_sb(" | ".join(model_items[:3]), 370, font_size=11, color=(160, 200, 220))
 
     # 6. VLM 复核与防篡改审计
-    vlm_summary = tick_result.get("vlm_summary") or "慢通路静默等待"
+    vlm_busy = tick_result.get("vlm_is_inferencing", False)
+    vlm_dur = tick_result.get("vlm_last_duration_ms", 0.0)
+    vlm_summary = tick_result.get("vlm_last_summary") or tick_result.get("vlm_summary") or "慢通路待机"
+    if vlm_busy:
+        vlm_display = "VLM 复核: [推理中] 正在深度语义研判..."
+        vlm_color = (0, 200, 255)
+    elif vlm_dur > 0:
+        vlm_display = f"VLM 复核 ({vlm_dur:.0f}ms): {vlm_summary}"
+        vlm_color = (120, 255, 180)
+    else:
+        vlm_display = f"VLM 复核: {vlm_summary}"
+        vlm_color = (180, 230, 180)
+
     latest_hash = engine.recorder.prev_hash[:10] + ".." if engine.recorder.prev_hash != engine.recorder.GENESIS_HASH else "GENESIS"
-    put_sb(f"VLM 复核: {vlm_summary}", 400, font_size=12, color=(180, 230, 180))
+    put_sb(vlm_display[:32], 400, font_size=12, color=vlm_color)
     put_sb(f"防篡改审计: {latest_hash} (区块: {len(engine.recorder.manifest)})", 418, font_size=11, color=(160, 180, 210))
 
     # 7. 播放进度与快捷键提示
@@ -947,7 +959,10 @@ def run_video_pipeline(
         max_tokens=vlm_max_tokens
     )
     engine.vlm_reviewer.backend = vlm_backend
+    engine.vlm_reviewer.profiler = profiler
     vlm_backend._probe_paths()
+    vlm_desc = str(vlm_backend._resolved_engine_dir or vlm_model_dir or "Qwen-VLM")
+    engine.profiler.register_model_metadata("Qwen-VLM", vlm_desc, "慢通路异步端侧多模态复核与中文战报生成", is_async=True)
 
     # 4. 规范化引擎证据录像器：统一设置为标准 30 FPS，环形缓冲容量确保满足事前 10s (450 帧)
     import collections
@@ -1099,6 +1114,11 @@ def run_video_pipeline(
         if hasattr(engine, 'recorder') and hasattr(engine.recorder, 'flush'):
             try:
                 engine.recorder.flush(timeout=2.0)
+            except Exception:
+                pass
+        if hasattr(engine, 'vlm_reviewer') and hasattr(engine.vlm_reviewer, 'wait_for_completion'):
+            try:
+                engine.vlm_reviewer.wait_for_completion(timeout=1.0)
             except Exception:
                 pass
         print("[*] 评估测试结束。")
@@ -1378,12 +1398,23 @@ def run_video_pipeline(
             if realtime and remaining_sec > 0:
                 time.sleep(remaining_sec)
             gui_key = 0xFF
-            if frame_idx % 25 == 0 or verbose:
-                if realtime:
-                    print(f"[*] [Frame {frame_idx:03d}/{total_frames}] 视频流速: {real_fps:4.1f} FPS (实时平滑) | AI耗时: {ai_e2e_ms:5.1f}ms ({ai_fps:4.1f} FPS) | 目标: {len(active_targets)} | 状态: {tick_res.get('state')} | 威胁: {tick_res.get('threat_level')}")
-                else:
-                    fps_e2e = 1000.0 / max(ai_e2e_ms, 1e-3)
-                    print(f"[*] [Frame {frame_idx:03d}/{total_frames}] E2E: {ai_e2e_ms:5.1f}ms ({fps_e2e:4.1f} FPS) | 目标: {len(active_targets)} | 状态: {tick_res.get('state')} | 威胁: {tick_res.get('threat_level')}")
+
+        if frame_idx % 25 == 0 or verbose:
+            vlm_busy = tick_res.get("vlm_is_inferencing", False)
+            vlm_dur = tick_res.get("vlm_last_duration_ms", 0.0)
+            vlm_cnt = tick_res.get("vlm_total_reviews", 0)
+            if vlm_busy:
+                vlm_tag = " | VLM: [推理中]"
+            elif vlm_cnt > 0:
+                vlm_tag = f" | VLM: [完成: {vlm_dur:.0f}ms](x{vlm_cnt})"
+            else:
+                vlm_tag = " | VLM: [待机]"
+
+            if realtime:
+                print(f"[*] [Frame {frame_idx:03d}/{total_frames}] 视频流速: {real_fps:4.1f} FPS (实时平滑) | AI耗时: {ai_e2e_ms:5.1f}ms ({ai_fps:4.1f} FPS) | 目标: {len(active_targets)} | 状态: {tick_res.get('state')} | 威胁: {tick_res.get('threat_level')}{vlm_tag}")
+            else:
+                fps_e2e = 1000.0 / max(ai_e2e_ms, 1e-3)
+                print(f"[*] [Frame {frame_idx:03d}/{total_frames}] E2E: {ai_e2e_ms:5.1f}ms ({fps_e2e:4.1f} FPS) | 目标: {len(active_targets)} | 状态: {tick_res.get('state')} | 威胁: {tick_res.get('threat_level')}{vlm_tag}")
 
         key = term_key if term_key is not None else gui_key
 

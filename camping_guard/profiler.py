@@ -39,6 +39,7 @@ class ModelStats:
     durations_ms: List[float] = field(default_factory=list)
     gpu_durations_ms: List[float] = field(default_factory=list)
     conditions: List[str] = field(default_factory=list)
+    is_async: bool = False
 
     def record_call(self, duration_ms: float, condition: str = "", gpu_ms: Optional[float] = None):
         self.call_count += 1
@@ -201,22 +202,41 @@ class PipelineProfiler:
                 "default_weight": "models/insightface/w600k_mbf.onnx",
                 "condition": "FQA质检通过后5点对齐白名单比对",
                 "category": "FaceRecognition"
+            },
+            "MegaDetector": {
+                "default_weight": "models/megadetector/md_v5a.onnx",
+                "condition": "野生动物与夜间生物检测初筛",
+                "category": "Detection"
+            },
+            "MobileNetV3-AnimalCls": {
+                "default_weight": "models/cls/mobilenetv3-large.onnx",
+                "condition": "MegaDetector二级动物细分类 (224x224)",
+                "category": "Classification"
+            },
+            "Qwen-VLM": {
+                "default_weight": "Qwen2.5-VL / Qwen3.5-VLM",
+                "condition": "慢通路异步端侧多模态复核与中文战报生成",
+                "category": "MultimodalReview",
+                "is_async": True
             }
         }
 
-    def register_model_metadata(self, model_name: str, weight_path: str = "", condition: str = ""):
+    def register_model_metadata(self, model_name: str, weight_path: str = "", condition: str = "", is_async: bool = False):
         """注册或更新模型元信息"""
         if model_name not in self.model_stats:
             self.model_stats[model_name] = ModelStats(
                 model_name=model_name,
                 weight_path=weight_path,
-                trigger_condition=condition
+                trigger_condition=condition,
+                is_async=is_async
             )
         else:
             if weight_path:
                 self.model_stats[model_name].weight_path = weight_path
             if condition:
                 self.model_stats[model_name].trigger_condition = condition
+            if is_async:
+                self.model_stats[model_name].is_async = is_async
 
     def start_frame(self, frame_idx: int):
         """开启一帧的 E2E 计时"""
@@ -266,16 +286,23 @@ class PipelineProfiler:
         condition: str = "",
         success: bool = True,
         input_shape: Optional[Tuple] = None,
-        gpu_ms: Optional[float] = None
+        gpu_ms: Optional[float] = None,
+        is_async: Optional[bool] = None
     ):
         """记录单次模型调用"""
         if model_name not in self.model_stats:
             meta = self.model_metadata.get(model_name, {})
+            model_is_async = meta.get("is_async", False) or (meta.get("category") == "MultimodalReview") or ("vlm" in model_name.lower())
+            if is_async is not None:
+                model_is_async = is_async
             self.model_stats[model_name] = ModelStats(
                 model_name=model_name,
                 weight_path=meta.get("default_weight", ""),
-                trigger_condition=condition or meta.get("condition", "")
+                trigger_condition=condition or meta.get("condition", ""),
+                is_async=model_is_async
             )
+        elif is_async is not None:
+            self.model_stats[model_name].is_async = is_async
 
         self.model_stats[model_name].record_call(duration_ms, condition=condition, gpu_ms=gpu_ms)
 
@@ -286,7 +313,8 @@ class PipelineProfiler:
             success=success,
             input_shape=input_shape
         )
-        if self._is_profiling_frame:
+        # 仅同步模型调用才计入当前帧快照，异步慢通路模型不污染单帧同步 E2E 与帧渲染
+        if self._is_profiling_frame and not self.model_stats[model_name].is_async:
             self._current_frame_calls.append(rec)
 
     def record_stage_duration(self, stage_name: str, duration_ms: float):
@@ -421,10 +449,11 @@ class PipelineProfiler:
 
         for name, m in models.items():
             rate_str = f"{m['calls_per_frame']:.2f}/f"
-            pct_str = f"{m['pct_of_e2e']:.1f}%"
+            stats_obj = self.model_stats.get(name)
+            is_async = (stats_obj.is_async if stats_obj else False) or ("vlm" in name.lower())
+            pct_str = "异步并发" if is_async else f"{m['pct_of_e2e']:.1f}%"
             is_trt = str(m['weight_path']).lower().endswith(".engine")
             display_name = f"{name} (TRT)" if is_trt else name
-            stats_obj = self.model_stats.get(name)
             gpu_ms = stats_obj.avg_gpu_ms if stats_obj else 0.0
             if gpu_ms > 0:
                 gpu_str = f"{gpu_ms:6.2f} ms"
@@ -446,12 +475,14 @@ class PipelineProfiler:
             w_path = m['weight_path'] or "内置引擎"
             stats_obj = self.model_stats.get(name)
             gpu_ms = stats_obj.avg_gpu_ms if stats_obj else 0.0
-            if str(w_path).lower().endswith(".engine"):
+            is_async = (stats_obj.is_async if stats_obj else False) or ("vlm" in name.lower())
+            async_tag = " [后台异步慢通路]" if is_async else ""
+            if str(w_path).lower().endswith(".engine") or "engines" in str(w_path).lower():
                 gpu_detail = f" [纯GPU推理: {gpu_ms:.2f}ms]" if gpu_ms > 0 else ""
-                backend_desc = f"TensorRT GPU Engine{gpu_detail}"
+                backend_desc = f"TensorRT GPU Engine{gpu_detail}{async_tag}"
             else:
-                backend_desc = "ONNXRuntime"
-            lines.append(f"  * {name:<20}: {cond} (权重: {os.path.basename(w_path)}, 后端: {backend_desc})")
+                backend_desc = f"ONNXRuntime{async_tag}"
+            lines.append(f"  * {name:<20}: {cond} (权重: {os.path.basename(w_path) if os.path.basename(w_path) else w_path}, 后端: {backend_desc})")
         lines.append("=" * 96)
         return "\n".join(lines)
 

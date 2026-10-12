@@ -73,9 +73,11 @@ class MultiSourceFusionEngine:
                 return ThreatLevel.L3_CRITICAL, True, "车身碰撞确立：视觉车身区域运动扰动 + 车端 IMU 震动/状态变化联合确认 (如邻车开门撞击/倒木砸车)"
             return ThreatLevel.L2_WARNING, False, "疑似车身碰撞：车身敏感区域检测到显著运动扰动 (如邻车开门贴近/外物触碰)，待 VLM 复核"
 
-        # 5. 猛兽冲刺 (已在视觉侧 3 帧确认直接可定 L3)
+        # 5. 猛兽冲刺与出没 (视觉侧已定级 L2/L3)
         if visual_action == ActionType.BEAST_SPRINT and visual_threat == ThreatLevel.L3_CRITICAL:
-            return ThreatLevel.L3_CRITICAL, False, "大型猛兽冲刺：径向高速逼近，连续 3 帧确认"
+            return ThreatLevel.L3_CRITICAL, False, "大型猛兽冲刺：径向高速逼近，连续帧确认"
+        if visual_action in [ActionType.BEAST_PROXIMITY, ActionType.BEAST_SPRINT] and visual_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
+            return visual_threat, False, "防区内侦测到大型猛兽出没，按行为等级执行"
 
         # 5. 硬触发检测 (即便是视觉未识别动作，但检测到暴力破坏/倾斜/玻璃破碎)
         violent_hard_triggers = [

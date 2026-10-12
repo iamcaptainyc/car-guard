@@ -43,7 +43,10 @@ class VehicleActuator:
         if level == ThreatLevel.L2_WARNING:
             self._reset_critical()
             actions.append("【L2 预警】事件录像加密锁定 (事前10s至事后20s)")
-            if mode == OperatingMode.IN_CAR:
+            if record.action_type in [ActionType.BEAST_PROXIMITY, ActionType.BEAST_SPRINT]:
+                actions.append("【猛兽警戒】车底/外围补光灯开启照亮动向；App 弹出野生动物识别卡片")
+                self.puddle_light_active = True
+            elif mode == OperatingMode.IN_CAR:
                 actions.append("【车内响应】App 静默通知；座舱屏幕保持暗色")
             else:
                 actions.append("【车外响应】App 常规图文推送；车底照地灯低照度补光")
@@ -52,6 +55,17 @@ class VehicleActuator:
 
         if level == ThreatLevel.L3_CRITICAL:
             actions.append("【L3 紧急】完整录像加盖防篡改时间戳落盘")
+            if record.action_type == ActionType.BEAST_SPRINT:
+                if mode == OperatingMode.IN_CAR:
+                    actions.append("【猛兽冲刺紧急】主驾座椅脉冲震动唤醒车主 + 座舱屏幕全屏弹出猛兽夜视视角 + 车外高频大灯爆闪驱逐")
+                    self.seat_vibration_active = True
+                    self.headlight_strobe_active = True
+                else:
+                    actions.append("【猛兽冲刺紧急】车外大灯高频爆闪 + 扬声器猛犬吠叫与警报音 (105dB) 强力驱逐")
+                    self.headlight_strobe_active = True
+                    self.exterior_speaker_active = True
+                return actions
+
             if is_fire_event:
                 # 火情特殊响应: 不使用驱逐动作！
                 if mode == OperatingMode.IN_CAR:

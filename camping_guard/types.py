@@ -41,7 +41,8 @@ class ActionType(Enum):
     DOOR_HANDLE_PULL = "拉门撬锁"
     INTENTIONAL_KICK = "蓄意踢踹"
     EQUIPMENT_THEFT = "装备盗窃"
-    BEAST_SPRINT = "猛兽冲刺"
+    BEAST_PROXIMITY = "猛兽出没"     # 大型猛兽进入警戒防区 (Zone 1 / Zone 2) 活动
+    BEAST_SPRINT = "猛兽冲刺"        # 大型猛兽高速径向冲刺逼近车身
     FIRE_SMOKE = "火情烟雾"
     VEHICLE_COLLISION = "车身碰撞"   # 邻车开门碰撞、树木倒塌砸车、外物撞击等车身区域运动扰动
 

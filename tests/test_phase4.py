@@ -643,4 +643,86 @@ def test_evidence_recorder_auto_heal_legacy_break():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_vlm_beast_gating_and_summary():
+    """验证大型猛兽动作类型触发 VLM 唤醒门控并生成专业战报"""
+    reviewer = AsyncVLMReviewer(enable_worker_thread=False)
+
+    # 1. 验证 BEAST_PROXIMITY 与 BEAST_SPRINT 触发门控
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.90,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L1_NOTICE,
+        action_type=ActionType.BEAST_PROXIMITY,
+        has_contact_signal=False
+    ) is True
+
+    assert reviewer.should_trigger_vlm(
+        category_conf=0.90,
+        is_unknown_obstacle=False,
+        fast_path_threat=ThreatLevel.L2_WARNING,
+        action_type=ActionType.BEAST_SPRINT,
+        has_contact_signal=False
+    ) is True
+
+    # 2. 验证 Mock 后端生成对应战报
+    record_prox = ThreatEventRecord(
+        event_id="EVT_BEAST_01",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.BEAST_PROXIMITY,
+        description="防区大型猛兽游荡",
+        species="brown_bear",
+        species_cn="棕熊"
+    )
+    res_prox = reviewer.review_event_sync(record_prox)
+    assert "棕熊" in res_prox["summary_text"]
+    assert res_prox["final_threat"] == ThreatLevel.L2_WARNING
+
+
+def test_vlm_profiler_and_timing_integration():
+    """验证 VLM 运行时耗时统计并正确记录到 profiler (标记为异步慢通路并发)"""
+    from camping_guard.profiler import PipelineProfiler
+    profiler = PipelineProfiler()
+    mock_backend = MockVLMBackend(simulated_delay_sec=0.03) # 30ms 延迟
+    reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=True, profiler=profiler)
+
+    record = ThreatEventRecord(
+        event_id="EVT_TIMING_01",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.DOOR_HANDLE_PULL,
+        description="门把手拉动触碰",
+        has_contact_signal=True
+    )
+
+    task_id = reviewer.submit_review_async(record)
+    assert task_id.startswith("VLM_TASK_")
+
+    done = reviewer.wait_for_completion(timeout=1.5)
+    assert done is True
+    reviewer.stop()
+
+    # 验证遥测指标
+    assert reviewer.total_completed_reviews >= 1
+    assert reviewer.last_inference_ms >= 25.0
+    assert len(reviewer.last_summary_text) > 0
+
+    # 验证 profiler 记录
+    stats = profiler.model_stats.get("Qwen-VLM")
+    assert stats is not None
+    assert stats.call_count >= 1
+    assert stats.avg_ms >= 25.0
+    assert stats.is_async is True
+
+    # 验证汇总报表中展示为 异步并发，而非扭曲同步 E2E
+    profiler.start_frame(1)
+    profiler.end_frame("L2_WARNING", 1)
+    summary_table = profiler.format_summary_table()
+    assert "Qwen-VLM" in summary_table
+    assert "异步并发" in summary_table
+
+
+
 

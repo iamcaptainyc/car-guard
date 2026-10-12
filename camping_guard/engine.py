@@ -106,7 +106,7 @@ class CampingGuardEngine:
         self.pose_classifier = PoseActionClassifier()
         self.fusion_engine = MultiSourceFusionEngine()
         self.fire_monitor = CampfireMonitor()
-        self.vlm_reviewer = AsyncVLMReviewer()
+        self.vlm_reviewer = AsyncVLMReviewer(profiler=self.profiler)
         self.recorder = EvidenceRecorder(fps=30.0, buffer_duration_sec=15.0, async_encoding=True)
         self.vehicle_bus = MockVehicleBus()
         self.actuator = VehicleActuator()
@@ -137,6 +137,16 @@ class CampingGuardEngine:
             self.profiler.register_model_metadata("SCRFD-500M", self.faceid_pipeline.detector.model_path, "4m以内人员上半身人脸定位初筛")
         if self.faceid_pipeline and hasattr(self.faceid_pipeline, 'recognizer') and hasattr(self.faceid_pipeline.recognizer, 'model_path'):
             self.profiler.register_model_metadata("ArcFace-MobileFaceNet", self.faceid_pipeline.recognizer.model_path, "FQA质检通过后白名单比对")
+
+        # 注册 Qwen-VLM 慢通路模型元信息
+        vlm_model_desc = "Qwen2.5-VL / Qwen3.5-VLM"
+        backend_obj = getattr(self.vlm_reviewer, "backend", None)
+        if backend_obj:
+            if getattr(backend_obj, "_resolved_engine_dir", None):
+                vlm_model_desc = str(backend_obj._resolved_engine_dir)
+            elif getattr(backend_obj, "model_dir_arg", None):
+                vlm_model_desc = str(backend_obj.model_dir_arg)
+        self.profiler.register_model_metadata("Qwen-VLM", vlm_model_desc, "慢通路异步端侧多模态复核与中文战报生成", is_async=True)
 
         # 运行指标与统计
         self.current_threat_level: ThreatLevel = ThreatLevel.L0_SAFE
@@ -618,6 +628,10 @@ class CampingGuardEngine:
             "actions": self.executed_actions,
             "active_targets_count": len(self.active_targets),
             "vlm_summary": event_record.vlm_summary,
+            "vlm_is_inferencing": getattr(self.vlm_reviewer, "is_inferencing", False),
+            "vlm_last_duration_ms": getattr(self.vlm_reviewer, "last_inference_ms", 0.0),
+            "vlm_last_summary": getattr(self.vlm_reviewer, "last_summary_text", ""),
+            "vlm_total_reviews": getattr(self.vlm_reviewer, "total_completed_reviews", 0),
             "metrics": frame_metrics,
             "e2e_ms": frame_metrics.e2e_ms,
             "fps": frame_metrics.fps

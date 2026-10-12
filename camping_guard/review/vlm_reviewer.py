@@ -97,6 +97,13 @@ class MockVLMBackend(VLMBackendBase):
             # 无接触传感器的疑似装备盗窃，VLM 予以确认为盗窃并建议升级 L3
             threat_escalation = "CONFIRM_OR_UPGRADE"
             summary_text = "发现人员正尝试拆卸车顶行李架或外挂装备，建议立即驱逐！"
+        elif action == ActionType.BEAST_PROXIMITY:
+            action_category = "WILD_BEAST_DETECTED"
+            is_human_contact = False
+            threat_escalation = "MAINTAIN"
+            species_cn = getattr(event_record, "species_cn", "")
+            spec_str = f"({species_cn})" if species_cn else ""
+            summary_text = f"注意！防区内发现大型野生猛兽{spec_str}游荡，已锁定录像并警戒。"
         elif action == ActionType.BEAST_SPRINT:
             action_category = "WILD_ANIMAL_ATTACK"
             is_human_contact = False
@@ -139,7 +146,7 @@ class LocalHttpVLMBackend(VLMBackendBase):
         "排除光影、树叶飘落、鸟禽等环境假阳性，并为车主生成不超过50字的人性化简明情况通报。\n"
         "请严格输出 JSON 格式：\n"
         "{\n"
-        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "FALSE_ALARM" | "OTHER",\n'
+        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "is_human_contact": true/false,\n'
         '  "is_false_alarm": true/false,\n'
@@ -622,9 +629,11 @@ class AsyncVLMReviewer:
     def __init__(
         self,
         backend: Optional[VLMBackendBase] = None,
-        enable_worker_thread: bool = True
+        enable_worker_thread: bool = True,
+        profiler: Optional[Any] = None
     ):
         self.backend = backend or MockVLMBackend()
+        self.profiler = profiler
         self.review_history: List[Dict[str, Any]] = []
         self.task_queue: queue.Queue = queue.Queue()
         self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
@@ -633,6 +642,13 @@ class AsyncVLMReviewer:
         self._lock = threading.Lock()
         self._is_running = enable_worker_thread
         self._worker_thread: Optional[threading.Thread] = None
+
+        # 实时状态与耗时遥测属性 (供控制台看板与 HUD 实时显示)
+        self.is_inferencing: bool = False
+        self.last_inference_ms: float = 0.0
+        self.last_summary_text: str = ""
+        self.total_completed_reviews: int = 0
+        self.total_submitted_tasks: int = 0
 
         if enable_worker_thread:
             self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="VLM_Reviewer_Worker")
@@ -653,7 +669,7 @@ class AsyncVLMReviewer:
         is_zone3_roi_event: Optional[bool] = None
     ) -> bool:
         """
-        唤醒门控逻辑 (步骤 2.2 门控条件 1~5)
+        唤醒门控逻辑 (步骤 2.2 门控条件 1~6)
         """
         # 条件 1: 检测置信度低 (<35%) 或未知障碍物
         if is_unknown_obstacle or category_conf < 0.35:
@@ -676,6 +692,10 @@ class AsyncVLMReviewer:
         if action_type == ActionType.VEHICLE_COLLISION:
             return True
 
+        # 条件 6: 野生大型猛兽活动 (猛兽出没 / 猛兽冲刺) 必须唤醒 VLM 研判并生成安全避险建议
+        if action_type in [ActionType.BEAST_PROXIMITY, ActionType.BEAST_SPRINT]:
+            return True
+
         return False
 
     def submit_review_async(
@@ -693,6 +713,8 @@ class AsyncVLMReviewer:
             if self.task_queue.qsize() >= 2:
                 return task_id
             self._active_tasks_count += 1
+            self.total_submitted_tasks += 1
+
         self.task_queue.put((task_id, event_record, keyframes, callback))
         return task_id
 
@@ -704,8 +726,43 @@ class AsyncVLMReviewer:
         """
         同步复核接口（用于离线测试或引擎立即获取保底战报）
         """
-        raw_vlm_out = self.backend.infer(event_record, keyframes)
-        return self._arbitrate_and_finalize(event_record, raw_vlm_out)
+        self.is_inferencing = True
+        t0 = time.perf_counter()
+        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+        print(f"[*] [VLM-Reviewer] [SYNC-RUN] 正在同步执行端侧大模型视觉语义推理 (动作: {act_val})...")
+        try:
+            raw_vlm_out = self.backend.infer(event_record, keyframes)
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            result = self._arbitrate_and_finalize(event_record, raw_vlm_out)
+            self.last_inference_ms = dur_ms
+            self.last_summary_text = result.get("summary_text", "")
+            self.total_completed_reviews += 1
+            if self.profiler is not None:
+                self.profiler.record_model_call(
+                    model_name="Qwen-VLM",
+                    duration_ms=dur_ms,
+                    condition=f"同步复核({act_val})",
+                    success=True,
+                    is_async=False
+                )
+            fin_threat = result.get("final_threat")
+            fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
+            print(f"[+] [VLM-Reviewer] [SYNC-DONE] 端侧大模型同步复核完成 (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s) -> 仲裁等级: {fin_threat_val} | 战报: \"{result.get('summary_text')}\"")
+            return result
+        except Exception as e:
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"[!] [VLM-Reviewer] [SYNC-FAIL] 端侧大模型同步推理异常 (耗时: {dur_ms:.1f}ms): {e}")
+            if self.profiler is not None:
+                self.profiler.record_model_call(
+                    model_name="Qwen-VLM",
+                    duration_ms=dur_ms,
+                    condition=f"同步异常({act_val})",
+                    success=False,
+                    is_async=False
+                )
+            raise
+        finally:
+            self.is_inferencing = False
 
     def review_event_async(
         self,
@@ -800,23 +857,56 @@ class AsyncVLMReviewer:
                 continue
 
             task_id, event_record, keyframes, callback = task
+            self.is_inferencing = True
+            t0 = time.perf_counter()
+            act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+            print(f"[*] [VLM-Reviewer] [RUN] 正在执行端侧大模型视觉语义推理 [{task_id}] (动作: {act_val})...")
+
             try:
                 raw_out = self.backend.infer(event_record, keyframes)
+                dur_ms = (time.perf_counter() - t0) * 1000.0
                 result = self._arbitrate_and_finalize(event_record, raw_out)
 
+                self.last_inference_ms = dur_ms
+                self.last_summary_text = result.get("summary_text", "")
+                self.total_completed_reviews += 1
+
+                # 记录到 profiler (标记为 is_async=True，避免污染单帧同步 E2E)
+                if self.profiler is not None:
+                    self.profiler.record_model_call(
+                        model_name="Qwen-VLM",
+                        duration_ms=dur_ms,
+                        condition=f"异步复核({act_val})",
+                        success=True,
+                        is_async=True
+                    )
+
+                fin_threat = result.get("final_threat")
+                fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
+                print(f"[+] [VLM-Reviewer] [DONE] 端侧大模型语义复核完成 [{task_id}] (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s) -> 仲裁等级: {fin_threat_val} | 战报: \"{result.get('summary_text')}\"")
+
                 # 更新原记录
-                event_record.vlm_summary = result["summary_text"]
-                event_record.final_threat_level = result["final_threat"]
+                event_record.vlm_summary = result.get("summary_text")
+                event_record.final_threat_level = result.get("final_threat")
 
                 # 分发特定回调与通用回调
                 if callback:
                     callback(result)
                 for cb in self.callbacks:
                     cb(result)
-            except Exception:
-                # 记录工作线程异常，不影响整车防御
-                pass
+            except Exception as e:
+                dur_ms = (time.perf_counter() - t0) * 1000.0
+                print(f"[!] [VLM-Reviewer] [FAIL] 端侧大模型异步推理异常 [{task_id}] (耗时: {dur_ms:.1f}ms): {e}")
+                if self.profiler is not None:
+                    self.profiler.record_model_call(
+                        model_name="Qwen-VLM",
+                        duration_ms=dur_ms,
+                        condition=f"异步异常({act_val})",
+                        success=False,
+                        is_async=True
+                    )
             finally:
+                self.is_inferencing = False
                 with self._lock:
                     self._active_tasks_count = max(0, self._active_tasks_count - 1)
                 self.task_queue.task_done()
