@@ -175,10 +175,13 @@ class ONNXObjectDetector(BaseObjectDetector):
         class_ids = np.argmax(scores[mask], axis=1)
         confidences = confidences[mask]
 
-        # 自适应根据模型配置与输出通道维度判断分类字典
+        # 自适应根据输出通道维度判断分类字典 (MegaDetector 3类 vs Fisheye8K 5类 vs COCO 80类 vs 火灾 1~2类)
+        is_megadetector = getattr(self, 'is_megadetector', False) or (scores.shape[1] == 3)
+        is_fisheye_5cls = (scores.shape[1] == 5)
+
         if getattr(self, 'custom_cls_map', None) is not None:
             cls_map = self.custom_cls_map
-        elif getattr(self, 'is_fire_model', False) or (scores.shape[1] in [1, 2] and not getattr(self, 'is_megadetector', False)):
+        elif getattr(self, 'is_fire_model', False) or (scores.shape[1] in [1, 2] and not is_megadetector):
             cls_map = self.fire_to_guard_map
         elif is_megadetector:
             cls_map = self.megadetector_to_guard_map

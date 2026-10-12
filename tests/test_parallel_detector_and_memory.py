@@ -182,3 +182,55 @@ def test_evidence_recorder_lightweight_jpeg_compression():
         assert video_p.stat().st_size > 0
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_onnx_object_detector_detect_cls_mapping():
+    """测试 ONNXObjectDetector.detect 预测分支中的类别映射逻辑，确保无未定义变量"""
+    from camping_guard.perception.detector import ONNXObjectDetector
+
+    det = ONNXObjectDetector.__new__(ONNXObjectDetector)
+    det.input_size = (640, 640)
+    det.conf_threshold = 0.25
+    det.input_name = "images"
+    det.backend = "mock"
+    det.animal_classifier = None
+    det.custom_cls_map = None
+    det.is_megadetector = False
+    det.is_fire_model = False
+    det.coco_to_guard_map = {0: 'person', 2: 'car'}
+    det.megadetector_to_guard_map = {0: 'animal', 1: 'person', 2: 'car'}
+    det.fisheye_to_guard_map = {3: 'person', 2: 'car'}
+    det.fire_to_guard_map = {0: 'fire', 1: 'smoke'}
+
+    class MockSession:
+        def __init__(self, num_classes=80):
+            self.num_classes = num_classes
+        def run(self, output_names, input_feed):
+            num_feats = 4 + self.num_classes
+            preds = np.zeros((1, num_feats, 1000), dtype=np.float32)
+            preds[0, 0:4, 0] = [320, 320, 100, 100]
+            preds[0, 4, 0] = 0.95
+            return [preds]
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # 1. 测试 COCO 80 类模式 (YOLO)
+    det.session = MockSession(num_classes=80)
+    res_coco = det.detect(dummy_frame)
+    assert len(res_coco) == 1
+    assert res_coco[0]["category"] == "person"
+
+    # 2. 测试 MegaDetector 3 类模式
+    det.session = MockSession(num_classes=3)
+    det.is_megadetector = True
+    res_md = det.detect(dummy_frame)
+    assert len(res_md) == 1
+    assert res_md[0]["category"] == "small_animal"
+
+    # 3. 测试 Fire 2 类模式
+    det.is_megadetector = False
+    det.is_fire_model = True
+    det.session = MockSession(num_classes=2)
+    res_fire = det.detect(dummy_frame)
+    assert len(res_fire) == 1
+    assert res_fire[0]["category"] == "fire"
