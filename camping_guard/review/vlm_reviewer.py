@@ -131,7 +131,9 @@ class MockVLMBackend(VLMBackendBase):
             "is_human_contact": is_human_contact,
             "is_false_alarm": is_false_alarm,
             "threat_escalation": threat_escalation,
-            "summary_text": summary_text[:50]
+            "summary_text": summary_text[:50],
+            "backend_source": "FALLBACK_RULE_MOCK (离线规则保底模板)",
+            "raw_output_text": "(使用离线规则模板，未执行真实大模型)"
         }
 
 
@@ -233,11 +235,12 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
        - 在开发主机或无硬件环境时，无缝衔接高保真端侧规则兜底引擎，保障单元测试与全流程绝对稳定。
     """
     SYSTEM_PROMPT = (
-        "你是一个部署在智能汽车座舱域控制器上的安全哨兵多模态复核大模型。"
-        "对快通路提交的可疑事件关键帧进行语义复核，排除风吹草动假阳性，并生成<=50字简明情况通报。\n"
+        "你是一个部署在智能汽车车载边缘计算平台（Jetson Orin）上的安全哨兵多模态复核大模型。"
+        "你的职责是对守卫系统快通路提交的可疑事件关键帧与车身传感器数据进行深度语义研判，"
+        "排除光影、树叶、鸟禽等环境假阳性，识别人员偷盗、破坏、窥探或野生猛兽等安全风险，并为车主生成不超过50字的人性化简明情况通报。\n"
         "请严格输出 JSON 格式：\n"
         "{\n"
-        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "FALSE_ALARM" | "OTHER",\n'
+        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "is_human_contact": true/false,\n'
         '  "is_false_alarm": true/false,\n'
@@ -425,13 +428,18 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         dwell_s = getattr(event_record, "target_dwell_time", 0.0)
         dist_m = getattr(event_record, "target_distance", 0.0)
         target_cat = getattr(event_record, "target_category", "person")
+        species_name = getattr(event_record, "species_cn", "")
 
         prompt_text = (
             f"{self.SYSTEM_PROMPT}\n\n"
-            f"当前事件动作: {event_record.action_type.value}, 目标类别: {target_cat}, "
-            f"滞留时间: {dwell_s:.1f}秒, 空间距离: {dist_m:.1f}米, "
-            f"是否有物理接触信号: {event_record.has_contact_signal}。\n"
-            "请输出判定 JSON："
+            f"【现场传感器遥测上下文】\n"
+            f"- 目标类别: {target_cat}\n"
+            f"- 识别物种: {species_name or '未定'}\n"
+            f"- 视觉动作类型: {event_record.action_type.value}\n"
+            f"- 空间物理距离: {dist_m:.1f} 米\n"
+            f"- 防区累计滞留时间: {dwell_s:.1f} 秒\n"
+            f"- 是否有车身硬件物理接触信号 (CAN/IMU): {event_record.has_contact_signal}\n\n"
+            f"请结合关键帧图像分析并输出判定 JSON："
         )
 
         # 优先使用 Linux /dev/shm 内存盘加速 (0ms 磁盘读写延迟，0 闪存损耗)
@@ -542,6 +550,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         parsed = json.loads(raw_text[s:e])
                         if "summary_text" in parsed:
                             parsed["summary_text"] = parsed["summary_text"][:50]
+                        parsed["backend_source"] = "TRT-Edge-LLM (C++ 原生真实大模型)"
+                        parsed["raw_output_text"] = output_str
+                        parsed["prompt_text"] = prompt_text
                         print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 ({elapsed_ms:.1f}ms): {parsed.get('summary_text')}")
                         return parsed
             else:
@@ -588,6 +599,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         parsed = json.loads(raw_text[s:e])
                         if "summary_text" in parsed:
                             parsed["summary_text"] = parsed["summary_text"][:50]
+                        parsed["backend_source"] = "tensorrt_edgellm (Python绑定真实推理)"
+                        parsed["raw_output_text"] = output_str
+                        parsed["prompt_text"] = prompt
                         return parsed
         except Exception:
             pass
@@ -613,6 +627,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         # 3. 开发测试/离线主机兜底：挂载端侧高保真语义复核规则 (融合滞留时间与空间距离)
         res = self.fallback_mock.infer(event_record, keyframes)
+        res["backend_source"] = "FALLBACK_RULE_MOCK (离线规则保底模板)"
+        res["raw_output_text"] = "(无真实大模型输出，使用离线保底)"
         dwell_s = getattr(event_record, "target_dwell_time", 0.0)
         dist_m = getattr(event_record, "target_distance", 0.0)
         if dwell_s > 10.0 and res.get("summary_text"):
@@ -729,7 +745,14 @@ class AsyncVLMReviewer:
         self.is_inferencing = True
         t0 = time.perf_counter()
         act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+        tgt_cat = getattr(event_record, "target_category", "unknown")
+        species_str = getattr(event_record, "species_cn", "")
+        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
+        dist_m = getattr(event_record, "target_distance", 0.0)
+        contact_str = "是" if event_record.has_contact_signal else "否"
+
         print(f"[*] [VLM-Reviewer] [SYNC-RUN] 正在同步执行端侧大模型视觉语义推理 (动作: {act_val})...")
+        print(f"    - 现场上下文: 动作={act_val} | 目标={tgt_cat} ({species_str or '未定'}) | 距离={dist_m:.1f}m | 滞留={dwell_s:.1f}s | 接触={contact_str}")
         try:
             raw_vlm_out = self.backend.infer(event_record, keyframes)
             dur_ms = (time.perf_counter() - t0) * 1000.0
@@ -737,17 +760,29 @@ class AsyncVLMReviewer:
             self.last_inference_ms = dur_ms
             self.last_summary_text = result.get("summary_text", "")
             self.total_completed_reviews += 1
+
+            backend_source = raw_vlm_out.get("backend_source", "FALLBACK_RULE_MOCK (离线规则保底模板)")
+            raw_text = raw_vlm_out.get("raw_output_text", "")
+            is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
+
             if self.profiler is not None:
                 self.profiler.record_model_call(
                     model_name="Qwen-VLM",
                     duration_ms=dur_ms,
-                    condition=f"同步复核({act_val})",
+                    condition=f"{'真实' if is_real_vlm else '保底'}复核({act_val})",
                     success=True,
                     is_async=False
                 )
             fin_threat = result.get("final_threat")
             fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
-            print(f"[+] [VLM-Reviewer] [SYNC-DONE] 端侧大模型同步复核完成 (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s) -> 仲裁等级: {fin_threat_val} | 战报: \"{result.get('summary_text')}\"")
+            if is_real_vlm:
+                print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s)")
+                print(f"    - 推理后端: {backend_source}")
+                print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
+                print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+            else:
+                print(f"[!] [VLM-Reviewer] [FALLBACK] [WARN] 真实大模型未就绪/超时/退出异常，当前生效为【离线规则保底模板】")
+                print(f"    - 保底战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
             return result
         except Exception as e:
             dur_ms = (time.perf_counter() - t0) * 1000.0
@@ -860,7 +895,14 @@ class AsyncVLMReviewer:
             self.is_inferencing = True
             t0 = time.perf_counter()
             act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
-            print(f"[*] [VLM-Reviewer] [RUN] 正在执行端侧大模型视觉语义推理 [{task_id}] (动作: {act_val})...")
+            tgt_cat = getattr(event_record, "target_category", "unknown")
+            species_str = getattr(event_record, "species_cn", "")
+            dwell_s = getattr(event_record, "target_dwell_time", 0.0)
+            dist_m = getattr(event_record, "target_distance", 0.0)
+            contact_str = "是" if event_record.has_contact_signal else "否"
+
+            print(f"[*] [VLM-Reviewer] [RUN] 正在启动端侧大模型视觉语义推理 [{task_id}]...")
+            print(f"    - 输入事件: 动作={act_val} | 目标={tgt_cat} ({species_str or '未定'}) | 距离={dist_m:.1f}m | 滞留={dwell_s:.1f}s | 接触={contact_str}")
 
             try:
                 raw_out = self.backend.infer(event_record, keyframes)
@@ -871,19 +913,32 @@ class AsyncVLMReviewer:
                 self.last_summary_text = result.get("summary_text", "")
                 self.total_completed_reviews += 1
 
+                backend_source = raw_out.get("backend_source", "FALLBACK_RULE_MOCK (离线规则保底模板)")
+                raw_text = raw_out.get("raw_output_text", "")
+                is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
+
                 # 记录到 profiler (标记为 is_async=True，避免污染单帧同步 E2E)
+                cond_tag = f"{'真实' if is_real_vlm else '保底'}复核({act_val})"
                 if self.profiler is not None:
                     self.profiler.record_model_call(
                         model_name="Qwen-VLM",
                         duration_ms=dur_ms,
-                        condition=f"异步复核({act_val})",
+                        condition=cond_tag,
                         success=True,
                         is_async=True
                     )
 
                 fin_threat = result.get("final_threat")
                 fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
-                print(f"[+] [VLM-Reviewer] [DONE] 端侧大模型语义复核完成 [{task_id}] (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s) -> 仲裁等级: {fin_threat_val} | 战报: \"{result.get('summary_text')}\"")
+
+                if is_real_vlm:
+                    print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 [{task_id}] (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s)")
+                    print(f"    - 推理后端: {backend_source}")
+                    print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
+                    print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+                else:
+                    print(f"[!] [VLM-Reviewer] [FALLBACK] [WARN] 真实大模型未就绪/超时/退出异常，当前生效为【离线规则保底模板】")
+                    print(f"    - 保底战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
 
                 # 更新原记录
                 event_record.vlm_summary = result.get("summary_text")
