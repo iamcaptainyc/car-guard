@@ -127,6 +127,8 @@ class TrackedEntity:
     reid_feature: Optional[Any] = None                          # 当前提取的最优 ReID 特征向量
     association_version: int = 1                                # 异步任务防踩内存关联版本号
     velocity_pixel: Tuple[float, float] = (0.0, 0.0)            # 图像坐标系中心运动速度 (vx, vy, 像素/帧)
+    species: Optional[str] = None                               # 细粒度物种英文 (如 "brown_bear", "dog", "wild_boar")
+    species_cn: Optional[str] = None                            # 细粒度物种中文 (如 "棕熊", "犬类", "野猪")
 
 @dataclass
 class BodyROI:
@@ -182,6 +184,8 @@ class ThreatEventRecord:
     is_whitelisted: bool = False
     disturbed_rois: List[str] = field(default_factory=list)
     executed_actions: List[str] = field(default_factory=list)
+    species: Optional[str] = None
+    species_cn: Optional[str] = None
 
     def to_push_payload(self) -> Dict[str, Any]:
         """生成面向车主手机 App / 车联网云端 / Webhook 的标准高效推送报文格式"""
@@ -201,9 +205,15 @@ class ThreatEventRecord:
         elif self.threat_level == ThreatLevel.L2_WARNING:
             title = "⚠️【预警提示】车周检测到人员可疑逗留徘徊"
 
+        target_display = self.target_category
+        if self.species_cn:
+            target_display += f" ({self.species_cn})"
+        elif self.species:
+            target_display += f" ({self.species})"
+
         dwell_txt = f"{self.target_dwell_time:.1f}s" if self.target_dwell_time > 0 else "刚出现"
         body = (
-            f"目标: {self.target_category} (ID:{self.target_id or '-'}) | "
+            f"目标: {target_display} (ID:{self.target_id or '-'}) | "
             f"距离: {self.target_distance:.1f}m ({self.target_zone or '防区内'}) | "
             f"滞留徘徊: {dwell_txt} | "
             f"行为: {self.description}"
@@ -225,6 +235,8 @@ class ThreatEventRecord:
             },
             "target": {
                 "category": self.target_category,
+                "species": self.species,
+                "species_cn": self.species_cn,
                 "track_id": self.target_id,
                 "session_id": self.person_session_id,
                 "distance_m": round(self.target_distance, 2),
@@ -250,11 +262,16 @@ class ThreatEventRecord:
     def format_audit_card(self) -> str:
         """生成人类一目了然的高可读性事件审计卡片"""
         time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.timestamp))
+        target_display = self.target_category
+        if self.species_cn:
+            target_display += f" ({self.species_cn})"
+        elif self.species:
+            target_display += f" ({self.species})"
         lines = [
             f"┌─【事件报告: {self.event_id}】" + "─" * 45,
             f"│ 威胁等级     : {self.threat_level.value} (模式: {self.operating_mode.value})",
             f"│ 触发时间     : {time_str} (时间戳: {self.timestamp:.3f})",
-            f"│ 目标属性     : 类别={self.target_category} | ID={self.target_id} | 会话={self.person_session_id or '无'} | 白名单={'是' if self.is_whitelisted else '否'}",
+            f"│ 目标属性     : 类别={target_display} | ID={self.target_id} | 会话={self.person_session_id or '无'} | 白名单={'是' if self.is_whitelisted else '否'}",
             f"│ 空间与运动   : 距离={self.target_distance:.1f}m ({self.target_zone}) | 径向速度={self.target_radial_speed:+.1f}m/s",
             f"│ 徘徊滞留时长 : {self.target_dwell_time:.1f} 秒 (防区内持续累积)",
             f"│ 行为与接触   : 动作={self.action_type.value} | 物理接触={'是 (已联合确认)' if self.has_contact_signal else '否 (纯视觉)'}",

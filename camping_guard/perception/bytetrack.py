@@ -132,8 +132,9 @@ class STrack:
         self.face_id_name: Optional[str] = None
         self.reid_feature: Optional[Any] = None
         self.keypoints: Optional[Dict[str, Tuple[float, float]]] = None
-        self.last_pose_time: float = 0.0
         self.association_version: int = 1
+        self.species: Optional[str] = None
+        self.species_cn: Optional[str] = None
 
     @property
     def tlwh(self) -> Tuple[float, float, float, float]:
@@ -157,6 +158,10 @@ class STrack:
         self.mean, self.covariance = self.kalman.update(self.mean, self.covariance, measurement)
         self.score = new_track.score
         self.category = new_track.category
+        if getattr(new_track, 'species', None):
+            self.species = new_track.species
+        if getattr(new_track, 'species_cn', None):
+            self.species_cn = new_track.species_cn
         self.state = 1
         self.is_activated = True
 
@@ -215,6 +220,8 @@ class ByteTracker:
             cat = d.get('category', 'person')
             bbox = tuple(d['bbox'])
             st = STrack(bbox, conf, cat, current_time=current_time)
+            st.species = d.get('species')
+            st.species_cn = d.get('species_cn')
             if conf >= self.high_thresh:
                 high_dets.append(st)
             elif conf >= self.low_thresh:
@@ -358,7 +365,9 @@ class ByteTracker:
                 face_id_name=st.face_id_name,
                 reid_feature=st.reid_feature,
                 association_version=st.association_version,
-                velocity_pixel=(vx, vy)
+                velocity_pixel=(vx, vy),
+                species=getattr(st, 'species', None),
+                species_cn=getattr(st, 'species_cn', None)
             )
             output_entities.append(entity)
 

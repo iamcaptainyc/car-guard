@@ -46,7 +46,8 @@ class CampingGuardEngine:
         distance_estimator: Optional[GroundDistanceEstimator] = None,
         calib: Optional[VehicleCalibration] = None,
         profiler: Optional[PipelineProfiler] = None,
-        use_tensorrt: bool = False
+        use_tensorrt: bool = False,
+        animal_classifier: Optional[Any] = None
     ):
         # 0. 载入整车标定参数配置 (解耦 JSON 配置形式)
         if calib is not None:
@@ -110,9 +111,24 @@ class CampingGuardEngine:
         self.vehicle_bus = MockVehicleBus()
         self.actuator = VehicleActuator()
 
+        self.animal_classifier = animal_classifier
+        if self.animal_classifier is None:
+            try:
+                from camping_guard.perception.animal_classifier import AnimalClassifier
+                self.animal_classifier = AnimalClassifier(use_trt=self.use_tensorrt)
+            except Exception:
+                pass
+
+        if self.detector is not None and getattr(self.detector, 'animal_classifier', None) is None:
+            if hasattr(self.detector, 'animal_classifier'):
+                self.detector.animal_classifier = self.animal_classifier
+
         # 注册模型元数据至 profiler (保持 key 与执行期 profile_model("...") 完全一致)
         if self.detector and hasattr(self.detector, 'model_path'):
-            self.profiler.register_model_metadata("YOLO11n-Det", self.detector.model_path, "S1全图目标检测初筛 (640x480)")
+            det_label = "MegaDetector" if getattr(self.detector, 'is_megadetector', False) else "YOLO11n-Det"
+            self.profiler.register_model_metadata(det_label, self.detector.model_path, "S1全图目标检测初筛 (640x480)")
+        if self.animal_classifier and getattr(self.animal_classifier, 'model_path', None) and getattr(self.animal_classifier, 'session', None) is not None:
+            self.profiler.register_model_metadata("MobileNetV3-AnimalCls", self.animal_classifier.model_path, "MegaDetector二级动物细分类 (224x224)")
         if self.pose_estimator and hasattr(self.pose_estimator, 'model_path'):
             self.profiler.register_model_metadata("RTMPose-s", self.pose_estimator.model_path, "Zone2/3人员姿态与17骨骼点提取")
         if self.reid_extractor and hasattr(self.reid_extractor, 'model_path'):
@@ -176,6 +192,10 @@ class CampingGuardEngine:
         # 性能剖析启动当帧采样
         self._frame_count += 1
         self.profiler.start_frame(self._frame_count)
+
+        # 兼容用户直接传入单个 numpy ndarray 的情况
+        if isinstance(camera_frames, np.ndarray):
+            camera_frames = {0: camera_frames}
 
         # 0. 自动获取视频流 (若未显式传入且配置了 StreamManager)
         if not camera_frames and self.stream_manager is not None:
@@ -304,7 +324,9 @@ class CampingGuardEngine:
                         'bbox': bbox_obj,
                         'dist': dist,
                         'radial_speed': vr,
-                        'zone': zone
+                        'zone': zone,
+                        'species': d.get('species'),
+                        'species_cn': d.get('species_cn')
                     })
                 self.active_targets = self.track_mgr.update_tracks(
                     processed_dets,
@@ -483,6 +505,8 @@ class CampingGuardEngine:
 
         # 提取目标全生命周期画像 (类别、ID、空间距离、关键滞留时长)
         tgt_cat = target_for_threat.category if target_for_threat else "unknown"
+        tgt_species = getattr(target_for_threat, 'species', None)
+        tgt_species_cn = getattr(target_for_threat, 'species_cn', None)
         tgt_dist = target_for_threat.ground_dist if target_for_threat else 0.0
         tgt_dwell = target_for_threat.cumulative_dwell_time if target_for_threat else 0.0
         tgt_vr = target_for_threat.radial_speed if target_for_threat else 0.0
@@ -502,6 +526,8 @@ class CampingGuardEngine:
             target_id=target_for_threat.track_id if target_for_threat else None,
             has_contact_signal=has_contact_confirmed,
             target_category=tgt_cat,
+            species=tgt_species,
+            species_cn=tgt_species_cn,
             target_distance=tgt_dist,
             target_dwell_time=tgt_dwell,
             target_radial_speed=tgt_vr,

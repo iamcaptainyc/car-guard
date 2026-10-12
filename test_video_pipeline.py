@@ -710,7 +710,8 @@ def run_video_pipeline(
     edgellm_dir: Optional[str] = None,
     build_dir: Optional[str] = None,
     vlm_timeout: float = 35.0,
-    vlm_max_tokens: int = 128
+    vlm_max_tokens: int = 128,
+    cls_onnx_path: Optional[str] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -790,15 +791,29 @@ def run_video_pipeline(
     print("   [q/ESC] 退出程序并安全保存输出视频")
     print("=" * 70)
 
-    # 1. 目标检测器初始化 (支持自动发现/手动加载用户提供的 YOLO ONNX 模型)
+    # 1. 目标检测器初始化 (支持自动发现/手动加载 YOLO 与 MegaDetector 模型)
     detector = None
     chosen_detector_path = detector_onnx_path
 
-    # 支持用户仅传入模型文件名 (自动在 models/yolo/ 或当前目录检索)
-    if chosen_detector_path and not os.path.exists(chosen_detector_path):
-        sub_cand = os.path.join("models", "yolo", chosen_detector_path)
-        if os.path.exists(sub_cand):
-            chosen_detector_path = sub_cand
+    # 支持用户传入 megadetector 别名或仅传入模型文件名 (自动在 models/megadetector/, models/yolo/ 或当前目录检索)
+    if chosen_detector_path:
+        cp_lower = str(chosen_detector_path).lower()
+        if cp_lower in ["megadetector", "mdv", "mdv6"]:
+            for md_cand in [
+                "models/megadetector/MDV6-yolov10-c.engine",
+                "models/megadetector/MDV6-yolov10-c.onnx",
+                "models/yolo/MDV6-yolov10-c.engine",
+                "models/yolo/MDV6-yolov10-c.onnx"
+            ]:
+                if os.path.exists(md_cand):
+                    chosen_detector_path = md_cand
+                    break
+        elif not os.path.exists(chosen_detector_path):
+            for search_dir in ["models/megadetector", "models/yolo", "models"]:
+                sub_cand = os.path.join(search_dir, chosen_detector_path)
+                if os.path.exists(sub_cand):
+                    chosen_detector_path = sub_cand
+                    break
 
     if not chosen_detector_path:
         # 优先使用在车周视角人体与车辆检测能力最强的高召回通用模型
@@ -809,6 +824,8 @@ def run_video_pipeline(
                 "models/yolo/yolo11n.engine",
                 "models/yolo/yolo11n-fisheye.engine",
                 "models/yolo/yolo26n.engine",
+                "models/megadetector/MDV6-yolov10-c.engine",
+                "models/yolo/MDV6-yolov10-c.engine",
                 "yolo11s.engine",
                 "yolo11n.engine"
             ])
@@ -821,6 +838,8 @@ def run_video_pipeline(
             "models/yolo/yolo11n-fisheye.onnx", # 俯视交通鱼眼模型 (Fisheye8K)
             "models/yolo/yolov8n-fisheye.onnx",
             "models/yolo/yolo11x-fisheye.onnx",
+            "models/megadetector/MDV6-yolov10-c.onnx",
+            "models/yolo/MDV6-yolov10-c.onnx",
             "yolo11s.onnx",
             "yolo11n.onnx"
         ])
@@ -835,13 +854,36 @@ def run_video_pipeline(
             if eng_cand.is_file():
                 chosen_detector_path = str(eng_cand)
 
+    # 1.1 二级动物细分类器初始化 (按需用于 MegaDetector 检出 animal 时的物种研判)
+    chosen_cls_path = cls_onnx_path
+    if chosen_cls_path and not os.path.exists(chosen_cls_path):
+        for search_dir in ["models/cls", "models"]:
+            sub_cand = os.path.join(search_dir, chosen_cls_path)
+            if os.path.exists(sub_cand):
+                chosen_cls_path = sub_cand
+                break
+
+    animal_classifier = None
+    try:
+        from camping_guard.perception.animal_classifier import AnimalClassifier
+        animal_classifier = AnimalClassifier(model_path=chosen_cls_path, use_trt=use_trt)
+    except Exception as e:
+        pass
+
     if chosen_detector_path and os.path.exists(chosen_detector_path):
         tag = "[TensorRT Engine]" if str(chosen_detector_path).endswith(".engine") else "[ONNX]"
-        print(f"[*] 正在挂载 YOLO 目标检测模型 {tag}: {chosen_detector_path} (置信度阈值: {conf_threshold:.2f})")
-        detector = ONNXObjectDetector(model_path=chosen_detector_path, conf_threshold=conf_threshold, use_trt=use_trt)
+        is_md = "mdv" in str(chosen_detector_path).lower() or "megadetector" in str(chosen_detector_path).lower()
+        model_type_str = "MegaDetector" if is_md else "YOLO"
+        print(f"[*] 正在挂载 {model_type_str} 目标检测模型 {tag}: {chosen_detector_path} (置信度阈值: {conf_threshold:.2f})")
+        detector = ONNXObjectDetector(
+            model_path=chosen_detector_path,
+            conf_threshold=conf_threshold,
+            use_trt=use_trt,
+            animal_classifier=animal_classifier
+        )
     else:
-        print("[i] 提示: 未指定且未找到 YOLO 模型，系统将启用【车身固定 ROI MOG2 局部微动守护】模式")
-        print("    (若需全图人体检测，可传入 --detector yolo11n-fisheye.onnx / yolo11s.onnx / yolov8m.onnx)")
+        print("[i] 提示: 未指定且未找到 YOLO/MegaDetector 模型，系统将启用【车身固定 ROI MOG2 局部微动守护】模式")
+        print("    (若需全图检测，可传入 --detector yolo11s.onnx / MDV6-yolov10-c.onnx)")
 
     # 2. 姿态估计器初始化
     pose_estimator = None
@@ -887,7 +929,8 @@ def run_video_pipeline(
         distance_estimator=dist_estimator,
         use_bytetrack=True,
         profiler=profiler,
-        use_tensorrt=use_trt
+        use_tensorrt=use_trt,
+        animal_classifier=animal_classifier
     )
     success, msg = engine.activate()
     print(f"[*] 系统激活状态: {msg}")
@@ -1564,6 +1607,8 @@ def main():
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
     parser.add_argument("--vlm-max-tokens", type=int, default=128,
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
+    parser.add_argument("--cls", "--animal-cls", dest="cls_model", type=str, default=None,
+                        help="二级动物细分类模型文件或路径 (支持自动在 models/cls/ 查找，如 mobilenetv3-large.onnx / mobilenetv3-large.engine)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1600,7 +1645,8 @@ def main():
         edgellm_dir=args.edgellm_dir,
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
-        vlm_max_tokens=args.vlm_max_tokens
+        vlm_max_tokens=args.vlm_max_tokens,
+        cls_onnx_path=args.cls_model
     )
 
 

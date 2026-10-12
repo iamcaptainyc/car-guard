@@ -7,6 +7,7 @@ import time
 import json
 import shutil
 import tempfile
+import hashlib
 from pathlib import Path
 import numpy as np
 import cv2
@@ -523,5 +524,123 @@ def test_trt_edgellm_split_engine_discovery():
         assert backend_none._resolved_edgellm_bin is None
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_evidence_recorder_restart_continuity():
+    """测试阶段 4.7：验证 EvidenceRecorder 跨会话/跨进程重启后哈希链不断裂且无缝衔接"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        now = time.time()
+
+        # 第 1 次启动：记录事件 0
+        rec1 = EvidenceRecorder(buffer_duration_sec=2.0, fps=5.0, storage_dir=temp_dir)
+        rec1.push_frame(dummy_frame, now)
+        rec1.lock_event_clip("EVT_RUN1_000", "L2 预警", now, pre_duration_sec=0.5, post_duration_sec=0.1)
+        rec1.push_frame(dummy_frame, now + 0.2)
+        assert len(rec1.manifest) == 1
+        h0 = rec1.manifest[0]["block_hash"]
+        rec1.flush()
+
+        # 第 2 次启动 (模拟守护进程重启或下一次运行)
+        rec2 = EvidenceRecorder(buffer_duration_sec=2.0, fps=5.0, storage_dir=temp_dir)
+        assert len(rec2.manifest) == 1
+        assert rec2.prev_hash == h0
+
+        # 在新会话中记录事件 1
+        t2 = now + 10.0
+        rec2.push_frame(dummy_frame, t2)
+        rec2.lock_event_clip("EVT_RUN2_001", "L3 紧急", t2, pre_duration_sec=0.5, post_duration_sec=0.1)
+        rec2.push_frame(dummy_frame, t2 + 0.2)
+        rec2.flush()
+
+        assert len(rec2.manifest) == 2
+        assert rec2.manifest[1]["payload"]["block_index"] == 1
+        assert rec2.manifest[1]["payload"]["prev_hash"] == h0
+        h1 = rec2.manifest[1]["block_hash"]
+
+        # 第 3 次启动：再记录事件 2
+        rec3 = EvidenceRecorder(buffer_duration_sec=2.0, fps=5.0, storage_dir=temp_dir)
+        assert len(rec3.manifest) == 2
+        assert rec3.prev_hash == h1
+
+        t3 = now + 20.0
+        rec3.push_frame(dummy_frame, t3)
+        rec3.lock_event_clip("EVT_RUN3_002", "L1 提示", t3, pre_duration_sec=0.5, post_duration_sec=0.1)
+        rec3.push_frame(dummy_frame, t3 + 0.2)
+        rec3.flush()
+
+        assert len(rec3.manifest) == 3
+        assert rec3.manifest[2]["payload"]["block_index"] == 2
+        assert rec3.manifest[2]["payload"]["prev_hash"] == h1
+
+        # 终极审计验证
+        is_valid, msg, bad_idx = rec3.verify_hash_chain()
+        assert is_valid is True
+        assert bad_idx is None
+        assert "完整性验证通过" in msg
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_evidence_recorder_auto_heal_legacy_break():
+    """测试阶段 4.8：验证对历史断裂清单 (旧版本跨进程重启遗留的多个 GENESIS_HASH) 自动自愈重签"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        manifest_file = Path(temp_dir) / "evidence_manifest.jsonl"
+        # 构造模拟历史故障断裂数据 (与用户日志完全一致的错误链)
+        payload0 = {
+            "block_index": 0, "event_id": "EVT_OLD_0", "threat_level": "L2 预警",
+            "trigger_time": 1000.0, "clock_source": "GNSS_PPS_SYNC",
+            "prev_hash": "GENESIS_BLOCK_HASH_CAMPING_GUARD_2026",
+            "video_file_name": "EVT_OLD_0.mp4", "video_file_sha256": "fake0"
+        }
+        h0 = hashlib.sha256(json.dumps(payload0, sort_keys=True).encode("utf-8")).hexdigest()
+
+        # 区块 1 错误地记录了 GENESIS_HASH (旧版重启缺陷)
+        payload1_broken = {
+            "block_index": 0, "event_id": "EVT_OLD_1", "threat_level": "L3 紧急",
+            "trigger_time": 1050.0, "clock_source": "GNSS_PPS_SYNC",
+            "prev_hash": "GENESIS_BLOCK_HASH_CAMPING_GUARD_2026",
+            "video_file_name": "EVT_OLD_1.mp4", "video_file_sha256": "fake1"
+        }
+        h1_broken = hashlib.sha256(json.dumps(payload1_broken, sort_keys=True).encode("utf-8")).hexdigest()
+
+        # 区块 2 链接到了 h1_broken
+        payload2 = {
+            "block_index": 1, "event_id": "EVT_OLD_2", "threat_level": "L1 提示",
+            "trigger_time": 1100.0, "clock_source": "GNSS_PPS_SYNC",
+            "prev_hash": h1_broken,
+            "video_file_name": "EVT_OLD_2.mp4", "video_file_sha256": "fake2"
+        }
+        h2 = hashlib.sha256(json.dumps(payload2, sort_keys=True).encode("utf-8")).hexdigest()
+
+        # 写入历史故障文件
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"block_hash": h0, "payload": payload0}) + "\n")
+            f.write(json.dumps({"block_hash": h1_broken, "payload": payload1_broken}) + "\n")
+            f.write(json.dumps({"block_hash": h2, "payload": payload2}) + "\n")
+
+        # 启动 Recorder，应触发自愈修复
+        recorder = EvidenceRecorder(storage_dir=temp_dir)
+        assert len(recorder.manifest) == 3
+        # 验证备份文件已创建
+        assert (Path(temp_dir) / "evidence_manifest.jsonl.bak").exists()
+
+        # 验证修复后的区块 1 prev_hash 为区块 0 的哈希
+        assert recorder.manifest[1]["payload"]["prev_hash"] == recorder.manifest[0]["block_hash"]
+        assert recorder.manifest[1]["payload"]["block_index"] == 1
+        # 验证区块 2 prev_hash 为修复后的区块 1 哈希
+        assert recorder.manifest[2]["payload"]["prev_hash"] == recorder.manifest[1]["block_hash"]
+        assert recorder.manifest[2]["payload"]["block_index"] == 2
+
+        # 验证审计全面通过
+        is_valid, msg, bad_idx = recorder.verify_hash_chain()
+        assert is_valid is True
+        assert bad_idx is None
+        assert "完整性验证通过" in msg
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 

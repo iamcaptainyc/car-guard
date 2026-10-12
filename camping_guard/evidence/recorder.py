@@ -156,6 +156,91 @@ class EvidenceRecorder:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_file = self.storage_dir / "evidence_manifest.jsonl"
 
+        # 加载既有存证清单与同步哈希链状态
+        self._load_and_sync_manifest()
+
+    def _load_and_sync_manifest(self):
+        """
+        从存储中加载既有存证清单，恢复防篡改哈希链末端状态，
+        并对历史版本因跨进程重启引发的链条断裂进行自愈修复
+        """
+        if not self.manifest_file.exists():
+            return
+
+        entries = []
+        try:
+            with open(self.manifest_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entries.append(json.loads(line))
+        except Exception as e:
+            print(f"[EvidenceRecorder] 读取存证清单文件异常: {e}")
+            return
+
+        if not entries:
+            return
+
+        # 检查是否存在旧版本重启缺陷 (多个 block_index=0 且 prev_hash=GENESIS_HASH)
+        needs_heal = False
+        for idx, entry in enumerate(entries):
+            payload = entry.get("payload", {})
+            if idx > 0 and payload.get("prev_hash") == self.GENESIS_HASH and payload.get("block_index") == 0:
+                needs_heal = True
+                break
+
+        if needs_heal:
+            print("[EvidenceRecorder] 发现历史版本跨进程重启导致的断裂区块，正在执行哈希链自愈修复...")
+            try:
+                import shutil
+                bak_path = self.manifest_file.with_suffix(".jsonl.bak")
+                if not bak_path.exists():
+                    shutil.copy(self.manifest_file, bak_path)
+
+                cur_prev = self.GENESIS_HASH
+                healed_entries = []
+                for idx, entry in enumerate(entries):
+                    payload = entry.get("payload", {})
+                    payload["block_index"] = idx
+                    payload["prev_hash"] = cur_prev
+                    new_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+                    entry["block_hash"] = new_hash
+                    cur_prev = new_hash
+                    healed_entries.append(entry)
+
+                with open(self.manifest_file, "w", encoding="utf-8") as f:
+                    for he in healed_entries:
+                        f.write(json.dumps(he, ensure_ascii=False) + "\n")
+                entries = healed_entries
+                print(f"[EvidenceRecorder] 哈希链自愈修复完成！共修复并重签 {len(entries)} 个区块。")
+            except Exception as ex:
+                print(f"[EvidenceRecorder] 哈希链自愈修复异常: {ex}")
+
+        self.manifest = entries
+        if self.manifest:
+            self.prev_hash = self.manifest[-1].get("block_hash", self.GENESIS_HASH)
+            for item in self.manifest:
+                payload = item.get("payload", {})
+                ev_id = payload.get("event_id")
+                if not any(ev.get("event_id") == ev_id for ev in self.locked_evidence):
+                    vid_name = payload.get("video_file_name", "")
+                    self.locked_evidence.append({
+                        "event_id": ev_id,
+                        "threat_level": payload.get("threat_level", ""),
+                        "trigger_time": payload.get("trigger_time", 0.0),
+                        "video_path": str(self.storage_dir / vid_name) if vid_name else "",
+                        "video_file_sha256": payload.get("video_file_sha256", ""),
+                        "block_hash": item.get("block_hash", ""),
+                        "clock_source": payload.get("clock_source", ""),
+                        "total_frames": payload.get("total_frame_count", 0),
+                        "is_locked": True,
+                        "target": payload.get("target", {}),
+                        "behavior": payload.get("behavior", {}),
+                        "vlm_summary": payload.get("vlm_summary", ""),
+                        "executed_actions": payload.get("executed_actions", []),
+                        "payload": payload
+                    })
+
     def _async_encode_worker(self):
         """后台独立工作线程：从队列消费待持久化的切片，执行视频编码与哈希计算"""
         while True:
@@ -229,6 +314,8 @@ class EvidenceRecorder:
         if event_record is not None:
             meta = {
                 "target_category": getattr(event_record, "target_category", "unknown"),
+                "target_species": getattr(event_record, "species", None),
+                "target_species_cn": getattr(event_record, "species_cn", None),
                 "target_id": getattr(event_record, "target_id", None),
                 "person_session_id": getattr(event_record, "person_session_id", None),
                 "target_distance_m": getattr(event_record, "target_distance", 0.0),
@@ -361,6 +448,8 @@ class EvidenceRecorder:
                 # 语义审计核心字段
                 "target": {
                     "category": meta.get("target_category", "unknown"),
+                    "species": meta.get("target_species"),
+                    "species_cn": meta.get("target_species_cn"),
                     "track_id": meta.get("target_id"),
                     "session_id": meta.get("person_session_id"),
                     "is_whitelisted": meta.get("is_whitelisted", False),
@@ -407,6 +496,11 @@ class EvidenceRecorder:
 
             clip_duration_sec = len(resampled_frames) / max(self.fps, 1.0)
             log_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(pending.trigger_time))
+            tgt_display = meta.get('target_category', 'unknown')
+            if meta.get('target_species_cn'):
+                tgt_display += f" ({meta.get('target_species_cn')})"
+            elif meta.get('target_species'):
+                tgt_display += f" ({meta.get('target_species')})"
             human_log = (
                 f"\n================================================================================\n"
                 f" 🛡️ 车载露营守卫 - 事件审计卡片 (Block #{block_index})\n"
@@ -414,7 +508,7 @@ class EvidenceRecorder:
                 f" 事件编号       : {pending.event_id}\n"
                 f" 触发时间       : {log_time_str} ({formatted_iso_time})\n"
                 f" 威胁等级       : {pending.threat_level_str} | 运行模式: {meta.get('operating_mode', '未知')}\n"
-                f" 目标主体       : {meta.get('target_category', 'unknown')} (Track ID: {meta.get('target_id', '-')}, 会话: {meta.get('person_session_id') or '无'}) | 白名单: {'是' if meta.get('is_whitelisted') else '否'}\n"
+                f" 目标主体       : {tgt_display} (Track ID: {meta.get('target_id', '-')}, 会话: {meta.get('person_session_id') or '无'}) | 白名单: {'是' if meta.get('is_whitelisted') else '否'}\n"
                 f" 空间与测距     : 距离: {dist_m:.1f}m ({meta.get('target_zone', '防区内')}) | 相对速度: {vr_mps:+.1f} m/s\n"
                 f" 徘徊/滞留时间  : {dwell_sec:.1f} 秒 (防区内持续累积)\n"
                 f" 行为与接触     : {meta.get('action_type', '')} ({meta.get('description', '')}) | 物理接触: {'是 (已联合确认)' if meta.get('has_contact_signal') else '否'}\n"

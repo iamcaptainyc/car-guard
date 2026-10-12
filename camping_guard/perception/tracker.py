@@ -58,6 +58,10 @@ class TargetTrackManager:
                 entity.zone = det['zone']
                 entity.confidence = det['conf']
                 entity.cumulative_dwell_time += dt
+                if det.get('species'):
+                    entity.species = det.get('species')
+                if det.get('species_cn'):
+                    entity.species_cn = det.get('species_cn')
 
                 # 全局会话时长同步
                 if self.session_manager and entity.track_uid:
@@ -91,7 +95,9 @@ class TargetTrackManager:
                     first_seen_time=current_time,
                     last_seen_time=current_time,
                     cumulative_dwell_time=initial_dwell,
-                    track_uid=track_uid
+                    track_uid=track_uid,
+                    species=det.get('species'),
+                    species_cn=det.get('species_cn')
                 )
 
                 # 如果是人员目标且启用了 ReID，执行特征提取与全局人员会话关联

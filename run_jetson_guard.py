@@ -68,9 +68,11 @@ def check_and_recommend_power_mode():
 
 
 def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optional[Path]]:
-    """检查系统所需的 5 大核心 TensorRT Engine 模型文件"""
+    """检查系统所需的各核心 TensorRT Engine / ONNX 模型文件"""
     engine_status = {
         "yolo": None,
+        "megadetector": None,
+        "cls": None,
         "pose": None,
         "reid": None,
         "face_det": None,
@@ -89,6 +91,30 @@ def check_required_engines(models_dir: Path = Path("models")) -> Dict[str, Optio
     for c in yolo_cands:
         if c.is_file():
             engine_status["yolo"] = c
+            break
+
+    # 1.1 MegaDetector 野生动物与人车检测器
+    md_cands = [
+        models_dir / "megadetector" / "MDV6-yolov10-c.engine",
+        models_dir / "yolo" / "MDV6-yolov10-c.engine",
+        models_dir / "megadetector" / "MDV6-yolov10-c.onnx",
+        models_dir / "yolo" / "MDV6-yolov10-c.onnx",
+    ]
+    for c in md_cands:
+        if c.is_file():
+            engine_status["megadetector"] = c
+            break
+
+    # 1.2 二级动物细分类器 (MobileNetV3)
+    cls_cands = [
+        models_dir / "cls" / "mobilenetv3-large.engine",
+        models_dir / "cls" / "mobilenetv3.engine",
+        models_dir / "cls" / "mobilenetv3-large.onnx",
+        models_dir / "cls" / "mobilenetv3.onnx",
+    ]
+    for c in cls_cands:
+        if c.is_file():
+            engine_status["cls"] = c
             break
 
     # 2. RTMPose 人体姿态
@@ -172,6 +198,10 @@ def main():
                         help="全车标定配置文件 (默认: vehicle_calib.json)")
     parser.add_argument("--detector", type=str, default=None,
                         help="显式指定 YOLO .engine 模型路径 (如 models/yolo/yolo11n.engine)")
+    parser.add_argument("--megadetector", type=str, default=None,
+                        help="显式指定 MegaDetector 模型路径 (如 models/megadetector/MDV6-yolov10-c.engine)")
+    parser.add_argument("--cls", "--animal-cls", dest="cls_model", type=str, default=None,
+                        help="显式指定二级动物细分类模型路径 (如 models/cls/mobilenetv3-large.engine，默认自动发现)")
     parser.add_argument("--pose", type=str, default=None,
                         help="显式指定 RTMPose .engine 模型路径 (如 models/pose/rtmpose-s.engine)")
     parser.add_argument("--conf", type=float, default=0.25, help="检测置信度阈值 (默认 0.25)")
@@ -254,12 +284,15 @@ def main():
 
     show_sb = args.sidebar and not args.no_sidebar
 
+    chosen_det = args.megadetector or args.detector or (str(engines["yolo"]) if engines["yolo"] else (str(engines["megadetector"]) if engines["megadetector"] else None))
+    chosen_cls = args.cls_model or (str(engines["cls"]) if engines["cls"] else None)
+
     print("\n[*] 正在启动车载露营守卫 (TensorRT 模式)...")
     run_video_pipeline(
         video_path=video_source,
         config_path=args.config,
         camera_id=args.camera_id,
-        detector_onnx_path=args.detector or (str(engines["yolo"]) if engines["yolo"] else None),
+        detector_onnx_path=chosen_det,
         pose_onnx_path=args.pose or (str(engines["pose"]) if engines["pose"] else None),
         conf_threshold=args.conf,
         show_sidebar=show_sb,
@@ -276,7 +309,8 @@ def main():
         edgellm_dir=args.edgellm_dir,
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
-        vlm_max_tokens=args.vlm_max_tokens
+        vlm_max_tokens=args.vlm_max_tokens,
+        cls_onnx_path=chosen_cls
     )
 
 

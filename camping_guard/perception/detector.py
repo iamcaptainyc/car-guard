@@ -8,7 +8,7 @@ import abc
 import os
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 class BaseObjectDetector(abc.ABC):
     @abc.abstractmethod
@@ -21,19 +21,21 @@ class BaseObjectDetector(abc.ABC):
 
 
 class ONNXObjectDetector(BaseObjectDetector):
-    """基于 ONNXRuntime / TensorRT Engine 的车载轻量 YOLO 检测引擎"""
+    """基于 ONNXRuntime / TensorRT Engine 的车载轻量 YOLO / MegaDetector 检测引擎"""
     def __init__(
         self,
         model_path: str,
         input_size: Tuple[int, int] = (640, 640),
         conf_threshold: float = 0.25,
-        use_trt: bool = False
+        use_trt: bool = False,
+        animal_classifier: Optional[Any] = None
     ):
         self.model_path = model_path
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.session = None
         self.backend = "unknown"
+        self.animal_classifier = animal_classifier
 
         # COCO 类别映射到露营守卫规范类别
         self.coco_to_guard_map = {
@@ -53,6 +55,17 @@ class ONNXObjectDetector(BaseObjectDetector):
             4: 'car',     # truck
             1: 'car'      # bike
         }
+
+        # 专有野生动物/通用 MegaDetector 类别映射 (0: animal, 1: person, 2: vehicle)
+        self.megadetector_to_guard_map = {
+            0: 'animal',
+            1: 'person',
+            2: 'car'
+        }
+
+        # 判定是否为 MegaDetector 专用模型
+        mpath_str = str(model_path).lower()
+        self.is_megadetector = ("mdv" in mpath_str or "megadetector" in mpath_str)
 
         is_engine = str(model_path).lower().endswith(".engine")
         if os.path.exists(model_path) or is_engine:
@@ -82,6 +95,27 @@ class ONNXObjectDetector(BaseObjectDetector):
                         print(f"[ONNXObjectDetector] 初始化 ONNX 失败: {ex}")
                 else:
                     print(f"[ObjectDetector] 初始化模型失败: {e}")
+
+        # 补充通过 metadata 探测 MegaDetector
+        if not self.is_megadetector and self.session is not None and hasattr(self.session, "get_modelmeta"):
+            try:
+                meta = self.session.get_modelmeta().custom_metadata_map
+                names_str = str(meta.get("names", ""))
+                desc_str = str(meta.get("description", "")).lower()
+                if "0: 'animal'" in names_str or "animal" in names_str or "megadb" in desc_str:
+                    self.is_megadetector = True
+            except Exception:
+                pass
+
+        # 若当前为 MegaDetector 且尚未挂载动物分类器，尝试自动挂载 models/cls 下的模型
+        if self.is_megadetector and self.animal_classifier is None:
+            try:
+                from camping_guard.perception.animal_classifier import AnimalClassifier
+                self.animal_classifier = AnimalClassifier(use_trt=use_trt)
+                if self.animal_classifier.session is not None:
+                    print(f"[ObjectDetector] 已为 MegaDetector 自动级联挂载二级动物细分类器: {self.animal_classifier.model_path}")
+            except Exception as e:
+                pass
 
     def letterbox(self, img: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)):
         shape = img.shape[:2]
@@ -130,9 +164,16 @@ class ONNXObjectDetector(BaseObjectDetector):
         class_ids = np.argmax(scores[mask], axis=1)
         confidences = confidences[mask]
 
-        # 自适应根据输出通道维度判断分类字典 (COCO 80类 vs Fisheye8K 5类)
+        # 自适应根据输出通道维度判断分类字典 (MegaDetector 3类 vs Fisheye8K 5类 vs COCO 80类)
+        is_megadetector = getattr(self, 'is_megadetector', False) or (scores.shape[1] == 3)
         is_fisheye_5cls = (scores.shape[1] == 5)
-        cls_map = self.fisheye_to_guard_map if is_fisheye_5cls else self.coco_to_guard_map
+
+        if is_megadetector:
+            cls_map = self.megadetector_to_guard_map
+        elif is_fisheye_5cls:
+            cls_map = self.fisheye_to_guard_map
+        else:
+            cls_map = self.coco_to_guard_map
 
         # 转换为 (x, y, w, h) 并做坐标还原
         detections = []
@@ -149,13 +190,34 @@ class ONNXObjectDetector(BaseObjectDetector):
             w = max(5, min(w0 - x, int(w)))
             h = max(5, min(h0 - y, int(h)))
 
-            category = cls_map.get(int(cid), 'unknown')
-            if category != 'unknown':
-                detections.append({
-                    'bbox': (x, y, w, h),
-                    'category': category,
-                    'conf': float(score)
-                })
+            base_cat = cls_map.get(int(cid), 'unknown')
+            if base_cat == 'unknown':
+                continue
+
+            category = base_cat
+            species_en = None
+            species_cn = None
+            cls_conf = None
+
+            # 核心策略：仅在调用 MegaDetector 且识别到 animal 类目标时，调用二级动物细分类器
+            if is_megadetector and base_cat == 'animal':
+                if self.animal_classifier is not None:
+                    crop = frame[y:y+h, x:x+w]
+                    category, cls_conf, species_en, species_cn = self.animal_classifier.classify(crop)
+                else:
+                    category = 'small_animal'
+
+            det_item = {
+                'bbox': (x, y, w, h),
+                'category': category,
+                'conf': float(score)
+            }
+            if species_en is not None:
+                det_item['species'] = species_en
+                det_item['species_cn'] = species_cn
+                det_item['cls_conf'] = cls_conf
+
+            detections.append(det_item)
 
         return self._apply_nms(detections, iou_threshold=0.45, score_threshold=eff_conf)
 
@@ -190,12 +252,19 @@ class SyntheticDetector(BaseObjectDetector):
 
 
 class TRTObjectDetector(ONNXObjectDetector):
-    """TensorRT 专用 YOLO 目标检测引擎 (适用 Jetson Orin)"""
+    """TensorRT 专用 YOLO / MegaDetector 目标检测引擎 (适用 Jetson Orin)"""
     def __init__(
         self,
         model_path: str,
         input_size: Tuple[int, int] = (640, 640),
-        conf_threshold: float = 0.25
+        conf_threshold: float = 0.25,
+        animal_classifier: Optional[Any] = None
     ):
-        super().__init__(model_path=model_path, input_size=input_size, conf_threshold=conf_threshold, use_trt=True)
+        super().__init__(
+            model_path=model_path,
+            input_size=input_size,
+            conf_threshold=conf_threshold,
+            use_trt=True,
+            animal_classifier=animal_classifier
+        )
 
