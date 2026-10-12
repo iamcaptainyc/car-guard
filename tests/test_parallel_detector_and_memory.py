@@ -49,6 +49,8 @@ def test_parallel_ensemble_detector_concurrency_and_merge():
 
     ensemble = ParallelEnsembleDetector(main_detector=main_det, fire_detector=fire_det)
 
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
     # 预热线程池避免首次线程创建调度抖动
     ensemble.detect(dummy_frame)
 
