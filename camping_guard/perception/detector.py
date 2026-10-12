@@ -32,7 +32,8 @@ class ONNXObjectDetector(BaseObjectDetector):
         conf_threshold: float = 0.25,
         use_trt: bool = False,
         animal_classifier: Optional[Any] = None,
-        custom_cls_map: Optional[Dict[int, str]] = None
+        custom_cls_map: Optional[Dict[int, str]] = None,
+        profiler: Optional[Any] = None
     ):
         self.model_path = model_path
         self.input_size = input_size
@@ -41,6 +42,7 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.backend = "unknown"
         self.animal_classifier = animal_classifier
         self.custom_cls_map = custom_cls_map
+        self.profiler = profiler
 
         # COCO 类别映射到露营守卫规范类别
         self.coco_to_guard_map = {
@@ -245,7 +247,19 @@ class ONNXObjectDetector(BaseObjectDetector):
             if is_megadetector and base_cat == 'animal':
                 if self.animal_classifier is not None:
                     crop = frame[y:y+h, x:x+w]
+                    t_cls0 = time.perf_counter()
                     category, cls_conf, species_en, species_cn = self.animal_classifier.classify(crop)
+                    t_cls_ms = (time.perf_counter() - t_cls0) * 1000.0
+
+                    if getattr(self, 'profiler', None) is not None:
+                        cls_sess = getattr(self.animal_classifier, 'session', None)
+                        cls_gpu_ms = getattr(cls_sess, 'last_gpu_compute_ms', 0.0) if cls_sess else 0.0
+                        self.profiler.record_model_call(
+                            model_name="MobileNetV3-AnimalCls",
+                            duration_ms=t_cls_ms,
+                            condition="MegaDetector二级动物细分类 (224x224)",
+                            gpu_ms=cls_gpu_ms
+                        )
                 else:
                     category = 'small_animal'
 
@@ -302,7 +316,8 @@ class TRTObjectDetector(ONNXObjectDetector):
         input_size: Tuple[int, int] = (640, 640),
         conf_threshold: float = 0.25,
         animal_classifier: Optional[Any] = None,
-        custom_cls_map: Optional[Dict[int, str]] = None
+        custom_cls_map: Optional[Dict[int, str]] = None,
+        profiler: Optional[Any] = None
     ):
         super().__init__(
             model_path=model_path,
@@ -310,7 +325,8 @@ class TRTObjectDetector(ONNXObjectDetector):
             conf_threshold=conf_threshold,
             use_trt=True,
             animal_classifier=animal_classifier,
-            custom_cls_map=custom_cls_map
+            custom_cls_map=custom_cls_map,
+            profiler=profiler
         )
 
 
@@ -335,6 +351,7 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         self.max_workers = max_workers
         self.is_ensemble = True
         self.profiler_label = "Parallel-Ensemble-Det"
+        self._profiler = None
         self.profiler = profiler
 
         # 路径汇总标识 (保留双模型完整标识，避免被单个 basename 截断)
@@ -366,6 +383,18 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         if "main_detector" in self.__dict__ and hasattr(self.__dict__["main_detector"], name):
             return getattr(self.__dict__["main_detector"], name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    @property
+    def profiler(self):
+        return getattr(self, '_profiler', None)
+
+    @profiler.setter
+    def profiler(self, val):
+        self._profiler = val
+        if hasattr(self, 'main_detector') and self.main_detector is not None:
+            self.main_detector.profiler = val
+        if hasattr(self, 'fire_detector') and self.fire_detector is not None:
+            self.fire_detector.profiler = val
 
     @property
     def is_megadetector(self) -> bool:

@@ -203,3 +203,127 @@ def test_engine_integration_beast_vs_small_animal():
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_mobilenetv3_animal_cls_profiling():
+    """测试 5: 验证 MobileNetV3 动物细分类器独立耗时打点、GPU 推理时间与级联 Profiler 统计"""
+    from unittest.mock import MagicMock
+    from camping_guard.profiler import PipelineProfiler
+    from camping_guard.perception.detector import ONNXObjectDetector, ParallelEnsembleDetector
+
+    profiler = PipelineProfiler()
+
+    # 构造 ONNXObjectDetector 并设置 is_megadetector
+    detector = ONNXObjectDetector("models/megadetector/md_v5a.onnx")
+    detector.is_megadetector = True
+    detector.input_name = "images"
+
+    # Mock 主检测器 session 输出一个 animal (class_id=0)
+    mock_main_sess = MagicMock()
+    mock_main_sess.last_gpu_compute_ms = 35.5
+    # YOLO/MegaDetector output format: [1, 7, 10] -> [1, 10, 7] (cx, cy, w, h, score0, score1, score2)
+    fake_preds = np.zeros((1, 7, 10), dtype=np.float32)
+    fake_preds[0, 0, 0] = 320.0
+    fake_preds[0, 1, 0] = 240.0
+    fake_preds[0, 2, 0] = 100.0
+    fake_preds[0, 3, 0] = 100.0
+    fake_preds[0, 4, 0] = 0.95  # score for class 0 (animal)
+    mock_main_sess.run.return_value = [fake_preds]
+    detector.session = mock_main_sess
+
+    # Mock 动物分类器与 GPU 推理耗时
+    mock_classifier = MagicMock()
+    mock_cls_sess = MagicMock()
+    mock_cls_sess.last_gpu_compute_ms = 3.8
+    mock_classifier.session = mock_cls_sess
+    mock_classifier.classify.return_value = ('large_beast', 0.92, 'american_black_bear', '美洲黑熊')
+    detector.animal_classifier = mock_classifier
+
+    # 并发集成检测器挂载测试 (验证 profiler 级联属性传播)
+    ensemble = ParallelEnsembleDetector(main_detector=detector, fire_detector=None)
+    ensemble.profiler = profiler
+    assert detector.profiler is profiler, "ParallelEnsembleDetector 未能将 profiler 级联透传至 main_detector！"
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    dets = ensemble.detect(dummy_frame)
+
+    assert len(dets) == 1
+    assert dets[0]['category'] == 'large_beast'
+    assert dets[0]['species'] == 'american_black_bear'
+
+    # 核心断言: profiler 必须精准记录到 MobileNetV3-AnimalCls 的独立统计数据
+    assert "MobileNetV3-AnimalCls" in profiler.model_stats
+    stats = profiler.model_stats["MobileNetV3-AnimalCls"]
+    assert stats.call_count == 1, f"MobileNetV3-AnimalCls 预期调用 1 次，实际调用 {stats.call_count}"
+    assert stats.avg_gpu_ms == pytest.approx(3.8, rel=1e-3)
+    assert stats.avg_ms > 0.0
+
+
+def test_bytetrack_large_beast_hysteresis_latching():
+    """测试 6: 验证 ByteTrack 轨迹级大型猛兽防抖锁存机制 (Hysteresis Latching)"""
+    from camping_guard.perception.bytetrack import ByteTracker
+
+    tracker = ByteTracker(high_thresh=0.5, low_thresh=0.2)
+    now = 1000.0
+
+    # 帧 1: 首次检出高危美洲黑熊 (large_beast)
+    det_f1 = [{
+        'bbox': (100, 100, 80, 80),
+        'conf': 0.90,
+        'category': 'large_beast',
+        'species': 'american_black_bear',
+        'species_cn': '美洲黑熊'
+    }]
+    ents_f1 = tracker.update(det_f1, current_time=now)
+    assert len(ents_f1) == 1
+    t1 = ents_f1[0]
+    tid = t1.track_id
+    assert t1.category == 'large_beast'
+    assert t1.species == 'american_black_bear'
+    assert t1.species_cn == '美洲黑熊'
+
+    # 帧 2: 黑熊背对镜头/走入树荫，分类器在阈值边缘退化为通用 animal
+    det_f2 = [{
+        'bbox': (102, 101, 80, 80),
+        'conf': 0.75,
+        'category': 'animal'
+    }]
+    ents_f2 = tracker.update(det_f2, current_time=now + 0.033)
+    assert len(ents_f2) == 1
+    t2 = ents_f2[0]
+    assert t2.track_id == tid
+    # 核心断言: 类别必须锁存在 large_beast，物种维持美洲黑熊，杜绝标签与警报闪烁！
+    assert t2.category == 'large_beast', f"标签退化为 {t2.category}，锁存防抖失效！"
+    assert t2.species == 'american_black_bear'
+    assert t2.species_cn == '美洲黑熊'
+
+    # 帧 3: 进一步退化为 small_animal 且物种为 unknown
+    det_f3 = [{
+        'bbox': (104, 102, 80, 80),
+        'conf': 0.70,
+        'category': 'small_animal',
+        'species': 'unknown',
+        'species_cn': '未知动物'
+    }]
+    ents_f3 = tracker.update(det_f3, current_time=now + 0.066)
+    assert len(ents_f3) == 1
+    t3 = ents_f3[0]
+    assert t3.track_id == tid
+    assert t3.category == 'large_beast'
+    assert t3.species == 'american_black_bear'
+
+    # 帧 4: 目标确凿变更为完全独立物理类别 (例如人员走入替换)
+    det_f4 = [{
+        'bbox': (106, 103, 80, 80),
+        'conf': 0.95,
+        'category': 'person'
+    }]
+    ents_f4 = tracker.update(det_f4, current_time=now + 0.099)
+    assert len(ents_f4) == 1
+    t4 = ents_f4[0]
+    assert t4.track_id == tid
+    assert t4.category == 'person'
+    # 锁存解除
+    st = tracker.get_track(tid)
+    assert st.confirmed_large_beast is False
+

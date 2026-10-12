@@ -143,16 +143,13 @@ def check_required_engines(
             engine_status["fire_det"] = Path(custom_fire)
         else:
             fire_cands = [
+                models_dir / "fire" / "yolov8n_fire.engine",
                 models_dir / "fire" / "yolo11n_fire.engine",
                 models_dir / "yolo" / "yolo11n_fire.engine",
                 models_dir / "fire" / "fire.engine",
-                models_dir / "fire" / "yolov8n-fire.engine",
-                models_dir / "fire" / "fire_detector.engine",
+                models_dir / "fire" / "yolov8n_fire.onnx",
                 models_dir / "fire" / "yolo11n_fire.onnx",
-                models_dir / "yolo" / "yolo11n_fire.onnx",
                 models_dir / "fire" / "fire.onnx",
-                models_dir / "fire" / "yolov8n-fire.onnx",
-                models_dir / "fire" / "fire_detector.onnx",
             ]
             for c in fire_cands:
                 if c.is_file():

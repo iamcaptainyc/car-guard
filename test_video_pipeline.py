@@ -507,7 +507,23 @@ def draw_telemetry_sidebar(
             y_base = 192 + idx * 28
             z_short = t.zone.value.split()[0] if hasattr(t.zone, 'value') else str(t.zone)
             pose_status = "17点骨骼活跃" if t.keypoints else "休眠"
-            cat_cn = "行人" if "person" in str(t.category).lower() else str(t.category)
+            cat_lower = str(t.category).lower()
+            if "person" in cat_lower or "人" in str(t.category):
+                cat_cn = "行人"
+            elif "large_beast" in cat_lower or "beast" in cat_lower:
+                sp_cn = getattr(t, 'species_cn', None)
+                cat_cn = f"猛兽({sp_cn})" if sp_cn and sp_cn not in ['未知动物', '通用动物'] else "猛兽"
+            elif "small_animal" in cat_lower or "animal" in cat_lower:
+                sp_cn = getattr(t, 'species_cn', None)
+                cat_cn = f"动物({sp_cn})" if sp_cn and sp_cn not in ['未知动物', '通用动物'] else "动物"
+            elif "fire" in cat_lower:
+                cat_cn = "火灾"
+            elif "smoke" in cat_lower:
+                cat_cn = "浓烟"
+            elif "car" in cat_lower or "车" in str(t.category):
+                cat_cn = "车辆"
+            else:
+                cat_cn = str(t.category)
             sess_txt = f"({t.person_session_id})" if t.person_session_id else ""
             put_sb(f"ID:{t.track_id}{sess_txt} [{cat_cn}] {t.ground_dist:.1f}m ({z_short}) vr:{t.radial_speed:+.1f}m/s", y_base, font_size=12, color=(220, 220, 220))
             put_sb(f"姿态: {pose_status} | 驻留: {t.cumulative_dwell_time:.1f}s", y_base + 14, font_size=11, color=(120, 255, 180))
@@ -536,7 +552,7 @@ def draw_telemetry_sidebar(
     if frame_metrics:
         model_items = []
         for m_name, m_info in frame_metrics.get_model_summary().items():
-            short = m_name.replace("ArcFace-MobileFaceNet", "ArcFace").replace("YOLO11n-Det", "YOLO").replace("SCRFD-500M", "SCRFD").replace("RTMPose-s", "RTMPose").replace("OSNet-ReID", "ReID")
+            short = m_name.replace("ArcFace-MobileFaceNet", "ArcFace").replace("YOLO11n-Det", "YOLO").replace("SCRFD-500M", "SCRFD").replace("RTMPose-s", "RTMPose").replace("OSNet-ReID", "ReID").replace("MobileNetV3-AnimalCls", "AnimalCls")
             model_items.append(f"{short}:{m_info['total_ms']:.1f}ms")
         if model_items:
             put_sb(" | ".join(model_items[:3]), 370, font_size=11, color=(160, 200, 220))
@@ -1377,8 +1393,12 @@ def run_video_pipeline(
                 cat_short = "Fire"
             elif "smoke" in cat_str or "烟" in str(t.category):
                 cat_short = "Smoke"
-            elif "animal" in cat_str or "兽" in str(t.category) or "物" in str(t.category):
-                cat_short = "Animal"
+            elif "large_beast" in cat_str or "beast" in cat_str:
+                sp = getattr(t, 'species', None)
+                cat_short = f"Beast({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Beast"
+            elif "small_animal" in cat_str or "animal" in cat_str or "兽" in str(t.category) or "物" in str(t.category):
+                sp = getattr(t, 'species', None)
+                cat_short = f"Animal({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Animal"
             else:
                 cat_short = str(t.category).split(".")[-1].capitalize()
 

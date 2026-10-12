@@ -124,9 +124,10 @@ class CampingGuardEngine:
                 self.detector.animal_classifier = self.animal_classifier
 
         # 注册模型元数据至 profiler (保持 key 与执行期 profile_model("...") 完全一致)
+        if self.detector:
+            self.detector.profiler = self.profiler
         if self.detector and hasattr(self.detector, 'model_path'):
             if getattr(self.detector, 'is_ensemble', False):
-                self.detector.profiler = self.profiler
                 det_label = "Parallel-Ensemble-Det"
                 desc = "Orin双流并发目标检测 (主检测器+火灾检测器聚合)"
                 self.profiler.register_model_metadata(det_label, self.detector.model_path, desc)

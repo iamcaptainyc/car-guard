@@ -104,6 +104,7 @@ class STrack:
         STrack._count += 1
         self.track_id = STrack._count
         self.category = category
+        self.confirmed_large_beast: bool = (category == 'large_beast')
         self.score = score
         self.is_activated = False
         self.state = 1 # 1: Tracked, 2: Lost, 3: Removed
@@ -157,11 +158,37 @@ class STrack:
         measurement = new_track.initial_measurement
         self.mean, self.covariance = self.kalman.update(self.mean, self.covariance, measurement)
         self.score = new_track.score
-        self.category = new_track.category
-        if getattr(new_track, 'species', None):
-            self.species = new_track.species
-        if getattr(new_track, 'species_cn', None):
-            self.species_cn = new_track.species_cn
+        # 类别更新与猛兽防抖锁存 (Hysteresis Latching)
+        if new_track.category == 'large_beast':
+            self.confirmed_large_beast = True
+            self.category = 'large_beast'
+            if getattr(new_track, 'species', None):
+                self.species = new_track.species
+            if getattr(new_track, 'species_cn', None):
+                self.species_cn = new_track.species_cn
+        elif self.confirmed_large_beast:
+            # 轨迹已确认为大型猛兽：若因目标背身/遮挡/光照退化为通用 animal 或 small_animal，
+            # 自动保持高危猛兽锁存与已知物种，防止威胁等级与 UI 标注跳变闪烁
+            if new_track.category in ['animal', 'small_animal']:
+                self.category = 'large_beast'
+                sp_en = getattr(new_track, 'species', None)
+                if sp_en and sp_en not in ['unknown', 'unclassified_animal']:
+                    self.species = sp_en
+                sp_cn = getattr(new_track, 'species_cn', None)
+                if sp_cn and sp_cn not in ['未知动物', '通用动物']:
+                    self.species_cn = sp_cn
+            else:
+                # 若检测确凿变为人员或车辆等完全不相干物理类别，解除猛兽锁存
+                self.confirmed_large_beast = False
+                self.category = new_track.category
+                self.species = getattr(new_track, 'species', None)
+                self.species_cn = getattr(new_track, 'species_cn', None)
+        else:
+            self.category = new_track.category
+            if getattr(new_track, 'species', None):
+                self.species = new_track.species
+            if getattr(new_track, 'species_cn', None):
+                self.species_cn = new_track.species_cn
         self.state = 1
         self.is_activated = True
 
