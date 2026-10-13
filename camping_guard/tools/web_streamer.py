@@ -589,6 +589,8 @@ class WebLiveStreamer:
                     self.send_header("Pragma", "no-cache")
                     self.end_headers()
                     last_sent_seq = -1
+                    with streamer_ref._action_lock:
+                        streamer_ref.active_stream_clients = getattr(streamer_ref, "active_stream_clients", 0) + 1
                     try:
                         while True:
                             with streamer_ref.condition:
@@ -606,6 +608,9 @@ class WebLiveStreamer:
                                 self.wfile.write(b"\r\n")
                     except (BrokenPipeError, ConnectionResetError, socket.error):
                         pass
+                    finally:
+                        with streamer_ref._action_lock:
+                            streamer_ref.active_stream_clients = max(0, getattr(streamer_ref, "active_stream_clients", 1) - 1)
 
                 elif parsed.path == "/api/status":
                     with streamer_ref._action_lock:
@@ -652,20 +657,24 @@ class WebLiveStreamer:
         except Exception as e:
             print(f"[!] 启动 Web 实时推流服务器失败 (端口 {self.port}): {e}")
 
-    def push_frame(self, frame: np.ndarray, quality: int = 88, max_width: int = 1920):
+    def push_frame(self, frame: np.ndarray, quality: int = 85, max_width: int = 1280):
         """
         推送一帧 BGR 画面至网页客户端：
-        - 默认支持最高 1920 全高清 (1080p) 原生画质
-        - 采用 JPEG quality=88 高清低压缩比，彻底消除画面马赛克与噪点
+        - 惰性按需编码：首帧初始化后，若当前无任何浏览器客户端连接 /stream.mjpg，直接跳过 cv2.imencode，实现 0ms CPU 零开销
+        - 有浏览器观看时自动开启 720p/1080p 高清流畅推流
         """
         if frame is None or frame.size == 0:
+            return
+
+        # 若已完成首帧初始化且当前无活跃浏览器视频流连接，直接跳过昂贵的 JPEG 编码
+        if self.current_jpeg_bytes is not None and getattr(self, "active_stream_clients", 0) <= 0:
             return
 
         h, w = frame.shape[:2]
         if w > max_width:
             new_w = max_width
             new_h = int(h * (max_width / float(w)))
-            frame_to_encode = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            frame_to_encode = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         else:
             frame_to_encode = frame
 

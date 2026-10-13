@@ -39,26 +39,14 @@ class Zone3ResidentDaemon:
 
     def process_frames(self, camera_frames: Dict[int, np.ndarray], current_time: float) -> List[Dict]:
         """
-        常驻处理各路相机画面 (1~2 fps 降采样抽帧输入)
+        常驻处理各路相机画面
         :param camera_frames: {camera_id: BGR frame}
         :param current_time: 当前时间戳
         :return: 触发确认的 ROI 事件列表
         """
         active_disturbances = []
 
-        # 1. 第一步：全局扰动比率统计 (用于过滤暴雨/镜头起雾/剧烈震动等全局异常)
-        global_ratios: Dict[int, float] = {}
-        for cam_id, frame in camera_frames.items():
-            if frame is None:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # 缩放至极小尺寸快速评估全图动态
-            small = cv2.resize(gray, (80, 60))
-            # 快速帧差或全图 MOG
-            mean_intensity = float(np.mean(small))
-            global_ratios[cam_id] = mean_intensity
-
-        # 检查是否有多路相机同时发生 ROI 异常扰动
+        # 1. 第一步：仅对标定的局部 ROI 切片执行灰度转换与 MOG2 背景减除 (彻底移除全图无用灰度转换)
         roi_candidates = []
 
         for roi in self.rois:
@@ -79,6 +67,14 @@ class Zone3ResidentDaemon:
                 continue
 
             roi_img = frame[ry:ry+rh, rx:rx+rw]
+            # 对大面积车身防碰撞 ROI 降采样至 <= 160x120，兼顾亚毫秒级耗时与高灵敏度前景检测
+            if rw > 160 or rh > 120:
+                proc_w = min(rw, 160)
+                proc_h = min(rh, 120)
+                roi_img = cv2.resize(roi_img, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                proc_w, proc_h = rw, rh
+
             roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
             roi_blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
 
@@ -88,7 +84,7 @@ class Zone3ResidentDaemon:
             _, fg_thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
             # 计算前景扰动像素占 ROI 总像素的比值
-            roi_area = rw * rh
+            roi_area = proc_w * proc_h
             fg_pixels = cv2.countNonZero(fg_thresh)
             disturbance_ratio = fg_pixels / float(roi_area) if roi_area > 0 else 0.0
 

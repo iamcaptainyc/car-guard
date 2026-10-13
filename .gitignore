@@ -35,6 +35,7 @@ calib_data_8155/
 
 # Temporary, Logs & Output Dirs
 tmp/
+logs/
 outputs/
 secure_storage/
 *.log

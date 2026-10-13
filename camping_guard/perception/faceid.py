@@ -177,6 +177,7 @@ class SCRFDFaceDetector:
         if self.session is None or img is None or img.size == 0:
             return np.empty((0, 5)), np.empty((0, 5, 2))
 
+        t_pre0 = time.perf_counter()
         im_ratio = float(img.shape[0]) / img.shape[1]
         model_ratio = float(self.input_size[1]) / self.input_size[0]
         if im_ratio > model_ratio:
@@ -193,7 +194,9 @@ class SCRFDFaceDetector:
 
         input_tensor = (det_img.astype(np.float32) - 127.5) / 128.0
         input_tensor = input_tensor.transpose(2, 0, 1)[None, ...]
+        self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
 
+        t_inf0 = time.perf_counter()
         try:
             outputs = self.session.run(None, {self.input_name: input_tensor})
         except Exception as e:
@@ -217,6 +220,10 @@ class SCRFDFaceDetector:
             else:
                 return np.empty((0, 5)), np.empty((0, 5, 2))
 
+        inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+        self.last_gpu_compute_ms = float(getattr(self.session, "last_gpu_compute_ms", 0.0) or inf_wall_ms)
+
+        t_post0 = time.perf_counter()
         scores_list = []
         bboxes_list = []
         kpss_list = []
@@ -251,6 +258,12 @@ class SCRFDFaceDetector:
                 kpss_list.append(kpss)
 
         if not scores_list:
+            self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+            try:
+                self.session.last_preprocess_ms = self.last_preprocess_ms
+                self.session.last_postprocess_ms = self.last_postprocess_ms
+            except Exception:
+                pass
             return np.empty((0, 5)), np.empty((0, 5, 2))
 
         scores = np.vstack(scores_list).flatten()
@@ -258,6 +271,12 @@ class SCRFDFaceDetector:
         kpss = np.vstack(kpss_list)
 
         keep = cv2.dnn.NMSBoxes(bboxes.tolist(), scores.tolist(), self.conf_thresh, self.nms_thresh)
+        self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+        try:
+            self.session.last_preprocess_ms = self.last_preprocess_ms
+            self.session.last_postprocess_ms = self.last_postprocess_ms
+        except Exception:
+            pass
         if len(keep) > 0:
             keep = keep.flatten()
             return np.hstack([bboxes[keep], scores[keep, None]]), kpss[keep]
@@ -277,6 +296,9 @@ class ArcFaceRecognizer:
         self.model_path = model_path
         self.session = None
         self.backend = "unknown"
+        self.last_preprocess_ms: float = 0.0
+        self.last_gpu_compute_ms: float = 0.0
+        self.last_postprocess_ms: float = 0.0
 
         is_engine = str(model_path).lower().endswith(".engine")
         if os.path.exists(model_path) or is_engine:
@@ -340,15 +362,29 @@ class ArcFaceRecognizer:
             pseudo = np.random.randn(512).astype(np.float32)
             return pseudo / np.linalg.norm(pseudo)
 
+        t_pre0 = time.perf_counter()
         face_rgb = cv2.cvtColor(aligned_face_bgr, cv2.COLOR_BGR2RGB)
         tensor = (face_rgb.astype(np.float32) - 127.5) / 127.5
         tensor = tensor.transpose(2, 0, 1)[None, ...]
+        self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
 
+        t_inf0 = time.perf_counter()
         feat = self.session.run(None, {self.input_name: tensor})[0][0]
+        inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+        self.last_gpu_compute_ms = float(getattr(self.session, "last_gpu_compute_ms", 0.0) or inf_wall_ms)
+
+        t_post0 = time.perf_counter()
         norm = np.linalg.norm(feat)
         if norm > 1e-7:
             feat = feat / norm
-        return feat.astype(np.float32)
+        res = feat.astype(np.float32)
+        self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+        try:
+            self.session.last_preprocess_ms = self.last_preprocess_ms
+            self.session.last_postprocess_ms = self.last_postprocess_ms
+        except Exception:
+            pass
+        return res
 
 
 class FaceIDPipeline:
@@ -386,6 +422,12 @@ class FaceIDPipeline:
         # 轨迹运行状态缓存: {track_id: {"last_check_time": float, "candidate_name": str, "candidate_count": int}}
         self.track_face_context: Dict[int, dict] = {}
 
+    def clean_stale_tracks(self, active_track_ids: set):
+        """清理已消失轨迹的人脸上下文，避免长时间运行内存泄漏"""
+        stale = [tid for tid in self.track_face_context if tid not in active_track_ids]
+        for tid in stale:
+            del self.track_face_context[tid]
+
     def register_whitelist(self, name: str, face_img_bgr: np.ndarray) -> bool:
         """从底库照片注册白名单人脸"""
         bboxes, kpss = self.detector.detect(face_img_bgr)
@@ -422,6 +464,11 @@ class FaceIDPipeline:
         :return: 更新后的 FaceIDState
         """
         tid = target.track_id
+
+        # 0. 白名单底库前置短路：若未注册任何白名单人脸，直接跳过 SCRFD-500M 与 ArcFace 无效推理
+        if not self.whitelist_db:
+            target.face_state = FaceIDState.NO_MATCH
+            return FaceIDState.NO_MATCH
 
         # 1. 如果已确认白名单，且轨迹平稳，保持 VERIFIED，不再浪费算力
         if target.face_state == FaceIDState.VERIFIED and target.is_whitelisted:
@@ -501,10 +548,6 @@ class FaceIDPipeline:
             feat = self.recognizer.extract_feature(aligned_face)
 
         # 8. 匹配白名单底库
-        if not self.whitelist_db:
-            target.face_state = FaceIDState.NO_MATCH
-            return FaceIDState.NO_MATCH
-
         best_name = None
         best_sim = -1.0
         for name, db_feat in self.whitelist_db.items():

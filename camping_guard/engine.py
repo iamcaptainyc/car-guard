@@ -99,7 +99,7 @@ class CampingGuardEngine:
         )
         self.track_mgr.profiler = self.profiler
 
-        self.bytetracker = ByteTracker() if use_bytetrack else None
+        self.bytetracker = ByteTracker(profiler=self.profiler) if use_bytetrack else None
         self.detector = detector
         self.stream_manager = stream_manager
         self.pose_estimator = pose_estimator or RTMPoseEstimator(use_trt=self.use_tensorrt)
@@ -259,7 +259,8 @@ class CampingGuardEngine:
             primary_cam_id = 1 if 1 in camera_frames else (0 if 0 in camera_frames else (list(camera_frames.keys())[0] if camera_frames else 1))
         primary_frame = camera_frames.get(primary_cam_id)
         if primary_frame is not None:
-            self.recorder.push_frame(primary_frame, current_time)
+            with self.profiler.profile_stage("Recorder_RingBuffer"):
+                self.recorder.push_frame(primary_frame, current_time)
 
         # 2. 消费车端总线事件 (CAN / IMU / UWB)
         pulled_events = self.vehicle_bus.pull_pending_events()
@@ -445,24 +446,35 @@ class CampingGuardEngine:
                     camera_id=primary_cam_id
                 )
 
-        active_ids = set(t.track_id for t in self.active_targets)
-        self.distance_estimator.clean_stale_tracks(active_ids)
+        # 定期清理已彻底移除轨迹的历史字典，同时保留 lost_stracks 临时遮挡轨迹上下文
+        retain_ids = set(t.track_id for t in self.active_targets)
+        if self.bytetracker is not None:
+            for lst in self.bytetracker.lost_stracks:
+                retain_ids.add(lst.track_id)
+        self.distance_estimator.clean_stale_tracks(retain_ids)
+        if hasattr(self.zone_filter, 'clean_stale_tracks'):
+            self.zone_filter.clean_stale_tracks(retain_ids)
+        if hasattr(self.pose_classifier, 'clean_stale_tracks') and self._frame_count % 30 == 0:
+            self.pose_classifier.clean_stale_tracks(retain_ids)
+        if hasattr(self.faceid_pipeline, 'clean_stale_tracks') and self._frame_count % 30 == 0:
+            self.faceid_pipeline.clean_stale_tracks(retain_ids)
 
         # 7. 白名单双通道排查 (步骤 1.2, 结合 UWB, FaceID 深度模型与 ReID 全局会话)
-        self.whitelist_mgr.evaluate_whitelist(
-            targets=self.active_targets,
-            uwb_key_pos=self.vehicle_bus.uwb_key_pos,
-            face_id_results=None,
-            current_time=current_time,
-            frame=primary_frame
-        )
-        if self.bytetracker is not None:
-            for t in self.active_targets:
-                st = self.bytetracker.get_track(t.track_id)
-                if st is not None:
-                    st.is_whitelisted = t.is_whitelisted
-                    st.face_state = t.face_state
-                    st.face_id_name = t.face_id_name
+        with self.profiler.profile_stage("Whitelist_and_FaceID"):
+            self.whitelist_mgr.evaluate_whitelist(
+                targets=self.active_targets,
+                uwb_key_pos=self.vehicle_bus.uwb_key_pos,
+                face_id_results=None,
+                current_time=current_time,
+                frame=primary_frame
+            )
+            if self.bytetracker is not None:
+                for t in self.active_targets:
+                    st = self.bytetracker.get_track(t.track_id)
+                    if st is not None:
+                        st.is_whitelisted = t.is_whitelisted
+                        st.face_state = t.face_state
+                        st.face_id_name = t.face_id_name
 
         # 8. 统计防区状态用于状态机调度
         has_zone1 = any(t.zone == VehicleZone.ZONE_1_OUTER and not t.is_whitelisted for t in self.active_targets)
@@ -492,123 +504,124 @@ class CampingGuardEngine:
         has_contact_confirmed = False
         target_for_threat = None
 
-        # 火情研判通道
-        fire_targets = [t for t in self.active_targets if t.category in ['fire', 'smoke']]
-        person_targets = [t for t in self.active_targets if t.category == 'person']
-        if fire_targets:
-            fire_threat, fire_desc = self.fire_monitor.update_fire_status(fire_targets, person_targets, current_time)
-            if fire_threat.value > highest_threat.value:
-                highest_threat = fire_threat
-                highest_action = ActionType.FIRE_SMOKE
-                threat_description = fire_desc
+        with self.profiler.profile_stage("Pose_and_Action_Fusion"):
+            # 火情研判通道
+            fire_targets = [t for t in self.active_targets if t.category in ['fire', 'smoke']]
+            person_targets = [t for t in self.active_targets if t.category == 'person']
+            if fire_targets:
+                fire_threat, fire_desc = self.fire_monitor.update_fire_status(fire_targets, person_targets, current_time)
+                if fire_threat.value > highest_threat.value:
+                    highest_threat = fire_threat
+                    highest_action = ActionType.FIRE_SMOKE
+                    threat_description = fire_desc
 
-        # 人员与动物研判通道
-        handle_polys = [r.polygon for r in self.zone3_daemon.rois if "handle" in r.roi_id]
-        window_polys = [r.polygon for r in self.zone3_daemon.rois if "window" in r.roi_id]
+            # 人员与动物研判通道
+            handle_polys = [r.polygon for r in self.zone3_daemon.rois if "handle" in r.roi_id]
+            window_polys = [r.polygon for r in self.zone3_daemon.rois if "window" in r.roi_id]
 
-        for target in self.active_targets:
-            if target.is_whitelisted:
-                continue
+            for target in self.active_targets:
+                if target.is_whitelisted:
+                    continue
 
-            # 若目标进入核心研判区 (Zone 2) 且为人员，按需触发 RTMPose 局部切片骨骼点提取 (Top-Down 节能范式)
-            if target.category == 'person' and target.zone == VehicleZone.ZONE_2_INNER:
-                st = self.bytetracker.get_track(target.track_id) if self.bytetracker else None
-                last_pose_t = getattr(st, 'last_pose_time', 0.0) if st else 0.0
-                # 姿态时序限频：在 Zone 2 维持 10 FPS (100ms 间隔) 研判刷新率，避免 30 FPS 饱和挤占边缘算力
-                need_pose_infer = (current_time - last_pose_t >= 0.10) or (target.keypoints is None)
+                # 若目标进入核心研判区 (Zone 2) 且为人员，按需触发 RTMPose 局部切片骨骼点提取 (Top-Down 节能范式)
+                if target.category == 'person' and target.zone == VehicleZone.ZONE_2_INNER:
+                    st = self.bytetracker.get_track(target.track_id) if self.bytetracker else None
+                    last_pose_t = getattr(st, 'last_pose_time', 0.0) if st else 0.0
+                    # 姿态时序限频：在 Zone 2 维持 10 FPS (100ms 间隔) 研判刷新率，避免 30 FPS 饱和挤占边缘算力
+                    need_pose_infer = (current_time - last_pose_t >= 0.10) or (target.keypoints is None)
 
-                if need_pose_infer and primary_frame is not None and self.pose_estimator is not None:
-                    bx = int(target.bbox.x if hasattr(target.bbox, 'x') else target.bbox[0])
-                    by = int(target.bbox.y if hasattr(target.bbox, 'y') else target.bbox[1])
-                    bw = int(target.bbox.w if hasattr(target.bbox, 'w') else target.bbox[2])
-                    bh = int(target.bbox.h if hasattr(target.bbox, 'h') else target.bbox[3])
-                    pose_sess = getattr(self.pose_estimator, 'session', None)
-                    with self.profiler.profile_model("RTMPose-s", condition=f"ID:{target.track_id} Zone 2 姿态骨骼提取 (10FPS)", session=pose_sess):
-                        kpts_list = self.pose_estimator.estimate_keypoints(primary_frame, [(bx, by, bw, bh)])
-                    if kpts_list:
-                        target.keypoints = kpts_list[0]
-                    if st is not None:
-                        st.keypoints = target.keypoints
-                        st.last_pose_time = current_time
-                else:
-                    # 复用上一帧提取的骨骼点，保持动作分类器时序连贯性
-                    if st is not None and st.keypoints is not None:
-                        target.keypoints = st.keypoints
-            elif target.category == 'person' and target.zone != VehicleZone.ZONE_2_INNER:
-                # 退出 Zone 2 时及时清理姿态关键点，避免远距离依然残留陈旧姿态
-                target.keypoints = None
-                if self.bytetracker:
-                    st = self.bytetracker.get_track(target.track_id)
-                    if st is not None:
-                        st.keypoints = None
+                    if need_pose_infer and primary_frame is not None and self.pose_estimator is not None:
+                        bx = int(target.bbox.x if hasattr(target.bbox, 'x') else target.bbox[0])
+                        by = int(target.bbox.y if hasattr(target.bbox, 'y') else target.bbox[1])
+                        bw = int(target.bbox.w if hasattr(target.bbox, 'w') else target.bbox[2])
+                        bh = int(target.bbox.h if hasattr(target.bbox, 'h') else target.bbox[3])
+                        pose_sess = getattr(self.pose_estimator, 'session', None)
+                        with self.profiler.profile_model("RTMPose-s", condition=f"ID:{target.track_id} Zone 2 姿态骨骼提取 (10FPS)", session=pose_sess):
+                            kpts_list = self.pose_estimator.estimate_keypoints(primary_frame, [(bx, by, bw, bh)])
+                        if kpts_list:
+                            target.keypoints = kpts_list[0]
+                        if st is not None:
+                            st.keypoints = target.keypoints
+                            st.last_pose_time = current_time
+                    else:
+                        # 复用上一帧提取的骨骼点，保持动作分类器时序连贯性
+                        if st is not None and st.keypoints is not None:
+                            target.keypoints = st.keypoints
+                elif target.category == 'person' and target.zone != VehicleZone.ZONE_2_INNER:
+                    # 退出 Zone 2 时及时清理姿态关键点，避免远距离依然残留陈旧姿态
+                    target.keypoints = None
+                    if self.bytetracker:
+                        st = self.bytetracker.get_track(target.track_id)
+                        if st is not None:
+                            st.keypoints = None
 
-            # 动作与姿态分类 (传入门把手与车窗 ROI 空间多边形)
-            action, visual_threat, v_desc = self.pose_classifier.classify_action(
-                target, current_time,
-                handle_roi_polygons=handle_polys,
-                window_roi_polygons=window_polys
-            )
-            # 融合整车接触信号仲裁
-            final_threat, contact_flag, fusion_desc = self.fusion_engine.arbitrate_threat(
-                target, action, visual_threat, current_time
-            )
+                # 动作与姿态分类 (传入门把手与车窗 ROI 空间多边形)
+                action, visual_threat, v_desc = self.pose_classifier.classify_action(
+                    target, current_time,
+                    handle_roi_polygons=handle_polys,
+                    window_roi_polygons=window_polys
+                )
+                # 融合整车接触信号仲裁
+                final_threat, contact_flag, fusion_desc = self.fusion_engine.arbitrate_threat(
+                    target, action, visual_threat, current_time
+                )
 
-            # 更新最高等级
-            threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
-            if threat_rank[final_threat] > threat_rank[highest_threat]:
-                highest_threat = final_threat
-                highest_action = action
-                threat_description = fusion_desc
-                has_contact_confirmed = contact_flag
-                target_for_threat = target
+                # 更新最高等级
+                threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
+                if threat_rank[final_threat] > threat_rank[highest_threat]:
+                    highest_threat = final_threat
+                    highest_action = action
+                    threat_description = fusion_desc
+                    has_contact_confirmed = contact_flag
+                    target_for_threat = target
 
-        # 叠加相机故障威胁
-        if occl_threat is not None:
-            threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
-            if threat_rank[occl_threat] > threat_rank[highest_threat]:
-                highest_threat = occl_threat
-                threat_description = occl_desc
+            # 叠加相机故障威胁
+            if occl_threat is not None:
+                threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
+                if threat_rank[occl_threat] > threat_rank[highest_threat]:
+                    highest_threat = occl_threat
+                    threat_description = occl_desc
 
-        # 叠加车身防碰撞区与敏感部件 ROI 运动扰动研判 (邻车开门碰撞、树木倒塌、外物砸击、手部触碰)
-        if len(self.active_roi_disturbances) > 0:
-            # 优先检查是否存在车身大面积防碰撞监视区扰动 (邻车开门碰撞/倒木/外物砸车)
-            body_dists = [d for d in self.active_roi_disturbances if d.get("roi_type") == "body" or "碰撞" in d.get("name", "") or "门板" in d.get("name", "")]
-            if body_dists:
-                first_dist = body_dists[0]
-                collision_action = ActionType.VEHICLE_COLLISION
-            else:
-                first_dist = self.active_roi_disturbances[0]
-                roi_id = first_dist.get("roi_id", "")
-                if "handle" in roi_id:
-                    collision_action = ActionType.DOOR_HANDLE_PULL
-                elif "rack" in roi_id or "charge" in roi_id:
-                    collision_action = ActionType.EQUIPMENT_THEFT
-                else:
+            # 叠加车身防碰撞区与敏感部件 ROI 运动扰动研判 (邻车开门碰撞、树木倒塌、外物砸击、手部触碰)
+            if len(self.active_roi_disturbances) > 0:
+                # 优先检查是否存在车身大面积防碰撞监视区扰动 (邻车开门碰撞/倒木/外物砸车)
+                body_dists = [d for d in self.active_roi_disturbances if d.get("roi_type") == "body" or "碰撞" in d.get("name", "") or "门板" in d.get("name", "")]
+                if body_dists:
+                    first_dist = body_dists[0]
                     collision_action = ActionType.VEHICLE_COLLISION
+                else:
+                    first_dist = self.active_roi_disturbances[0]
+                    roi_id = first_dist.get("roi_id", "")
+                    if "handle" in roi_id:
+                        collision_action = ActionType.DOOR_HANDLE_PULL
+                    elif "rack" in roi_id or "charge" in roi_id:
+                        collision_action = ActionType.EQUIPMENT_THEFT
+                    else:
+                        collision_action = ActionType.VEHICLE_COLLISION
 
-            # 融合整车 CAN/IMU 硬件信号 (若伴随 IMU 震动峰值直接升 L3)
-            collision_threat, collision_contact, collision_desc = self.fusion_engine.arbitrate_threat(
-                target=None,
-                visual_action=collision_action,
-                visual_threat=ThreatLevel.L2_WARNING,
-                current_time=current_time
-            )
+                # 融合整车 CAN/IMU 硬件信号 (若伴随 IMU 震动峰值直接升 L3)
+                collision_threat, collision_contact, collision_desc = self.fusion_engine.arbitrate_threat(
+                    target=None,
+                    visual_action=collision_action,
+                    visual_threat=ThreatLevel.L2_WARNING,
+                    current_time=current_time
+                )
 
+                threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
+                if threat_rank[collision_threat] >= threat_rank[highest_threat]:
+                    highest_threat = collision_threat
+                    highest_action = collision_action
+                    threat_description = collision_desc
+                    has_contact_confirmed = has_contact_confirmed or collision_contact
+
+            # 极近距离 (<0.5m) 绝对兜底：任何目标进入 0.5m 内绝不可判定为 L0 安全
             threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
-            if threat_rank[collision_threat] >= threat_rank[highest_threat]:
-                highest_threat = collision_threat
-                highest_action = collision_action
-                threat_description = collision_desc
-                has_contact_confirmed = has_contact_confirmed or collision_contact
-
-        # 极近距离 (<0.5m) 绝对兜底：任何目标进入 0.5m 内绝不可判定为 L0 安全
-        threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
-        for t in self.active_targets:
-            if not t.is_whitelisted and t.ground_dist <= 0.5:
-                if threat_rank[highest_threat] < threat_rank[ThreatLevel.L1_NOTICE]:
-                    highest_threat = ThreatLevel.L1_NOTICE
-                    threat_description = f"目标在车身极近距离 (<0.5m)，进入高警戒状态"
-                    target_for_threat = t
+            for t in self.active_targets:
+                if not t.is_whitelisted and t.ground_dist <= 0.5:
+                    if threat_rank[highest_threat] < threat_rank[ThreatLevel.L1_NOTICE]:
+                        highest_threat = ThreatLevel.L1_NOTICE
+                        threat_description = f"目标在车身极近距离 (<0.5m)，进入高警戒状态"
+                        target_for_threat = t
 
         self.current_threat_level = highest_threat
         self.latest_event_description = threat_description
@@ -648,75 +661,76 @@ class CampingGuardEngine:
         )
 
         # 12. 慢通路异步 VLM 复核 (阶段 2.2 / 阶段 4)
-        if self.vlm_reviewer.should_trigger_vlm(
-            category_conf=target_for_threat.confidence if target_for_threat else 1.0,
-            is_unknown_obstacle=False,
-            fast_path_threat=highest_threat,
-            action_type=highest_action,
-            has_contact_signal=has_contact_confirmed,
-            is_zone3_roi_event=(len(self.active_roi_disturbances) > 0)
-        ):
-            kframes = [primary_frame] if primary_frame is not None else []
-            vlm_res = self.vlm_reviewer.review_event_async(event_record, keyframes=kframes)
-            self.vlm_summaries.append(vlm_res)
-            event_record.vlm_summary = vlm_res.get("summary_text")
-            # 若 VLM 经安全沙箱仲裁调整了威胁等级 (如纯视觉 L2 降级为 L1)
-            if "final_threat" in vlm_res:
-                event_record.final_threat_level = vlm_res["final_threat"]
-                highest_threat = vlm_res["final_threat"]
+        with self.profiler.profile_stage("VLM_Dispatch"):
+            if self.vlm_reviewer.should_trigger_vlm(
+                category_conf=target_for_threat.confidence if target_for_threat else 1.0,
+                is_unknown_obstacle=False,
+                fast_path_threat=highest_threat,
+                action_type=highest_action,
+                has_contact_signal=has_contact_confirmed,
+                is_zone3_roi_event=(len(self.active_roi_disturbances) > 0)
+            ):
+                kframes = [primary_frame] if primary_frame is not None else []
+                vlm_res = self.vlm_reviewer.review_event_async(event_record, keyframes=kframes)
+                self.vlm_summaries.append(vlm_res)
+                if len(self.vlm_summaries) > 200:
+                    self.vlm_summaries = self.vlm_summaries[-200:]
+                event_record.vlm_summary = vlm_res.get("summary_text")
+                # 若 VLM 经安全沙箱仲裁调整了威胁等级 (如纯视觉 L2 降级为 L1)
+                if "final_threat" in vlm_res:
+                    event_record.final_threat_level = vlm_res["final_threat"]
+                    highest_threat = vlm_res["final_threat"]
 
-        # 13. 响应执行器输出动作 (阶段 3)
-        self.executed_actions = self.actuator.execute_response(
-            record=event_record,
-            current_time=current_time,
-            is_fire_event=(highest_action == ActionType.FIRE_SMOKE)
-        )
-        event_record.executed_actions = list(self.executed_actions)
+        # 13 & 14. 响应执行器输出动作与存证录像锁存
+        with self.profiler.profile_stage("Actuator_and_Evidence_Lock"):
+            self.executed_actions = self.actuator.execute_response(
+                record=event_record,
+                current_time=current_time,
+                is_fire_event=(highest_action == ActionType.FIRE_SMOKE)
+            )
+            event_record.executed_actions = list(self.executed_actions)
 
-        # 14. 存证与录像锁存 (阶段 4)
-        if event_record.threat_level in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL] or highest_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
-            self.state_machine.last_high_threat_time = current_time
+            if event_record.threat_level in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL] or highest_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
+                self.state_machine.last_high_threat_time = current_time
 
-            # 存证事件去重与防抖合并机制：
-            # 持续高危期间避免在每一帧重复创建独立录像切片，而是复用/延展当前活跃录制切片
-            need_new_clip = True
-            if self._last_locked_event_id:
-                pending_clip = self.recorder.pending_clips.get(self._last_locked_event_id)
-                if pending_clip and not pending_clip.is_finalized:
-                    # 保持以首个触发报警事件 A 为原点的标准 30s 视窗 (事前 10s + 事后 20s)，
-                    # 在事后 20 秒窗口期内的新伴随事件均被该 30s 黄金证据链完整覆盖，避免切片被不可控拉长
-                    need_new_clip = False
-                    event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
-                    # 持续动态更新当前活跃切片的最新语义 (更新驻留时长、动作与 VLM 战报)
-                    if hasattr(self.recorder, 'update_clip_metadata'):
-                        self.recorder.update_clip_metadata(self._last_locked_event_id, {
-                            "target_dwell_time_sec": tgt_dwell,
-                            "vlm_summary": event_record.vlm_summary or "",
-                            "executed_actions": list(self.executed_actions)
-                        })
-                elif current_time - self._last_locked_time < 15.0:
-                    # 距离上次事件录像完成不足 15 秒冷却窗口，跳过重复创建
-                    need_new_clip = False
-                    event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
+                # 存证事件去重与防抖合并机制：
+                # 持续高危期间避免在每一帧重复创建独立录像切片，而是复用/延展当前活跃录制切片
+                need_new_clip = True
+                if self._last_locked_event_id:
+                    pending_clip = self.recorder.pending_clips.get(self._last_locked_event_id)
+                    if pending_clip and not pending_clip.is_finalized:
+                        need_new_clip = False
+                        event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
+                        if hasattr(self.recorder, 'update_clip_metadata'):
+                            self.recorder.update_clip_metadata(self._last_locked_event_id, {
+                                "target_dwell_time_sec": tgt_dwell,
+                                "vlm_summary": event_record.vlm_summary or "",
+                                "executed_actions": list(self.executed_actions)
+                            })
+                    elif current_time - self._last_locked_time < 15.0:
+                        need_new_clip = False
+                        event_record.hash_signature = getattr(self.recorder, 'prev_hash', "")
 
-            if need_new_clip:
-                sig = self.recorder.lock_event_clip(
-                    event_id=event_record.event_id,
-                    threat_level_str=event_record.threat_level.value,
-                    trigger_time=current_time,
-                    event_record=event_record
-                )
-                self._last_locked_event_id = event_record.event_id
-                self._last_locked_time = current_time
-                event_record.hash_signature = sig
-                video_filename = f"{event_record.event_id}_{event_record.threat_level.value.replace(' ', '_')}.mp4"
-                event_record.video_clip_path = str(self.recorder.storage_dir / video_filename)
-                self.historical_threat_events.append(event_record)
+                if need_new_clip:
+                    sig = self.recorder.lock_event_clip(
+                        event_id=event_record.event_id,
+                        threat_level_str=event_record.threat_level.value,
+                        trigger_time=current_time,
+                        event_record=event_record
+                    )
+                    self._last_locked_event_id = event_record.event_id
+                    self._last_locked_time = current_time
+                    event_record.hash_signature = sig
+                    video_filename = f"{event_record.event_id}_{event_record.threat_level.value.replace(' ', '_')}.mp4"
+                    event_record.video_clip_path = str(self.recorder.storage_dir / video_filename)
+                    self.historical_threat_events.append(event_record)
 
-        # 15. 结束当帧性能统计并生成指标快照
+        # 15. 结束当帧性能统计并生成指标快照 (同步记录当前帧是否与后台 VLM 并发)
+        vlm_busy = bool(getattr(self.vlm_reviewer, "is_inferencing", False))
         frame_metrics = self.profiler.end_frame(
             threat_level=highest_threat.value,
-            target_count=len(self.active_targets)
+            target_count=len(self.active_targets),
+            vlm_is_inferencing=vlm_busy
         )
 
         return {
@@ -728,7 +742,7 @@ class CampingGuardEngine:
             "actions": self.executed_actions,
             "active_targets_count": len(self.active_targets),
             "vlm_summary": event_record.vlm_summary,
-            "vlm_is_inferencing": getattr(self.vlm_reviewer, "is_inferencing", False),
+            "vlm_is_inferencing": vlm_busy,
             "vlm_last_duration_ms": getattr(self.vlm_reviewer, "last_inference_ms", 0.0),
             "vlm_last_summary": getattr(self.vlm_reviewer, "last_summary_text", ""),
             "vlm_total_reviews": getattr(self.vlm_reviewer, "total_completed_reviews", 0),

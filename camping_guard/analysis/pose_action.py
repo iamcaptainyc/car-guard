@@ -25,6 +25,15 @@ class PoseActionClassifier:
         if old_id in self.ankle_history:
             self.ankle_history[new_id] = self.ankle_history.pop(old_id)
 
+    def clean_stale_tracks(self, active_track_ids: set):
+        """清理已移除轨迹的动作状态与脚踝历史缓存，防止长时间运行内存泄漏"""
+        stale_act = [tid for tid in self.action_states if tid not in active_track_ids]
+        for tid in stale_act:
+            del self.action_states[tid]
+        stale_ank = [tid for tid in self.ankle_history if tid not in active_track_ids]
+        for tid in stale_ank:
+            del self.ankle_history[tid]
+
     def classify_action(
         self,
         target: TrackedEntity,

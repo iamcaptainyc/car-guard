@@ -763,11 +763,14 @@ class AsyncVLMReviewer:
         self,
         backend: Optional[VLMBackendBase] = None,
         enable_worker_thread: bool = True,
-        profiler: Optional[Any] = None
+        profiler: Optional[Any] = None,
+        vlm_cooldown_sec: float = 30.0
     ):
         self.backend = backend or MockVLMBackend()
         self.profiler = profiler
+        self.vlm_cooldown_sec = float(vlm_cooldown_sec)
         self.review_history: List[Dict[str, Any]] = []
+        self.detailed_review_logs: List[Dict[str, Any]] = []
         self.task_queue: queue.Queue = queue.Queue()
         self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
 
@@ -776,16 +779,49 @@ class AsyncVLMReviewer:
         self._is_running = enable_worker_thread
         self._worker_thread: Optional[threading.Thread] = None
 
-        # 实时状态与耗时遥测属性 (供控制台看板与 HUD 实时显示)
+        # 同目标/同事件语义防抖冷却池:
+        # key -> {"last_submit_time": float, "last_action": str, "last_threat_rank": int, "had_contact": bool, "in_flight": bool, "last_real_result": dict}
+        self._target_cooldown_map: Dict[Any, Dict[str, Any]] = {}
+
+        # 实时状态与耗时遥测属性 (供控制台看板、HUD 与 JSON 性能报告读取)
         self.is_inferencing: bool = False
         self.last_inference_ms: float = 0.0
         self.last_summary_text: str = ""
         self.total_completed_reviews: int = 0
         self.total_submitted_tasks: int = 0
+        self.trigger_checks: int = 0
+        self.cooldown_skipped_count: int = 0
+        self.queue_dropped_count: int = 0
 
         if enable_worker_thread:
             self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="VLM_Reviewer_Worker")
             self._worker_thread.start()
+
+    @staticmethod
+    def _threat_rank(level: Any) -> int:
+        rank_map = {
+            ThreatLevel.L0_SAFE: 0,
+            ThreatLevel.L1_NOTICE: 1,
+            ThreatLevel.L2_WARNING: 2,
+            ThreatLevel.L3_CRITICAL: 3,
+            "L0 安全": 0,
+            "L1 提示": 1,
+            "L2 预警": 2,
+            "L3 紧急": 3,
+        }
+        return rank_map.get(level, 1)
+
+    @staticmethod
+    def _get_dedup_key(event_record: ThreatEventRecord) -> str:
+        sess_id = getattr(event_record, "person_session_id", None)
+        if sess_id:
+            return f"SESS_{sess_id}"
+        tid = getattr(event_record, "target_id", None)
+        if tid is not None:
+            return f"TRK_{tid}"
+        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+        tgt_cat = getattr(event_record, "target_category", "unknown")
+        return f"EVT_{tgt_cat}_{act_val}"
 
     def register_completion_callback(self, callback: Callable[[Dict[str, Any]], None]):
         """注册异步完成后的事件回调"""
@@ -839,12 +875,54 @@ class AsyncVLMReviewer:
     ) -> str:
         """
         非阻塞提交复核任务至后台工作线程队列 (耗时 < 1ms)
-        包含防任务积压节流保护：当队列中已有未消费的积压任务时，避免持续高频帧流导致任务无休止堆积
+        包含:
+        1. 同目标/同事件语义冷却门禁 (默认 30s)，杜绝同一目标停留期间背靠背 100% 占满 GPU
+        2. 威胁升级或动作突变即时破冰穿透 (如 L2->L3 或 游荡->冲刺)
+        3. 在途任务去重与队列容量保护 (最多 1 个执行 + 1 个候补)
         """
+        self.trigger_checks += 1
         task_id = f"VLM_TASK_{event_record.event_id}_{int(time.time() * 1000)}"
+        dedup_key = self._get_dedup_key(event_record)
+        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+        curr_rank = self._threat_rank(event_record.threat_level)
+        now_ts = float(getattr(event_record, "timestamp", 0.0) or time.time())
+        has_contact = bool(getattr(event_record, "has_contact_signal", False))
+
         with self._lock:
-            if self.task_queue.qsize() >= 2:
+            prev = self._target_cooldown_map.get(dedup_key)
+            is_escalated = False
+            if prev is not None:
+                # 威胁等级提升、动作类型突变、或新增车身物理接触信号时，立即破冰穿透冷却
+                if (
+                    curr_rank > prev.get("last_threat_rank", 0)
+                    or act_val != prev.get("last_action", "")
+                    or (has_contact and not prev.get("had_contact", False))
+                ):
+                    is_escalated = True
+
+                # 若未升级，且已有相同目标在途推理或处于冷却窗口期内，跳过重复提交
+                if not is_escalated:
+                    elapsed = now_ts - prev.get("last_submit_time", -1e9)
+                    if prev.get("in_flight", False) or (0.0 <= elapsed < self.vlm_cooldown_sec):
+                        self.cooldown_skipped_count += 1
+                        return task_id
+
+            # 队列防积压保护 (最多允许 1 个正在运行 + 1 个排队候补)
+            if self.task_queue.qsize() >= 1 and not is_escalated:
+                self.queue_dropped_count += 1
                 return task_id
+            if self.task_queue.qsize() >= 2:
+                self.queue_dropped_count += 1
+                return task_id
+
+            self._target_cooldown_map[dedup_key] = {
+                "last_submit_time": now_ts,
+                "last_action": act_val,
+                "last_threat_rank": curr_rank,
+                "had_contact": has_contact,
+                "in_flight": True,
+                "last_real_result": prev.get("last_real_result") if prev else None,
+            }
             self._active_tasks_count += 1
             self.total_submitted_tasks += 1
 
@@ -881,6 +959,21 @@ class AsyncVLMReviewer:
             backend_source = raw_vlm_out.get("backend_source", "FALLBACK_RULE_MOCK (离线规则保底模板)")
             raw_text = raw_vlm_out.get("raw_output_text", "")
             is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
+
+            self.detailed_review_logs.append({
+                "task_id": f"SYNC_{event_record.event_id}",
+                "event_id": event_record.event_id,
+                "target_id": getattr(event_record, "target_id", None),
+                "target_category": tgt_cat,
+                "species_cn": species_str,
+                "action_type": act_val,
+                "duration_ms": round(dur_ms, 2),
+                "backend_source": backend_source,
+                "is_real_vlm": is_real_vlm,
+                "final_threat": result.get("final_threat").value if hasattr(result.get("final_threat"), "value") else str(result.get("final_threat")),
+                "summary_text": result.get("summary_text", ""),
+                "timestamp": time.time(),
+            })
 
             if self.profiler is not None:
                 self.profiler.record_model_call(
@@ -923,13 +1016,21 @@ class AsyncVLMReviewer:
     ) -> Dict[str, Any]:
         """
         向后兼容接口：提交异步队列由后台执行真实大模型推理，
-        快通路主线程立即返回轻量仲裁快照，绝对禁止阻塞主视频与快通路渲染管线，
-        同时杜绝主线程与后台工作线程双重重复拉起 C++ 推理进程的资源竞争。
+        快通路主线程立即返回轻量仲裁快照，绝对禁止阻塞主视频与快通路渲染管线。
+        若该目标已有已完成的真实 VLM 战报且处于冷却期内，优先复用真实战报，杜绝被保底模板覆盖。
         """
-        # 1. 提交至异步队列由后台工作线程排队独占执行真实大模型
         if self._is_running:
+            dedup_key = self._get_dedup_key(event_record)
             self.submit_review_async(event_record, keyframes)
-            # 快通路立即返回端侧保底仲裁（< 1ms），真实 Qwen-VLM 战报将在后台完成后就地更新 event_record
+
+            with self._lock:
+                cached_entry = self._target_cooldown_map.get(dedup_key)
+                last_real = cached_entry.get("last_real_result") if cached_entry else None
+
+            if last_real is not None:
+                return dict(last_real)
+
+            # 首次触发尚未完成时，快通路立即返回端侧保底仲裁（< 1ms），不污染 review_history
             fallback = getattr(self.backend, "fallback_mock", None)
             if fallback:
                 provisional_out = fallback.infer(event_record, keyframes)
@@ -942,16 +1043,17 @@ class AsyncVLMReviewer:
                     "threat_escalation": "MAINTAIN",
                     "summary_text": "端侧 Qwen-VLM 正在异步复核中..."
                 }
-            return self._arbitrate_and_finalize(event_record, provisional_out)
+            return self._arbitrate_and_finalize(event_record, provisional_out, record_history=False)
 
         # 2. 若后台工作线程未开启（如纯离线测试），则同步执行复核
         raw_vlm_out = self.backend.infer(event_record, keyframes)
-        return self._arbitrate_and_finalize(event_record, raw_vlm_out)
+        return self._arbitrate_and_finalize(event_record, raw_vlm_out, record_history=True)
 
     def _arbitrate_and_finalize(
         self,
         event_record: ThreatEventRecord,
-        raw_vlm_out: Dict[str, Any]
+        raw_vlm_out: Dict[str, Any],
+        record_history: bool = True
     ) -> Dict[str, Any]:
         """
         核心安全权限沙箱：执行“只升不降铁律”与“纯视觉假阳性降级”
@@ -997,7 +1099,8 @@ class AsyncVLMReviewer:
             "timestamp": time.time()
         }
 
-        self.review_history.append(result)
+        if record_history:
+            self.review_history.append(result)
         return result
 
     def _worker_loop(self):
@@ -1009,6 +1112,7 @@ class AsyncVLMReviewer:
                 continue
 
             task_id, event_record, keyframes, callback = task
+            dedup_key = self._get_dedup_key(event_record)
             self.is_inferencing = True
             t0 = time.perf_counter()
             act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
@@ -1024,7 +1128,7 @@ class AsyncVLMReviewer:
             try:
                 raw_out = self.backend.infer(event_record, keyframes)
                 dur_ms = (time.perf_counter() - t0) * 1000.0
-                result = self._arbitrate_and_finalize(event_record, raw_out)
+                result = self._arbitrate_and_finalize(event_record, raw_out, record_history=True)
 
                 self.last_inference_ms = dur_ms
                 self.last_summary_text = result.get("summary_text", "")
@@ -1033,6 +1137,31 @@ class AsyncVLMReviewer:
                 backend_source = raw_out.get("backend_source", "FALLBACK_RULE_MOCK (离线规则保底模板)")
                 raw_text = raw_out.get("raw_output_text", "")
                 is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
+
+                with self._lock:
+                    if dedup_key in self._target_cooldown_map:
+                        self._target_cooldown_map[dedup_key]["last_real_result"] = dict(result)
+
+                fin_threat = result.get("final_threat")
+                fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
+
+                self.detailed_review_logs.append({
+                    "task_id": task_id,
+                    "event_id": event_record.event_id,
+                    "target_id": getattr(event_record, "target_id", None),
+                    "target_category": tgt_cat,
+                    "species_cn": species_str,
+                    "action_type": act_val,
+                    "distance_m": round(float(dist_m), 2),
+                    "dwell_time_sec": round(float(dwell_s), 2),
+                    "duration_ms": round(dur_ms, 2),
+                    "backend_source": backend_source,
+                    "is_real_vlm": is_real_vlm,
+                    "final_threat": fin_threat_val,
+                    "summary_text": result.get("summary_text", ""),
+                    "raw_output_text": raw_text.strip() if isinstance(raw_text, str) else "",
+                    "timestamp": time.time(),
+                })
 
                 # 记录到 profiler (标记为 is_async=True，避免污染单帧同步 E2E)
                 cond_tag = f"{'真实' if is_real_vlm else '保底'}复核({act_val})"
@@ -1044,9 +1173,6 @@ class AsyncVLMReviewer:
                         success=True,
                         is_async=True
                     )
-
-                fin_threat = result.get("final_threat")
-                fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
 
                 if is_real_vlm:
                     print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 [{task_id}] (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s)")
@@ -1080,8 +1206,24 @@ class AsyncVLMReviewer:
             finally:
                 self.is_inferencing = False
                 with self._lock:
+                    if dedup_key in self._target_cooldown_map:
+                        self._target_cooldown_map[dedup_key]["in_flight"] = False
                     self._active_tasks_count = max(0, self._active_tasks_count - 1)
                 self.task_queue.task_done()
+
+    def get_audit_summary(self) -> Dict[str, Any]:
+        """生成用于 JSON 性能报告的 VLM 慢通路审计详情"""
+        return {
+            "cooldown_window_sec": self.vlm_cooldown_sec,
+            "trigger_checks": self.trigger_checks,
+            "submitted_tasks": self.total_submitted_tasks,
+            "cooldown_skipped_count": self.cooldown_skipped_count,
+            "queue_dropped_count": self.queue_dropped_count,
+            "completed_reviews": self.total_completed_reviews,
+            "last_inference_ms": round(self.last_inference_ms, 2),
+            "last_summary_text": self.last_summary_text,
+            "reviews": list(self.detailed_review_logs),
+        }
 
     def wait_for_completion(self, timeout: float = 2.0) -> bool:
         """等待队列中所有任务执行完毕"""

@@ -273,7 +273,14 @@ class EvidenceRecorder:
         """
         if self.compress_buffer and isinstance(frame, np.ndarray) and frame.ndim >= 2:
             try:
-                _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                h, w = frame.shape[:2]
+                if w > 1280:
+                    new_w = 1280
+                    new_h = int(h * (1280.0 / float(w)))
+                    small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                else:
+                    small = frame
+                _, buf = cv2.imencode('.jpg', small, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 frame_to_store = buf
             except Exception:
                 frame_to_store = frame.copy()

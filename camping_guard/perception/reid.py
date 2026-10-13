@@ -83,6 +83,7 @@ class OSNetReIDExtractor:
             return pseudo / (norm + 1e-7)
 
         # 1. 预处理: BGR -> RGB, Resize, Transpose
+        t_pre0 = time.perf_counter()
         crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(crop_rgb, self.input_size)
         tensor = resized.astype(np.float32) / 255.0
@@ -90,20 +91,38 @@ class OSNetReIDExtractor:
         tensor = np.expand_dims(tensor, axis=0) # (1, 3, 256, 128)
         tensor = (tensor - self.mean) / self.std
 
-        # 2. 补齐到固定 batch 大小
+        # 2. 补齐到固定 batch 大小 (复用预分配连续缓冲区，消除每次 np.repeat 分配开销)
         if self.fixed_batch_size > 1:
-            pad_count = self.fixed_batch_size - 1
-            padded_batch = np.repeat(tensor, self.fixed_batch_size, axis=0)
-            outputs = self.session.run(None, {self.input_name: padded_batch})[0]
+            buf_shape = (self.fixed_batch_size, 3, self.input_size[1], self.input_size[0])
+            if getattr(self, "_batch_buffer", None) is None or self._batch_buffer.shape != buf_shape:
+                self._batch_buffer = np.zeros(buf_shape, dtype=np.float32)
+            self._batch_buffer[0] = tensor[0]
+            self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
+            t_inf0 = time.perf_counter()
+            outputs = self.session.run(None, {self.input_name: self._batch_buffer})[0]
+            inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
             feature = outputs[0]
         else:
+            self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
+            t_inf0 = time.perf_counter()
             feature = self.session.run(None, {self.input_name: tensor})[0][0]
+            inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+
+        self.last_gpu_compute_ms = float(getattr(self.session, "last_gpu_compute_ms", 0.0) or inf_wall_ms)
 
         # 3. L2 归一化
+        t_post0 = time.perf_counter()
         norm = np.linalg.norm(feature)
         if norm > 1e-7:
             feature = feature / norm
-        return feature.astype(np.float32)
+        res_feat = feature.astype(np.float32)
+        self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+        try:
+            self.session.last_preprocess_ms = self.last_preprocess_ms
+            self.session.last_postprocess_ms = self.last_postprocess_ms
+        except Exception:
+            pass
+        return res_feat
 
     def extract_from_frame(self, frame: np.ndarray, bbox: BoundingBox) -> np.ndarray:
         """从全景画面依据目标边界框安全裁剪并提取特征"""

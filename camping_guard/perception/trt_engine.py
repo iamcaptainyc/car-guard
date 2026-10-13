@@ -188,6 +188,8 @@ class TRTInferenceSession:
             if torch.cuda.is_available():
                 self._backend = "torch"
                 self._stream = torch.cuda.Stream()
+                self._start_event = torch.cuda.Event(enable_timing=True)
+                self._end_event = torch.cuda.Event(enable_timing=True)
                 return
         except ImportError:
             pass
@@ -272,9 +274,15 @@ class TRTInferenceSession:
                     inp_torch_dtype = torch.int64
 
                 if not isinstance(data, torch.Tensor):
-                    tensor = torch.from_numpy(np.ascontiguousarray(data)).to(device="cuda", dtype=inp_torch_dtype)
+                    cpu_tensor = torch.from_numpy(np.ascontiguousarray(data))
+                    if name in self._gpu_buffers and self._gpu_buffers[name].shape == cpu_tensor.shape and self._gpu_buffers[name].dtype == inp_torch_dtype:
+                        tensor = self._gpu_buffers[name]
+                        tensor.copy_(cpu_tensor, non_blocking=True)
+                    else:
+                        tensor = cpu_tensor.to(device="cuda", dtype=inp_torch_dtype, non_blocking=True)
+                        self._gpu_buffers[name] = tensor
                 else:
-                    tensor = data.to(device="cuda", dtype=inp_torch_dtype)
+                    tensor = data.to(device="cuda", dtype=inp_torch_dtype, non_blocking=True)
 
                 # 动态输入尺寸设置 (仅针对含动态 -1 维度的模型更新尺寸，若为静态且不匹配则抛出明确提示)
                 if self.is_trt10:
@@ -356,9 +364,9 @@ class TRTInferenceSession:
             if not self.is_trt10:
                 bindings = [tensor_ptrs[self.engine.get_binding_name(i)] for i in range(self.engine.num_bindings)]
 
-            # 4. 执行推理 (以 CUDA 硬件 Event 毫秒级高精度测速)
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            # 4. 执行推理 (复用预分配的 CUDA Event 毫秒级高精度测速)
+            start_event = getattr(self, "_start_event", None) or torch.cuda.Event(enable_timing=True)
+            end_event = getattr(self, "_end_event", None) or torch.cuda.Event(enable_timing=True)
             start_event.record(stream)
 
             if self.is_trt10:

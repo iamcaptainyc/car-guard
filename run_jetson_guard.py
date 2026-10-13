@@ -10,7 +10,7 @@
 2. 纯 TensorRT .engine 模型全管线挂载 (YOLO 目标检测 + RTMPose 姿态 + OSNet ReID + SCRFD/ArcFace 人脸)
 3. 缺失模型自动化一键编译引导 (对接 batch_convert_trt.py 与 trtexec)
 4. 多源视频流输入：MP4 视频文件、CSI 车载鱼眼相机 (nvarguscamerasrc)、USB (v4l2) 或 RTSP
-5. UI 渲染与 AI 推理流式解耦，保障车载级 30+ FPS 零卡顿物理流畅度
+5. 帧框同源合一实时渲染、1.0x 无卡顿录制与全维度 JSON 性能诊断报告自动导出
 =============================================================================
 """
 
@@ -300,6 +300,8 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None, help="最大测试评估帧数 (达到后自动结束)")
     parser.add_argument("--no-fire", action="store_true",
                         help="显式关闭火焰检测并发 (默认开启)")
+    parser.add_argument("--stats-json", type=str, default=None,
+                        help="额外指定全维度性能诊断 JSON 报告保存路径 (默认始终自动导出至 logs/latest_perf_report.json)")
 
     args = parser.parse_args()
 
@@ -435,6 +437,7 @@ def main():
         use_trt=True,
         loop_video=loop_val,
         output_path=args.output,
+        stats_json_path=args.stats_json,
         enable_web=args.web and not args.no_web,
         web_port=args.web_port,
         vlm_model_dir=args.vlm_model_dir,

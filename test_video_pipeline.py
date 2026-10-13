@@ -34,327 +34,6 @@ from run_simulation import draw_skeleton, draw_vehicle_and_zones
 from camping_guard.profiler import PipelineProfiler
 
 
-class TargetDisplaySnapshot:
-    """线程安全的目标快照，提供图层绘制与看板展示所需的所有属性"""
-    def __init__(self, target, source_frame_idx: int = 0):
-        self.track_id = target.track_id
-        self.category = target.category
-        self.bbox = copy.copy(target.bbox)
-        self.ground_dist = target.ground_dist
-        self.zone = target.zone
-        self.radial_speed = target.radial_speed
-        self.keypoints = copy.deepcopy(target.keypoints) if target.keypoints else None
-        self.is_whitelisted = target.is_whitelisted
-        self.cumulative_dwell_time = target.cumulative_dwell_time
-        self.velocity_pixel = getattr(target, 'velocity_pixel', (0.0, 0.0))
-        self.source_frame_idx = source_frame_idx
-
-
-class AsyncInferenceWorker:
-    """
-    车载级异步多线程流式推理引擎 (Decoupled Streaming Worker)
-    
-    设计原理:
-    车载环视/哨兵系统遵循【UI高帧率显示与AI按算力异步解耦】架构:
-    - 视频播放主线程按视频原生物理帧率 (如 25 FPS, 40ms) 平滑渲染播放，零卡顿、零阻塞、不跳帧。
-    - 后台工作线程以硬件支持的最大吞吐率 (~5-6 FPS, 180ms) 持续对最新到达的相机帧执行多模型端到端推理研判。
-    - 采用单槽最新帧邮箱 (Latest-Frame Mailbox) 机制，主线程非阻塞推送最新帧，工作线程处理完自动抓取最新帧，彻底杜绝队列积压延迟。
-    - 结果原子发布: 工作线程完成推理后原子更新 targets、threat_level、e2e_ms 等快照，主线程无锁/轻量锁读取最新结果进行图层叠加。
-    """
-    def __init__(self, engine: CampingGuardEngine, camera_id: int = 1):
-        self.engine = engine
-        self.camera_id = camera_id
-
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._stopped = False
-
-        # 邮箱中待处理的最新帧与虚拟时间戳
-        self._pending_frame = None
-        self._pending_timestamp = 0.0
-        self._pending_frame_idx = 0
-
-        # 最新推理结果快照 (供主线程渲染叠加)
-        self.latest_tick_result = {
-            "threat_level": "L0 正常安全",
-            "state": "S0 待机",
-            "mode": "车内模式",
-            "e2e_ms": 0.0,
-            "actions": [],
-            "vlm_summary": "慢通路静默等待",
-            "metrics": None
-        }
-        self.latest_targets = []
-        self.latest_roi_disturbances = []
-        self.ai_fps = 0.0
-        self.ai_e2e_ms = 0.0
-        self.processed_count = 0
-        self.latest_source_frame_idx = 0
-
-        self._last_finish_time = time.time()
-
-        # 启动守护工作线程
-        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="CampingGuard-AI-Worker")
-        self._thread.start()
-
-    def submit_frame(self, frame: np.ndarray, timestamp: float, frame_idx: int = 0):
-        """主线程推送最新帧 (非阻塞，若有未处理帧则覆盖为最新帧，防止延迟累积)"""
-        with self._cond:
-            self._pending_frame = frame.copy()
-            self._pending_timestamp = timestamp
-            self._pending_frame_idx = frame_idx
-            self._cond.notify()
-
-    def get_latest_snapshot(self):
-        """主线程获取最新推理结果快照 (轻量锁快速读取)"""
-        with self._lock:
-            return {
-                "tick_result": dict(self.latest_tick_result),
-                "active_targets": list(self.latest_targets),
-                "active_roi_disturbances": list(self.latest_roi_disturbances),
-                "ai_fps": self.ai_fps,
-                "ai_e2e_ms": self.ai_e2e_ms,
-                "processed_count": self.processed_count,
-                "source_frame_idx": self.latest_source_frame_idx
-            }
-
-    def stop(self):
-        """安全停止工作线程"""
-        with self._cond:
-            self._stopped = True
-            self._cond.notify_all()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-    def _worker_loop(self):
-        while True:
-            frame_to_process = None
-            sim_time = 0.0
-            sim_frame_idx = 0
-
-            with self._cond:
-                while not self._stopped and self._pending_frame is None:
-                    self._cond.wait(timeout=0.05)
-                if self._stopped:
-                    break
-                frame_to_process = self._pending_frame
-                sim_time = self._pending_timestamp
-                sim_frame_idx = self._pending_frame_idx
-                self._pending_frame = None  # 取走最新帧，清空邮箱
-
-            if frame_to_process is None:
-                continue
-
-            try:
-                t_start = time.perf_counter()
-                camera_dict = {self.camera_id: frame_to_process}
-
-                # 执行整套算法链推理
-                tick_res = self.engine.process_tick(
-                    camera_frames=camera_dict,
-                    raw_detections=None,
-                    current_time=sim_time
-                )
-
-                t_cost = (time.perf_counter() - t_start) * 1000.0  # ms
-                now_wall = time.time()
-                dt = now_wall - self._last_finish_time
-                self._last_finish_time = now_wall
-                inst_fps = 1.0 / max(dt, 1e-4)
-
-                # 创建快照目标对象
-                targets_snapshot = [TargetDisplaySnapshot(t, source_frame_idx=sim_frame_idx) for t in self.engine.active_targets]
-                roi_snapshot = [dict(d) for d in self.engine.active_roi_disturbances]
-
-                # 原子更新对外快照
-                with self._lock:
-                    self.latest_tick_result = tick_res
-                    self.latest_targets = targets_snapshot
-                    self.latest_roi_disturbances = roi_snapshot
-                    self.ai_e2e_ms = t_cost
-                    self.ai_fps = 0.8 * self.ai_fps + 0.2 * inst_fps if self.ai_fps > 0 else inst_fps
-                    self.processed_count += 1
-                    self.latest_source_frame_idx = sim_frame_idx
-            except Exception as e:
-                import traceback
-                print(f"[!] 后台 AI 推理线程发生异常: {e}")
-                traceback.print_exc()
-
-
-class RealtimeMotionCompensator:
-    """
-    车载级高帧率目标运动补偿与光流插值器 (Real-time Motion Compensator)
-    
-    原理与技术优势:
-    在 25 FPS 视频播放主线程中，由于后台 AI 深度学习模型存在处理延迟 (~500ms, 约 10~15 帧)，
-    补偿器结合【卡尔曼前向速度推断】与【帧间微光流 (Lucas-Kanade) 连续追踪】，
-    实时补偿由于后台异步延迟导致的运动位移差，使目标框在每一帧 (40ms) 紧紧贴合运动目标，
-    彻底消除目标框在人物后面滞后漂移的现象！
-    """
-    def __init__(self):
-        self.prev_gray = None
-        self.tracked_targets = {}
-        self.last_snapshot_count = -1
-
-    def reset(self):
-        self.prev_gray = None
-        self.tracked_targets.clear()
-        self.last_snapshot_count = -1
-
-    def update(self, current_frame: np.ndarray, current_frame_idx: int, snapshot: dict) -> list:
-        h, w = current_frame.shape[:2]
-        curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-
-        raw_targets = snapshot.get("active_targets", [])
-        snapshot_count = snapshot.get("processed_count", 0)
-        source_frame_idx = snapshot.get("source_frame_idx", current_frame_idx)
-
-        # 1. 检查是否有新 AI 快照到达
-        is_new_snapshot = (snapshot_count != self.last_snapshot_count)
-        if is_new_snapshot:
-            self.last_snapshot_count = snapshot_count
-            new_target_map = {}
-            delta_f = max(0, current_frame_idx - source_frame_idx)
-
-            for t in raw_targets:
-                vx, vy = getattr(t, 'velocity_pixel', (0.0, 0.0))
-                # 卡尔曼前向速度外插补偿 (补偿后台推理延迟导致的帧差，并设置物理上限防止跳跃)
-                max_shift = max(40.0, float(t.bbox.w))
-                comp_shift_x = float(np.clip(vx * delta_f, -max_shift, max_shift))
-                comp_shift_y = float(np.clip(vy * delta_f, -max_shift, max_shift))
-                comp_x = t.bbox.x + comp_shift_x
-                comp_y = t.bbox.y + comp_shift_y
-                comp_x = max(0, min(w - 10, comp_x))
-                comp_y = max(0, min(h - 10, comp_y))
-
-                # 若当前已有光流追踪，平滑融合检测位置与光流位置 (若偏差过大则强行对齐到 AI 外插，防止光流漂移)
-                if t.track_id in self.tracked_targets:
-                    prev_info = self.tracked_targets[t.track_id]
-                    dist_err = ((comp_x - prev_info['bbox'][0])**2 + (comp_y - prev_info['bbox'][1])**2) ** 0.5
-                    if dist_err > max(40.0, 0.5 * t.bbox.w):
-                        fx = comp_x
-                        fy = comp_y
-                    else:
-                        fx = 0.4 * comp_x + 0.6 * prev_info['bbox'][0]
-                        fy = 0.4 * comp_y + 0.6 * prev_info['bbox'][1]
-                else:
-                    fx = comp_x
-                    fy = comp_y
-
-                # 提取微光流跟踪角点
-                bx, by, bw, bh = int(fx), int(fy), int(t.bbox.w), int(t.bbox.h)
-                pts = self._extract_tracking_points(curr_gray, bx, by, bw, bh)
-
-                new_target_map[t.track_id] = {
-                    'bbox': [fx, fy, float(t.bbox.w), float(t.bbox.h)],
-                    'pts': pts,
-                    'target': t
-                }
-            self.tracked_targets = new_target_map
-
-        else:
-            # 2. 中间帧 (40ms): 运行微光流追踪与卡尔曼惯性推进
-            if self.prev_gray is not None and self.tracked_targets:
-                for tid, info in list(self.tracked_targets.items()):
-                    pts = info['pts']
-                    bx, by, bw, bh = info['bbox']
-                    vx, vy = getattr(info['target'], 'velocity_pixel', (0.0, 0.0))
-
-                    dx, dy = 0.0, 0.0
-                    tracked_by_flow = False
-
-                    if pts is not None and len(pts) >= 4:
-                        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                            self.prev_gray, curr_gray, pts, None,
-                            winSize=(15, 15), maxLevel=2,
-                            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-                        )
-                        valid = (status.flatten() == 1)
-                        if np.sum(valid) >= 3:
-                            good_prev = pts[valid].reshape(-1, 2)
-                            good_next = next_pts[valid].reshape(-1, 2)
-                            dx = float(np.median(good_next[:, 0] - good_prev[:, 0]))
-                            dy = float(np.median(good_next[:, 1] - good_prev[:, 1]))
-                            if abs(dx) < 30 and abs(dy) < 30:
-                                tracked_by_flow = True
-                                info['pts'] = next_pts[valid].reshape(-1, 1, 2)
-
-                    if not tracked_by_flow:
-                        # 纹理丢失时光流退化为卡尔曼速度外插
-                        dx = vx
-                        dy = vy
-                        if info['pts'] is not None and len(info['pts']) > 0:
-                            info['pts'][:, 0, 0] += dx
-                            info['pts'][:, 0, 1] += dy
-                        else:
-                            info['pts'] = self._extract_tracking_points(curr_gray, int(bx + dx), int(by + dy), int(bw), int(bh))
-
-                    new_bx = max(0, min(w - 10, bx + dx))
-                    new_by = max(0, min(h - 10, by + dy))
-                    info['bbox'] = [new_bx, new_by, bw, bh]
-
-                    # 补充或刷新跟踪点
-                    if info['pts'] is None or len(info['pts']) < 4:
-                        info['pts'] = self._extract_tracking_points(curr_gray, int(new_bx), int(new_by), int(bw), int(bh))
-
-        self.prev_gray = curr_gray
-
-        # 3. 输出补偿后的实时显示目标列表
-        from camping_guard.types import BoundingBox
-        compensated_targets = []
-        for tid, info in self.tracked_targets.items():
-            t_orig = info['target']
-            bx, by, bw, bh = info['bbox']
-
-            comp_t = copy.copy(t_orig)
-            comp_t.bbox = BoundingBox(int(round(bx)), int(round(by)), int(round(bw)), int(round(bh)))
-
-            # 若有骨骼点，随目标平移同步位移补偿
-            if t_orig.keypoints:
-                orig_bx = t_orig.bbox.x
-                orig_by = t_orig.bbox.y
-                shift_x = bx - orig_bx
-                shift_y = by - orig_by
-                new_kpts = {}
-                for kpt_name, kpt_val in t_orig.keypoints.items():
-                    if len(kpt_val) >= 3:
-                        kx, ky, conf = kpt_val[0], kpt_val[1], kpt_val[2]
-                        new_kpts[kpt_name] = (kx + shift_x, ky + shift_y, conf)
-                    else:
-                        kx, ky = kpt_val[0], kpt_val[1]
-                        new_kpts[kpt_name] = (kx + shift_x, ky + shift_y)
-                comp_t.keypoints = new_kpts
-
-            compensated_targets.append(comp_t)
-
-        # 保护性兜底: 若补偿池因故为空但 AI 快照已有目标，立即无缝降级直通快照，杜绝目标框丢失
-        if len(compensated_targets) == 0 and len(raw_targets) > 0:
-            return raw_targets
-
-        return compensated_targets
-
-    def _extract_tracking_points(self, gray: np.ndarray, x: int, y: int, w: int, h: int) -> Optional[np.ndarray]:
-        """在目标框内自适应提取跟踪特征点"""
-        h_img, w_img = gray.shape[:2]
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(w_img, x + w), min(h_img, y + h)
-        if x2 - x1 < 10 or y2 - y1 < 10:
-            return None
-
-        roi = gray[y1:y2, x1:x2]
-        corners = cv2.goodFeaturesToTrack(roi, maxCorners=16, qualityLevel=0.02, minDistance=5)
-        if corners is not None and len(corners) > 0:
-            corners[:, 0, 0] += x1
-            corners[:, 0, 1] += y1
-            return corners.astype(np.float32)
-
-        grid_x = np.linspace(x1 + w * 0.2, x2 - w * 0.2, 3)
-        grid_y = np.linspace(y1 + h * 0.2, y2 - h * 0.2, 3)
-        xv, yv = np.meshgrid(grid_x, grid_y)
-        pts = np.vstack([xv.flatten(), yv.flatten()]).T
-        return pts.reshape(-1, 1, 2).astype(np.float32)
-
-
 _SIDEBAR_FONT_CACHE = {}
 
 
@@ -545,7 +224,7 @@ def draw_telemetry_sidebar(
     if is_realtime_mode and ai_fps is not None:
         put_sb(f"视频显示: {real_fps:4.1f} FPS (实时平滑流速)", 322, font_size=12, color=(0, 255, 200))
         put_sb(f"AI耗时: {e2e_val:5.1f} ms | AI吞吐: {ai_fps:4.1f} FPS", 340, font_size=12, color=(220, 220, 220))
-        put_sb("追踪增强: 卡尔曼外插+微光流 (零滞后)", 358, font_size=11, color=(120, 255, 180))
+        put_sb("渲染模式: 帧框同源合一 (100%零框延迟)", 358, font_size=11, color=(120, 255, 180))
     else:
         put_sb(f"E2E 延时: {e2e_val:5.1f} ms ({1000.0/max(e2e_val, 1e-3):4.1f} FPS)", 324, font_size=12, color=(220, 220, 220))
 
@@ -1113,12 +792,12 @@ def run_video_pipeline(
     start_wall_time = time.perf_counter()
     t_prev = time.perf_counter()
     real_fps = fps
+    skipped_frames_count = 0
+    output_written_frames_count = 0
 
     # 5. 若启用 --realtime 实时流速模式，启动处理后实时帧流步调控制器
-    worker = None
-    compensator = None
     if realtime:
-        print("[*] 正在启动同步处理实时帧流引擎 (--realtime 已激活): 视频流按物理帧率节拍播放，逐帧处理并即时渲染，零框延迟、零骨骼漂移")
+        print("[*] 正在启动同步处理实时帧流引擎 (--realtime 已激活): 帧框同源合一渲染，按物理帧率节拍播放与录制，零框延迟、零骨骼漂移")
 
     def handle_interactive_key(k: int, now_time: float):
         """处理快捷键交互，返回 (event_msg, should_quit, req_reset)"""
@@ -1179,11 +858,6 @@ def run_video_pipeline(
         cleaned_up = True
         if term_listener is not None:
             term_listener.stop()
-        if realtime and worker is not None:
-            try:
-                worker.stop()
-            except Exception:
-                pass
         if web_streamer:
             try:
                 web_streamer.stop()
@@ -1200,7 +874,7 @@ def run_video_pipeline(
                 writer = None
                 if output_path and os.path.exists(output_path):
                     f_size = os.path.getsize(output_path)
-                    print(f"\n[OK] 导出视频已安全封口保存: {output_path} ({f_size / 1024 / 1024:.2f} MB)")
+                    print(f"\n[OK] 导出视频已安全封口保存: {output_path} ({f_size / 1024 / 1024:.2f} MB, 共写入 {output_written_frames_count} 帧)")
             except Exception as e:
                 print(f"[!] 释放 VideoWriter 异常: {e}")
         try:
@@ -1261,8 +935,6 @@ def run_video_pipeline(
                     start_wall_time = time.perf_counter()
                     sim_event_msg = "网页端指令: 重置视频起点"
                     sim_event_time = video_timestamp
-                    if compensator:
-                        compensator.reset()
                 elif web_act == "inject_handle":
                     engine.vehicle_bus.inject_door_handle_pull("handle_fl")
                     sim_event_msg = "【CAN 注入】门把手被机械拉动 -> 联合确认升 L3 紧急！"
@@ -1315,8 +987,6 @@ def run_video_pipeline(
                         start_wall_time = time.perf_counter()
                         sim_event_msg = msg
                         sim_event_time = video_timestamp
-                        if compensator:
-                            compensator.reset()
                     elif msg == "TOGGLE_VIEW":
                         view_mode = "MINIMAL" if view_mode == "SIDEBAR" else "SIDEBAR"
                         sim_event_msg = f"已切换视图: {view_mode}"
@@ -1343,8 +1013,6 @@ def run_video_pipeline(
                     print("[!] 错误: 视频回放无法重置，退出。")
                     break
                 frame_idx = 1
-                if compensator:
-                    compensator.reset()
                 start_wall_time = time.perf_counter()
                 print("[*] 视频播放完毕，循环重播中...")
             else:
@@ -1360,7 +1028,7 @@ def run_video_pipeline(
         # 视频虚拟时间戳推进 (严格与视频源物理帧率对齐，彻底解决 CPU 处理慢导致速度与滞留时间被扭曲的缺陷)
         video_timestamp = base_sim_time + (frame_idx / fps)
 
-        # 4. 算法研判分发 (单流同步处理帧流：逐帧推理、逐帧绘制，确保画面展示 100% 处理帧，杜绝异步框延迟)
+        # 4. 算法研判分发 (铁律 1：100% 帧框同源合一，当前帧同步推理并直接在该帧上绘制 OpenCV 检测框与骨骼点)
         camera_dict = {camera_id: frame}
         run_detection = (frame_idx % detect_interval == 0) if detect_interval > 1 else True
         tick_res = engine.process_tick(
@@ -1373,101 +1041,103 @@ def run_video_pipeline(
         ai_e2e_ms = tick_res.get("e2e_ms", 0.0)
         ai_fps = 1000.0 / max(ai_e2e_ms, 1e-3)
 
-        # 5. 可视化增强绘制
-        render_frame = frame.copy()
+        # 5. 可视化增强绘制与输出推流 (纳入 Render_and_Output 阶段性能统计)
+        with engine.profiler.profile_stage("Render_and_Output"):
+            render_frame = frame.copy()
 
-        # 绘制车周防区参考线与固定 ROI (根据当前机位 camera_id 独立匹配与渲染)
-        draw_vehicle_and_zones(render_frame, engine, camera_id=camera_id)
+            # 绘制车周防区参考线与固定 ROI (根据当前机位 camera_id 独立匹配与渲染)
+            draw_vehicle_and_zones(render_frame, engine, camera_id=camera_id)
 
-        # 绘制检测与追踪目标 (框上所有提示字符 100% 采用 ASCII 英文，杜绝 OpenCV putText 乱码)
-        for t in active_targets:
-            bx, by, bw, bh = t.bbox.x, t.bbox.y, t.bbox.w, t.bbox.h
-            z_val = t.zone.value if hasattr(t.zone, 'value') else str(t.zone)
-            z_short = "Zone 2" if ("Zone 2" in z_val or "2" in z_val) else ("Zone 1" if ("Zone 1" in z_val or "1" in z_val) else "Zone 0")
-            cat_str = str(t.category).lower()
-            if "person" in cat_str or "人" in str(t.category):
-                cat_short = "Person"
-            elif "car" in cat_str or "veh" in cat_str or "车" in str(t.category):
-                cat_short = "Vehicle"
-            elif "fire" in cat_str or "火" in str(t.category):
-                cat_short = "Fire"
-            elif "smoke" in cat_str or "烟" in str(t.category):
-                cat_short = "Smoke"
-            elif "large_beast" in cat_str or "beast" in cat_str:
-                sp = getattr(t, 'species', None)
-                cat_short = f"Beast({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Beast"
-            elif "small_animal" in cat_str or "animal" in cat_str or "兽" in str(t.category) or "物" in str(t.category):
-                sp = getattr(t, 'species', None)
-                cat_short = f"Animal({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Animal"
+            # 绘制检测与追踪目标 (框上所有提示字符 100% 采用 ASCII 英文，杜绝 OpenCV putText 乱码)
+            for t in active_targets:
+                bx, by, bw, bh = t.bbox.x, t.bbox.y, t.bbox.w, t.bbox.h
+                z_val = t.zone.value if hasattr(t.zone, 'value') else str(t.zone)
+                z_short = "Zone 2" if ("Zone 2" in z_val or "2" in z_val) else ("Zone 1" if ("Zone 1" in z_val or "1" in z_val) else "Zone 0")
+                cat_str = str(t.category).lower()
+                if "person" in cat_str or "人" in str(t.category):
+                    cat_short = "Person"
+                elif "car" in cat_str or "veh" in cat_str or "车" in str(t.category):
+                    cat_short = "Vehicle"
+                elif "fire" in cat_str or "火" in str(t.category):
+                    cat_short = "Fire"
+                elif "smoke" in cat_str or "烟" in str(t.category):
+                    cat_short = "Smoke"
+                elif "large_beast" in cat_str or "beast" in cat_str:
+                    sp = getattr(t, 'species', None)
+                    cat_short = f"Beast({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Beast"
+                elif "small_animal" in cat_str or "animal" in cat_str or "兽" in str(t.category) or "物" in str(t.category):
+                    sp = getattr(t, 'species', None)
+                    cat_short = f"Animal({sp})" if sp and sp not in ['unknown', 'unclassified_animal'] else "Animal"
+                else:
+                    cat_short = str(t.category).split(".")[-1].capitalize()
+
+                color = (0, 255, 120) if t.is_whitelisted else ((0, 160, 255) if "Zone 2" in z_short else (255, 180, 0))
+                cv2.rectangle(render_frame, (bx, by), (bx + bw, by + bh), color, 2)
+
+                sess_suffix = f"({t.person_session_id})" if t.person_session_id else ""
+                dwell_s = max(0.0, float(getattr(t, "cumulative_dwell_time", 0.0)))
+                dist_val = float(getattr(t, "ground_dist", 0.0))
+                vr_val = float(getattr(t, "radial_speed", 0.0))
+                info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {dist_val:.1f}m ({z_short}) | Dwell:{dwell_s:.1f}s | vr:{vr_val:+.1f}m/s"
+                cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+                # 若有骨骼点则渲染 (传入当前 bbox，严格限制连线在人体合理生理轮廓内，防止骨骼划出框外)
+                if t.keypoints:
+                    draw_skeleton(render_frame, t.keypoints, bbox=t.bbox)
+
+            # 画面组合输出: 默认直通 1080P 原始画面 (0% CPU 绘图损耗，所有遥测指标实时推流至 Web 仪表盘)
+            if show_sidebar and view_mode == "SIDEBAR":
+                display_frame = draw_telemetry_sidebar(
+                    video_frame=render_frame,
+                    engine=engine,
+                    tick_result=tick_res,
+                    real_fps=real_fps,
+                    frame_idx=frame_idx,
+                    total_frames=total_frames,
+                    is_paused=is_paused,
+                    sim_status=sim_event_msg,
+                    camera_id=camera_id,
+                    detector_name=Path(chosen_detector_path).stem if chosen_detector_path else "MOG2",
+                    panel_w=panel_w,
+                    targets_override=active_targets,
+                    roi_disturbances_override=active_rois,
+                    ai_fps=ai_fps,
+                    ai_e2e_ms=ai_e2e_ms,
+                    is_realtime_mode=realtime
+                )
             else:
-                cat_short = str(t.category).split(".")[-1].capitalize()
+                display_frame = render_frame
 
-            color = (0, 255, 120) if t.is_whitelisted else ((0, 160, 255) if "Zone 2" in z_short else (255, 180, 0))
-            cv2.rectangle(render_frame, (bx, by), (bx + bw, by + bh), color, 2)
+            # 显示与保存
+            if not headless:
+                try:
+                    cv2.imshow(window_name, display_frame)
+                except cv2.error:
+                    headless = True
+                    print("[!] 检测到无显示环境，已自动切换为 --headless 无头静默模式")
 
-            sess_suffix = f"({t.person_session_id})" if t.person_session_id else ""
-            dwell_s = max(0.0, float(getattr(t, "cumulative_dwell_time", 0.0)))
-            dist_val = float(getattr(t, "ground_dist", 0.0))
-            vr_val = float(getattr(t, "radial_speed", 0.0))
-            info_text = f"ID:{t.track_id}{sess_suffix} {cat_short} | {dist_val:.1f}m ({z_short}) | Dwell:{dwell_s:.1f}s | vr:{vr_val:+.1f}m/s"
-            cv2.putText(render_frame, info_text, (bx, max(15, by - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            if writer is not None:
+                writer.write(display_frame)
+                output_written_frames_count += 1
 
-            # 若有骨骼点则渲染 (传入当前 bbox，严格限制连线在人体合理生理轮廓内，防止骨骼划出框外)
-            if t.keypoints:
-                draw_skeleton(render_frame, t.keypoints, bbox=t.bbox)
-
-        # 画面组合输出: 默认直通 1080P 原始画面 (0% CPU 绘图损耗，所有遥测指标实时推流至 Web 仪表盘)
-        if show_sidebar and view_mode == "SIDEBAR":
-            display_frame = draw_telemetry_sidebar(
-                video_frame=render_frame,
-                engine=engine,
-                tick_result=tick_res,
-                real_fps=real_fps,
-                frame_idx=frame_idx,
-                total_frames=total_frames,
-                is_paused=is_paused,
-                sim_status=sim_event_msg,
-                camera_id=camera_id,
-                detector_name=Path(chosen_detector_path).stem if chosen_detector_path else "MOG2",
-                panel_w=panel_w,
-                targets_override=active_targets,
-                roi_disturbances_override=active_rois,
-                ai_fps=ai_fps,
-                ai_e2e_ms=ai_e2e_ms,
-                is_realtime_mode=realtime
-            )
-        else:
-            display_frame = render_frame
-
-        # 显示与保存
-        if not headless:
-            try:
-                cv2.imshow(window_name, display_frame)
-            except cv2.error:
-                headless = True
-                print("[!] 检测到无显示环境，已自动切换为 --headless 无头静默模式")
-
-        if writer:
-            writer.write(display_frame)
-
-        # 网页端实时推流与全维度遥测指标同步 (视频 100% 直通 1080P 原画，指标交由 Web DOM 渲染)
-        if web_streamer:
-            web_streamer.push_frame(render_frame)
-            web_streamer.update_telemetry(
-                active_targets=active_targets,
-                active_rois=active_rois,
-                latest_event=engine.historical_threat_events[-1] if getattr(engine, "historical_threat_events", None) else None,
-                threat_level=f"{tick_res.get('threat_level', 'L0')}",
-                state=f"{tick_res.get('state', 'S0')}",
-                mode=f"{tick_res.get('mode', '车内模式')}",
-                fps=real_fps,
-                ai_fps=ai_fps,
-                e2e_ms=ai_e2e_ms or 0.0,
-                frame_idx=frame_idx,
-                total_frames=total_frames,
-                uwb_online=(engine.vehicle_bus.uwb_key_pos is not None)
-            )
+            # 网页端实时推流与全维度遥测指标同步 (视频 100% 直通 1080P 帧框合一画面，指标交由 Web DOM 渲染)
+            if web_streamer:
+                web_streamer.push_frame(render_frame)
+                web_streamer.update_telemetry(
+                    active_targets=active_targets,
+                    active_rois=active_rois,
+                    latest_event=engine.historical_threat_events[-1] if getattr(engine, "historical_threat_events", None) else None,
+                    threat_level=f"{tick_res.get('threat_level', 'L0')}",
+                    state=f"{tick_res.get('state', 'S0')}",
+                    mode=f"{tick_res.get('mode', '车内模式')}",
+                    fps=real_fps,
+                    ai_fps=ai_fps,
+                    e2e_ms=ai_e2e_ms or 0.0,
+                    frame_idx=frame_idx,
+                    total_frames=total_frames,
+                    uwb_online=(engine.vehicle_bus.uwb_key_pos is not None)
+                )
 
         # 6. 交互按键监听与动态帧率步调控制
         now_render = time.perf_counter()
@@ -1476,14 +1146,22 @@ def run_video_pipeline(
             target_wall_time = start_wall_time + (frame_idx * target_frame_interval)
             remaining_sec = target_wall_time - now_render
             wait_ms = max(1, int(remaining_sec * 1000.0)) if remaining_sec > 0 else 1
-            # 追赶物理时钟与排空硬件驱动队列:
-            # 当单帧 AI 耗时超出帧间隔时 (如 Jetson Orin 耗时 ~55ms > 33ms)，
-            # 必须快速抓取跳过积压陈旧帧，保障实时流以 1.0x 真实流速播放，杜绝硬件队列积压导致的数秒级画面延迟
-            if remaining_sec < -0.04:
+            # 追赶物理时钟与保证 1.0x 平滑录像:
+            # 当偶发重负载帧导致单帧耗时超出物理帧间隔时，跳过积压帧以追赶物理时钟；
+            # 若开启了 --output 录像，按实际跨越的时间槽位补齐当前已渲染的同源帧，防止导出视频因缺帧产生快进跳变卡顿
+            if remaining_sec < -max(0.04, target_frame_interval):
                 lag_frames = min(int((-remaining_sec) / target_frame_interval), 3)
                 for _ in range(lag_frames):
-                    cap.grab()
-                    frame_idx += 1
+                    if not is_cam_or_pipe:
+                        if cap.grab():
+                            frame_idx += 1
+                            skipped_frames_count += 1
+                            if writer is not None:
+                                writer.write(display_frame)
+                                output_written_frames_count += 1
+                    else:
+                        cap.grab()
+                        skipped_frames_count += 1
         else:
             # 同步模式: 减去当帧算法处理耗时
             e2e_ms = tick_res.get("e2e_ms", 0.0)
@@ -1549,8 +1227,6 @@ def run_video_pipeline(
                 start_wall_time = time.perf_counter()
                 sim_event_msg = "网页端指令: 重置视频起点"
                 sim_event_time = video_timestamp
-                if compensator:
-                    compensator.reset()
             elif web_act == "inject_handle":
                 engine.vehicle_bus.inject_door_handle_pull("handle_fl")
                 sim_event_msg = "【CAN 注入】门把手被机械拉动 -> 联合确认升 L3 紧急！"
@@ -1593,8 +1269,6 @@ def run_video_pipeline(
                     start_wall_time = time.perf_counter()
                     sim_event_msg = msg
                     sim_event_time = video_timestamp
-                    if compensator:
-                        compensator.reset()
                 elif msg == "TOGGLE_VIEW":
                     view_mode = "MINIMAL" if view_mode == "SIDEBAR" else "SIDEBAR"
                     sim_event_msg = f"已切换视图模式: {view_mode}"
@@ -1614,19 +1288,59 @@ def run_video_pipeline(
         except Exception:
             pass
 
+    # 汇总运行期上下文供全维度 JSON 性能诊断报告使用
+    processed_cnt = engine.profiler.total_frames
+    total_seen = processed_cnt + skipped_frames_count
+    vlm_audit_summary = (
+        engine.vlm_reviewer.get_audit_summary()
+        if hasattr(engine, "vlm_reviewer") and hasattr(engine.vlm_reviewer, "get_audit_summary")
+        else {}
+    )
+    engine.profiler.set_runtime_context(
+        video_path=str(video_path),
+        video_name=display_video_name,
+        resolution=f"{video_w}x{video_h}",
+        source_fps=round(float(fps), 2),
+        total_source_frames=int(total_frames),
+        processed_frames=int(processed_cnt),
+        last_frame_idx=int(frame_idx),
+        skipped_frames=int(skipped_frames_count),
+        skip_ratio_pct=round(skipped_frames_count * 100.0 / max(1, total_seen), 2),
+        output_path=str(output_path) if output_path else None,
+        output_written_frames=int(output_written_frames_count),
+        real_fps_final=round(float(real_fps), 2),
+        realtime_mode=bool(realtime),
+        use_trt=bool(use_trt),
+        camera_id=int(camera_id),
+        detector_model=str(chosen_detector_path) if chosen_detector_path else "MOG2",
+        fire_enabled=bool(enable_fire),
+        vlm_audit=vlm_audit_summary,
+        threat_events_count=len(getattr(engine, "historical_threat_events", []))
+    )
+
     # 打印视频全流程端到端与各模型综合性能统计报告
     print("\n" + engine.profiler.format_summary_table())
 
     # 打印全维度守卫事件审计报告与 App 标准推送 JSON
     print_guard_event_summary(engine, str(video_path), frame_idx, fps)
 
-    # 若指定导出路径，保存为标准化 JSON 报告
-    if stats_json_path:
-        import json
-        summary_data = engine.profiler.get_summary()
-        with open(stats_json_path, "w", encoding="utf-8") as f:
-            json.dump(summary_data, f, indent=2, ensure_ascii=False)
-        print(f"[OK] 性能评估指标已成功保存为 JSON: {Path(stats_json_path).resolve()}")
+    # 默认自动导出全维度 JSON 性能诊断报告至 logs/ 目录，若用户指定了 --stats-json 则同步导出
+    try:
+        video_stem = Path(str(video_path)).stem if not is_cam_or_pipe else f"cam{camera_id}"
+        safe_stem = "".join(c if (c.isalnum() or c in "-_") else "_" for c in video_stem)[:32] or "video"
+        ts_tag = time.strftime("%Y%m%d_%H%M%S")
+        default_latest_json = Path("logs") / "latest_perf_report.json"
+        default_archive_json = Path("logs") / f"perf_report_{safe_stem}_{ts_tag}.json"
+        latest_saved = engine.profiler.export_json_report(default_latest_json)
+        archive_saved = engine.profiler.export_json_report(default_archive_json)
+        print(f"[OK] 全维度性能诊断 JSON 报告已自动导出:")
+        print(f"     - 最新报告 (固定路径): {latest_saved}")
+        print(f"     - 归档报告 (带时间戳): {archive_saved}")
+        if stats_json_path:
+            custom_saved = engine.profiler.export_json_report(stats_json_path)
+            print(f"     - 指定路径 (--stats-json): {custom_saved}")
+    except Exception as e:
+        print(f"[!] 导出性能诊断 JSON 报告异常: {e}")
 
 
 def print_guard_event_summary(engine: CampingGuardEngine, video_source: str, total_frames: int, fps: float):

@@ -237,7 +237,11 @@ class RTMPoseEstimator(BasePoseEstimator):
             return []
 
         results = []
+        total_pre = 0.0
+        total_gpu = 0.0
+        total_post = 0.0
         for bbox in bboxes:
+            t_pre0 = time.perf_counter()
             crop_img, inv_matrix = self.crop_and_warp(frame, bbox)
 
             if self.session is not None:
@@ -248,12 +252,18 @@ class RTMPoseEstimator(BasePoseEstimator):
                 std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
                 norm_img = (norm_img - mean) / std
                 blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...] # [1, 3, 256, 192]
+                total_pre += (time.perf_counter() - t_pre0) * 1000.0
 
                 # 优先显式按顺序索取 simcc_x 与 simcc_y，若底层不支持则传 None
                 avail_outputs = [o.name for o in self.session.get_outputs()] if hasattr(self.session, "get_outputs") else []
                 req_names = ["simcc_x", "simcc_y"] if ("simcc_x" in avail_outputs and "simcc_y" in avail_outputs) else None
 
+                t_inf0 = time.perf_counter()
                 outputs = self.session.run(req_names, {self.input_name: blob})
+                inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+                total_gpu += float(getattr(self.session, "last_gpu_compute_ms", 0.0) or inf_wall_ms)
+
+                t_post0 = time.perf_counter()
                 out0 = outputs[0][0]
                 out1 = outputs[1][0]
                 # 无论底层是 ONNXRuntime 还是 TensorRT Engine，无论底层枚举顺序如何，
@@ -266,12 +276,25 @@ class RTMPoseEstimator(BasePoseEstimator):
                     simcc_x, simcc_y = out0, out1
 
                 kpts = self.decode_simcc(simcc_x, simcc_y, inv_matrix, bbox=bbox)
+                total_post += (time.perf_counter() - t_post0) * 1000.0
                 results.append(kpts)
             else:
+                total_pre += (time.perf_counter() - t_pre0) * 1000.0
+                t_post0 = time.perf_counter()
                 # 离线环境与测试用合成骨骼生成器 (依据 Box 解算自然人体站立姿态)
                 kpts = self._generate_synthetic_pose(bbox)
+                total_post += (time.perf_counter() - t_post0) * 1000.0
                 results.append(kpts)
 
+        self.last_preprocess_ms = total_pre
+        self.last_gpu_compute_ms = total_gpu
+        self.last_postprocess_ms = total_post
+        if self.session is not None:
+            try:
+                self.session.last_preprocess_ms = total_pre
+                self.session.last_postprocess_ms = total_post
+            except Exception:
+                pass
         return results
 
     def _generate_synthetic_pose(self, bbox: Tuple[int, int, int, int]) -> Dict[str, Tuple[float, float, float]]:

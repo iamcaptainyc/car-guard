@@ -6,6 +6,7 @@
 """
 
 import os
+import time
 import cv2
 import numpy as np
 from pathlib import Path
@@ -99,6 +100,9 @@ class AnimalClassifier:
         self.session = None
         self.backend = "unknown"
         self.model_path = model_path
+        self.last_preprocess_ms: float = 0.0
+        self.last_gpu_compute_ms: float = 0.0
+        self.last_postprocess_ms: float = 0.0
 
         # ImageNet 经典归一化参数 (RGB 空间)
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
@@ -199,8 +203,16 @@ class AnimalClassifier:
             return ('small_animal', 0.5, 'unclassified_animal', '通用动物')
 
         try:
+            t_pre0 = time.perf_counter()
             inp = self.preprocess(crop)
+            self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
+
+            t_inf0 = time.perf_counter()
             outputs = self.session.run(None, {self.input_name: inp})
+            inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+            self.last_gpu_compute_ms = float(getattr(self.session, "last_gpu_compute_ms", 0.0) or inf_wall_ms)
+
+            t_post0 = time.perf_counter()
             logits = outputs[0] # (1, 1000)
 
             # Softmax 概率化
@@ -210,26 +222,40 @@ class AnimalClassifier:
             top1_id = int(np.argmax(probs[0]))
             top1_conf = float(probs[0, top1_id])
 
+            res_tuple = None
             if top1_id in IMAGENET_ANIMAL_MAP:
                 cat, sp_en, sp_cn = IMAGENET_ANIMAL_MAP[top1_id]
-                return (cat, top1_conf, sp_en, sp_cn)
+                res_tuple = (cat, top1_conf, sp_en, sp_cn)
 
-            # 若前 5 中存在猛兽候选且概率较高 (>0.25)，优先召回猛兽提高露营安全性
-            top5_ids = np.argsort(probs[0])[::-1][:5]
-            for cid in top5_ids:
-                if cid in IMAGENET_ANIMAL_MAP:
-                    cat, sp_en, sp_cn = IMAGENET_ANIMAL_MAP[cid]
-                    if cat == 'large_beast' and float(probs[0, cid]) > 0.25:
-                        return ('large_beast', float(probs[0, cid]), sp_en, sp_cn)
+            if res_tuple is None:
+                # 若前 5 中存在猛兽候选且概率较高 (>0.25)，优先召回猛兽提高露营安全性
+                top5_ids = np.argsort(probs[0])[::-1][:5]
+                for cid in top5_ids:
+                    if cid in IMAGENET_ANIMAL_MAP:
+                        cat, sp_en, sp_cn = IMAGENET_ANIMAL_MAP[cid]
+                        if cat == 'large_beast' and float(probs[0, cid]) > 0.25:
+                            res_tuple = ('large_beast', float(probs[0, cid]), sp_en, sp_cn)
+                            break
 
-            # 若前 5 均为其它类别或小型动物
-            for cid in top5_ids:
-                if cid in IMAGENET_ANIMAL_MAP:
-                    cat, sp_en, sp_cn = IMAGENET_ANIMAL_MAP[cid]
-                    return (cat, float(probs[0, cid]), sp_en, sp_cn)
+                # 若前 5 均为其它类别或小型动物
+                if res_tuple is None:
+                    for cid in top5_ids:
+                        if cid in IMAGENET_ANIMAL_MAP:
+                            cat, sp_en, sp_cn = IMAGENET_ANIMAL_MAP[cid]
+                            res_tuple = (cat, float(probs[0, cid]), sp_en, sp_cn)
+                            break
 
-            # 非动物预测回退
-            return ('small_animal', top1_conf, 'unclassified_animal', '通用动物')
+            if res_tuple is None:
+                # 非动物预测回退
+                res_tuple = ('small_animal', top1_conf, 'unclassified_animal', '通用动物')
+
+            self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+            try:
+                self.session.last_preprocess_ms = self.last_preprocess_ms
+                self.session.last_postprocess_ms = self.last_postprocess_ms
+            except Exception:
+                pass
+            return res_tuple
 
         except Exception as e:
             print(f"[AnimalClassifier] 推理过程发生异常: {e}")

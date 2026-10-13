@@ -42,12 +42,12 @@ class KalmanFilter2D:
         covariance = np.diag(np.square(std))
         return mean, covariance
 
-    def predict(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, mean: np.ndarray, covariance: np.ndarray, dt_scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         std_pos = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3] * max(1.0, dt_scale * 0.5),
+            self._std_weight_position * mean[3] * max(1.0, dt_scale * 0.5),
             1e-2,
-            self._std_weight_position * mean[3]
+            self._std_weight_position * mean[3] * max(1.0, dt_scale * 0.5)
         ]
         std_vel = [
             self._std_weight_velocity * mean[3],
@@ -56,8 +56,14 @@ class KalmanFilter2D:
             self._std_weight_velocity * mean[3]
         ]
         motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
-        mean = np.dot(self._motion_mat, mean)
-        covariance = np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+        if abs(dt_scale - 1.0) < 0.05:
+            motion_mat = self._motion_mat
+        else:
+            motion_mat = self._motion_mat.copy()
+            for i in range(4):
+                motion_mat[i, 4 + i] = float(np.clip(dt_scale, 0.2, 4.0))
+        mean = np.dot(motion_mat, mean)
+        covariance = np.linalg.multi_dot((motion_mat, covariance, motion_mat.T)) + motion_cov
         return mean, covariance
 
     def project(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -150,10 +156,15 @@ class STrack:
         ret[:2] -= ret[2:] / 2
         return (float(ret[0]), float(ret[1]), float(ret[2]), float(ret[3]))
 
-    def predict(self):
+    def predict(self, current_time: Optional[float] = None):
         if self.state != 1:
             self.mean[7] = 0
-        self.mean, self.covariance = self.kalman.predict(self.mean, self.covariance)
+        dt_scale = 1.0
+        if current_time is not None and self.last_seen_time > 0:
+            elapsed = current_time - self.last_seen_time
+            if 0.05 < elapsed < 0.5:
+                dt_scale = float(np.clip(elapsed / (1.0 / 30.0), 1.0, 3.0))
+        self.mean, self.covariance = self.kalman.predict(self.mean, self.covariance, dt_scale=dt_scale)
 
     def update(self, new_track: 'STrack', frame_id: int, current_time: float):
         self.frame_id = frame_id
@@ -213,13 +224,17 @@ class STrack:
 
     def mark_removed(self):
         self.state = 3
+        # 释放已移除轨迹的深度特征与关键点引用，防止长视频内存泄漏
+        self.reid_feature = None
+        self.keypoints = None
 
 
 class ByteTracker:
-    def __init__(self, high_thresh: float = 0.5, low_thresh: float = 0.15, max_time_lost: int = 60):
+    def __init__(self, high_thresh: float = 0.5, low_thresh: float = 0.15, max_time_lost: int = 60, profiler: Optional[Any] = None):
         self.high_thresh = high_thresh
         self.low_thresh = low_thresh
         self.max_time_lost = max_time_lost
+        self.profiler = profiler
         self.frame_id = 0
 
         self.tracked_stracks: List[STrack] = []
@@ -266,10 +281,10 @@ class ByteTracker:
             elif conf >= self.low_thresh:
                 low_dets.append(st)
 
-        # 2. 对当前追踪目标进行卡尔曼滤波预测
+        # 2. 对当前追踪目标进行卡尔曼滤波预测 (适配真实物理时间差 dt)
         all_pool = self.tracked_stracks + self.lost_stracks
         for st in all_pool:
-            st.predict()
+            st.predict(current_time=current_time)
 
         # 3. 第一次关联：高置信度检测与当前目标池关联
         unmatched_tracks_1, unmatched_dets_1, matches_1 = self._linear_assignment(all_pool, high_dets, iou_thresh=0.7)
@@ -311,7 +326,12 @@ class ByteTracker:
                         continue
                     bx, by, bw, bh = det.tlwh
                     crop_bbox = BoundingBox(int(bx), int(by), int(bw), int(bh))
-                    feat = reid_extractor.extract_from_frame(frame, crop_bbox)
+                    if self.profiler is not None:
+                        reid_s = getattr(reid_extractor, 'session', None)
+                        with self.profiler.profile_model("OSNet-ReID", condition="ByteTrack遮挡重现特征召回", session=reid_s):
+                            feat = reid_extractor.extract_from_frame(frame, crop_bbox)
+                    else:
+                        feat = reid_extractor.extract_from_frame(frame, crop_bbox)
                     if feat is None or len(feat) == 0:
                         continue
                     det.reid_feature = feat
@@ -368,6 +388,9 @@ class ByteTracker:
 
         self.lost_stracks = list({t.track_id: t for t in lost_stracks if t.state == 2}.values())
         self.removed_stracks.extend(removed_stracks)
+        # 限制 removed_stracks 最大留存长度为 100，杜绝长时运行内存无限增长
+        if len(self.removed_stracks) > 100:
+            self.removed_stracks = self.removed_stracks[-100:]
 
         # 清理超过 10 秒的 departed 缓存
         stale_dep = [tid for tid, info in self.departed_history.items() if current_time - info[0] > GuardConfig.DWELL_RESET_WINDOW_SEC]

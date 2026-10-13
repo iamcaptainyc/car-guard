@@ -349,6 +349,12 @@ class ZoneHysteresisFilter:
         if old_id in self.current_zones:
             self.current_zones[new_id] = self.current_zones.pop(old_id)
 
+    def clean_stale_tracks(self, active_track_ids: set):
+        """清理已移除轨迹的防区状态，防止长时间运行内存泄漏"""
+        stale = [tid for tid in self.current_zones if tid not in active_track_ids]
+        for tid in stale:
+            del self.current_zones[tid]
+
     def update_zone(self, track_id: int, dist: float) -> VehicleZone:
         buf = GuardConfig.HYSTERESIS_BUFFER # 0.3m
 

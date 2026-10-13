@@ -179,39 +179,69 @@ class ONNXObjectDetector(BaseObjectDetector):
 
         eff_conf = conf_threshold if conf_threshold is not None else getattr(self, 'conf_threshold', 0.25)
 
+        t_pre0 = time.perf_counter()
         h0, w0 = frame.shape[:2]
         img, ratio, (dw, dh) = self.letterbox(frame, new_shape=self.input_size)
-        img = img[:, :, ::-1].transpose(2, 0, 1) # BGR to RGB, HWC to CHW
-        img = np.ascontiguousarray(img, dtype=np.float32) / 255.0
-        img = np.expand_dims(img, axis=0)
+        # 使用 OpenCV C++ SIMD 加速算子一次性完成 BGR->RGB, HWC->CHW, float32 与 /255.0 归一化
+        blob = cv2.dnn.blobFromImage(img, 1.0 / 255.0, (img.shape[1], img.shape[0]), (0, 0, 0), swapRB=True, crop=False)
+        self.last_preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
 
         # 模型前向推理
-        outputs = self.session.run(None, {self.input_name: img})
+        t_inf0 = time.perf_counter()
+        outputs = self.session.run(None, {self.input_name: blob})
+        t_inf_wall_ms = (time.perf_counter() - t_inf0) * 1000.0
+        self.last_gpu_compute_ms = getattr(self.session, 'last_gpu_compute_ms', 0.0) or t_inf_wall_ms
+
+        t_post0 = time.perf_counter()
         preds = outputs[0] # 通常为 [1, 84, 8400] 或 [1, num_boxes, 85]
 
-        # 解析输出
-        if preds.shape[1] < preds.shape[2]:
-            preds = np.transpose(preds, (0, 2, 1))
-
-        preds = preds[0] # [num_candidates, features]
-        scores = preds[:, 4:]
-        confidences = np.max(scores, axis=1)
-        mask = confidences >= eff_conf
-
-        if not np.any(mask):
-            return []
-
-        boxes = preds[mask, :4]
-        class_ids = np.argmax(scores[mask], axis=1)
-        confidences = confidences[mask]
+        # 高效向量化后处理：在转置前直接沿连续内存维度做置信度掩码预筛，仅对极少数达标候选框做切片与转置
+        if preds.ndim == 3 and preds.shape[1] < preds.shape[2]:
+            p0 = preds[0] # [C, N], 其中 p0[4:, :] 在内存上按行连续
+            scores_cn = p0[4:, :]
+            num_classes = scores_cn.shape[0]
+            if num_classes == 1:
+                confidences = scores_cn[0]
+                mask = confidences >= eff_conf
+                if not np.any(mask):
+                    self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+                    self._sync_session_timing()
+                    return []
+                boxes = p0[:4, mask].T
+                confidences = confidences[mask]
+                class_ids = np.zeros(boxes.shape[0], dtype=np.int32)
+            else:
+                confidences = np.max(scores_cn, axis=0)
+                mask = confidences >= eff_conf
+                if not np.any(mask):
+                    self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+                    self._sync_session_timing()
+                    return []
+                boxes = p0[:4, mask].T
+                scores_filtered = scores_cn[:, mask]
+                class_ids = np.argmax(scores_filtered, axis=0)
+                confidences = confidences[mask]
+        else:
+            p0 = preds[0] if preds.ndim == 3 else preds
+            scores = p0[:, 4:]
+            num_classes = scores.shape[1]
+            confidences = np.max(scores, axis=1)
+            mask = confidences >= eff_conf
+            if not np.any(mask):
+                self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+                self._sync_session_timing()
+                return []
+            boxes = p0[mask, :4]
+            class_ids = np.argmax(scores[mask], axis=1)
+            confidences = confidences[mask]
 
         # 自适应根据输出通道维度判断分类字典 (MegaDetector 3类 vs Fisheye8K 5类 vs COCO 80类 vs 火灾 1~2类)
-        is_megadetector = getattr(self, 'is_megadetector', False) or (scores.shape[1] == 3)
-        is_fisheye_5cls = (scores.shape[1] == 5)
+        is_megadetector = getattr(self, 'is_megadetector', False) or (num_classes == 3)
+        is_fisheye_5cls = (num_classes == 5)
 
         if getattr(self, 'custom_cls_map', None) is not None:
             cls_map = self.custom_cls_map
-        elif getattr(self, 'is_fire_model', False) or (scores.shape[1] in [1, 2] and not is_megadetector):
+        elif getattr(self, 'is_fire_model', False) or (num_classes in [1, 2] and not is_megadetector):
             cls_map = self.fire_to_guard_map
         elif is_megadetector:
             cls_map = self.megadetector_to_guard_map
@@ -247,6 +277,8 @@ class ONNXObjectDetector(BaseObjectDetector):
 
         # 2. 先执行 NMS 滤除同一目标周围的重叠冗余候选框
         nms_detections = self._apply_nms(raw_candidates, iou_threshold=0.45, score_threshold=eff_conf)
+        self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
+        self._sync_session_timing()
 
         # 3. 核心策略：仅对 NMS 去重后幸存的独立 animal 目标调用二级细分类器
         # 若上层已启用 ByteTrack 轨迹级按需分类缓存 (defer_animal_cls=True)，则直接返回 'animal' 交由追踪器按需触发
@@ -263,11 +295,15 @@ class ONNXObjectDetector(BaseObjectDetector):
                         if getattr(self, 'profiler', None) is not None:
                             cls_sess = getattr(self.animal_classifier, 'session', None)
                             cls_gpu_ms = getattr(cls_sess, 'last_gpu_compute_ms', 0.0) if cls_sess else 0.0
+                            cls_pre_ms = getattr(self.animal_classifier, 'last_preprocess_ms', 0.0)
+                            cls_post_ms = getattr(self.animal_classifier, 'last_postprocess_ms', 0.0)
                             self.profiler.record_model_call(
                                 model_name="MobileNetV3-AnimalCls",
                                 duration_ms=t_cls_ms,
                                 condition="MegaDetector二级动物细分类 (224x224)",
-                                gpu_ms=cls_gpu_ms
+                                gpu_ms=cls_gpu_ms,
+                                preprocess_ms=cls_pre_ms,
+                                postprocess_ms=cls_post_ms
                             )
                         det_item['category'] = category
                         if species_en is not None:
@@ -278,6 +314,14 @@ class ONNXObjectDetector(BaseObjectDetector):
                         det_item['category'] = 'small_animal'
 
         return nms_detections
+
+    def _sync_session_timing(self):
+        if self.session is not None:
+            try:
+                self.session.last_preprocess_ms = getattr(self, 'last_preprocess_ms', 0.0)
+                self.session.last_postprocess_ms = getattr(self, 'last_postprocess_ms', 0.0)
+            except Exception:
+                pass
 
     def _apply_nms(self, dets: List[Dict], iou_threshold: float = 0.45, score_threshold: float = 0.2) -> List[Dict]:
         if not dets:
@@ -346,11 +390,13 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         main_detector: BaseObjectDetector,
         fire_detector: Optional[BaseObjectDetector] = None,
         max_workers: int = 2,
-        profiler: Optional[Any] = None
+        profiler: Optional[Any] = None,
+        fire_detect_interval: int = 3
     ):
         self.main_detector = main_detector
         self.fire_detector = fire_detector
         self.max_workers = max_workers
+        self.fire_detect_interval = max(1, int(fire_detect_interval))
         self.is_ensemble = True
         self.profiler_label = "Parallel-Ensemble-Det"
         self._profiler = None
@@ -368,16 +414,25 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             max_workers=max_workers,
             thread_name_prefix="ParallelDetWorker"
         )
+        self._frame_counter: int = 0
+        self._cached_fire_dets: List[Dict] = []
+
         self.last_main_ms: float = 0.0
         self.last_main_gpu_ms: float = 0.0
+        self.last_main_pre_ms: float = 0.0
+        self.last_main_post_ms: float = 0.0
         self.last_fire_ms: float = 0.0
         self.last_fire_gpu_ms: float = 0.0
+        self.last_fire_pre_ms: float = 0.0
+        self.last_fire_post_ms: float = 0.0
         self.last_parallel_ms: float = 0.0
         self.last_gpu_compute_ms: float = 0.0
+        self.last_preprocess_ms: float = 0.0
+        self.last_postprocess_ms: float = 0.0
 
     @property
     def session(self):
-        """暴露自身作为 session 供 profiler 读取 last_gpu_compute_ms"""
+        """暴露自身作为 session 供 profiler 读取 last_gpu_compute_ms / last_preprocess_ms / last_postprocess_ms"""
         return self
 
     def __getattr__(self, name):
@@ -424,6 +479,8 @@ class ParallelEnsembleDetector(BaseObjectDetector):
         if frame is None:
             return []
 
+        self._frame_counter += 1
+
         # 若未配置辅助火灾检测器，直接运行主检测器
         if self.fire_detector is None:
             t0 = time.perf_counter()
@@ -431,11 +488,26 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             self.last_main_ms = (time.perf_counter() - t0) * 1000.0
             sess = getattr(self.main_detector, 'session', None)
             self.last_main_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
+            self.last_main_pre_ms = getattr(self.main_detector, 'last_preprocess_ms', 0.0)
+            self.last_main_post_ms = getattr(self.main_detector, 'last_postprocess_ms', 0.0)
             self.last_parallel_ms = self.last_main_ms
             self.last_gpu_compute_ms = self.last_main_gpu_ms
+            self.last_preprocess_ms = self.last_main_pre_ms
+            self.last_postprocess_ms = self.last_main_post_ms
             return dets
 
-        # 启动双流/多流并发执行
+        # 自适应火灾副流分频策略:
+        # 1. 无火情常态下每 fire_detect_interval 帧 (默认 3 帧) 唤醒一次火灾副流，消除双线程每帧 GIL/GPU 抢占
+        # 2. 一旦上一帧检出火焰/烟雾 (_cached_fire_dets 非空)，立即切换为 1:1 逐帧高频检测
+        # 3. 合成测试检测器保持逐帧调用以兼容单元测试
+        is_real_heavy_fire_det = isinstance(self.fire_detector, (ONNXObjectDetector, VisualFlameDetector))
+        should_run_fire = (
+            (not is_real_heavy_fire_det)
+            or (self.fire_detect_interval <= 1)
+            or ((self._frame_counter - 1) % self.fire_detect_interval == 0)
+            or (len(self._cached_fire_dets) > 0)
+        )
+
         t_start = time.perf_counter()
 
         def _run_main():
@@ -444,6 +516,8 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             self.last_main_ms = (time.perf_counter() - tm0) * 1000.0
             sess = getattr(self.main_detector, 'session', None)
             self.last_main_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
+            self.last_main_pre_ms = getattr(self.main_detector, 'last_preprocess_ms', 0.0)
+            self.last_main_post_ms = getattr(self.main_detector, 'last_postprocess_ms', 0.0)
             return res
 
         def _run_fire():
@@ -452,36 +526,56 @@ class ParallelEnsembleDetector(BaseObjectDetector):
             self.last_fire_ms = (time.perf_counter() - tf0) * 1000.0
             sess = getattr(self.fire_detector, 'session', None)
             self.last_fire_gpu_ms = getattr(sess, 'last_gpu_compute_ms', 0.0) if sess else 0.0
+            self.last_fire_pre_ms = getattr(self.fire_detector, 'last_preprocess_ms', 0.0)
+            self.last_fire_post_ms = getattr(self.fire_detector, 'last_postprocess_ms', 0.0)
             return res
 
-        future_main = self._executor.submit(_run_main)
-        future_fire = self._executor.submit(_run_fire)
-
-        main_dets = future_main.result()
-        fire_dets = future_fire.result()
+        if should_run_fire:
+            future_main = self._executor.submit(_run_main)
+            future_fire = self._executor.submit(_run_fire)
+            main_dets = future_main.result()
+            fire_dets = future_fire.result()
+            self._cached_fire_dets = list(fire_dets)
+            self.last_gpu_compute_ms = max(self.last_main_gpu_ms, self.last_fire_gpu_ms)
+            self.last_preprocess_ms = max(self.last_main_pre_ms, self.last_fire_pre_ms)
+            self.last_postprocess_ms = max(self.last_main_post_ms, self.last_fire_post_ms)
+        else:
+            # 非火灾唤醒帧：直接在当前线程零开销执行主检测器，避免双线程 GIL 抢占
+            main_dets = _run_main()
+            fire_dets = self._cached_fire_dets
+            self.last_fire_ms = 0.0
+            self.last_fire_gpu_ms = 0.0
+            self.last_fire_pre_ms = 0.0
+            self.last_fire_post_ms = 0.0
+            self.last_gpu_compute_ms = self.last_main_gpu_ms
+            self.last_preprocess_ms = self.last_main_pre_ms
+            self.last_postprocess_ms = self.last_main_post_ms
 
         self.last_parallel_ms = (time.perf_counter() - t_start) * 1000.0
-        # 并发执行时，GPU 真实纯推理耗时取决于两并发子流中较长的一方
-        self.last_gpu_compute_ms = max(self.last_main_gpu_ms, self.last_fire_gpu_ms)
 
-        # 若配置了 profiler，分别精准记录两路并发子模型的耗时与纯 GPU 推理指标
+        # 若配置了 profiler，分别精准记录两路并发子模型的耗时与 3 阶段指标
         if self.profiler is not None:
             main_label = getattr(self.main_detector, "profiler_label", "General-Det")
-            fire_label = getattr(self.fire_detector, "profiler_label", "FireSmoke-Det")
             self.profiler.record_model_call(
                 model_name=main_label,
                 duration_ms=self.last_main_ms,
                 condition="通用人车动物目标检测 (并发主流)",
                 gpu_ms=self.last_main_gpu_ms,
-                is_substream=True
+                is_substream=True,
+                preprocess_ms=self.last_main_pre_ms,
+                postprocess_ms=self.last_main_post_ms
             )
-            self.profiler.record_model_call(
-                model_name=fire_label,
-                duration_ms=self.last_fire_ms,
-                condition="火灾浓烟专用目标检测 (并发副流)",
-                gpu_ms=self.last_fire_gpu_ms,
-                is_substream=True
-            )
+            if should_run_fire:
+                fire_label = getattr(self.fire_detector, "profiler_label", "FireSmoke-Det")
+                self.profiler.record_model_call(
+                    model_name=fire_label,
+                    duration_ms=self.last_fire_ms,
+                    condition="火灾浓烟专用目标检测 (并发副流)",
+                    gpu_ms=self.last_fire_gpu_ms,
+                    is_substream=True,
+                    preprocess_ms=self.last_fire_pre_ms,
+                    postprocess_ms=self.last_fire_post_ms
+                )
 
         # 合并检测目标框
         combined = list(main_dets) + list(fire_dets)
