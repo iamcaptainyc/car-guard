@@ -136,6 +136,9 @@ class STrack:
         self.association_version: int = 1
         self.species: Optional[str] = None
         self.species_cn: Optional[str] = None
+        self.last_animal_cls_time: float = 0.0
+        self.animal_cls_count: int = 0
+        self.animal_cls_locked: bool = False
 
     @property
     def tlwh(self) -> Tuple[float, float, float, float]:
@@ -164,6 +167,8 @@ class STrack:
             self.category = 'large_beast'
             if getattr(new_track, 'species', None):
                 self.species = new_track.species
+                if self.species not in ['unknown', 'unclassified_animal']:
+                    self.animal_cls_locked = True
             if getattr(new_track, 'species_cn', None):
                 self.species_cn = new_track.species_cn
         elif self.confirmed_large_beast:
@@ -180,11 +185,16 @@ class STrack:
             else:
                 # 若检测确凿变为人员或车辆等完全不相干物理类别，解除猛兽锁存
                 self.confirmed_large_beast = False
+                self.animal_cls_locked = False
                 self.category = new_track.category
                 self.species = getattr(new_track, 'species', None)
                 self.species_cn = getattr(new_track, 'species_cn', None)
         else:
-            self.category = new_track.category
+            if new_track.category == 'animal' and self.category == 'small_animal' and self.species:
+                # 保持已建档的二级细分类别与物种，避免被未分类的原始 'animal' 覆盖
+                pass
+            else:
+                self.category = new_track.category
             if getattr(new_track, 'species', None):
                 self.species = new_track.species
             if getattr(new_track, 'species_cn', None):
@@ -249,6 +259,8 @@ class ByteTracker:
             st = STrack(bbox, conf, cat, current_time=current_time)
             st.species = d.get('species')
             st.species_cn = d.get('species_cn')
+            if cat == 'large_beast' and st.species and st.species not in ['unknown', 'unclassified_animal']:
+                st.animal_cls_locked = True
             if conf >= self.high_thresh:
                 high_dets.append(st)
             elif conf >= self.low_thresh:

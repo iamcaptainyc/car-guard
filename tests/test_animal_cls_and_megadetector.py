@@ -218,16 +218,17 @@ def test_mobilenetv3_animal_cls_profiling():
     detector.is_megadetector = True
     detector.input_name = "images"
 
-    # Mock 主检测器 session 输出一个 animal (class_id=0)
+    # Mock 主检测器 session 输出同一只动物周围的 10 个高度重叠 Anchor 候选框 (class_id=0)
     mock_main_sess = MagicMock()
     mock_main_sess.last_gpu_compute_ms = 35.5
-    # YOLO/MegaDetector output format: [1, 7, 10] -> [1, 10, 7] (cx, cy, w, h, score0, score1, score2)
-    fake_preds = np.zeros((1, 7, 10), dtype=np.float32)
-    fake_preds[0, 0, 0] = 320.0
-    fake_preds[0, 1, 0] = 240.0
-    fake_preds[0, 2, 0] = 100.0
-    fake_preds[0, 3, 0] = 100.0
-    fake_preds[0, 4, 0] = 0.95  # score for class 0 (animal)
+    # YOLO/MegaDetector output format: [1, 7, 15] -> [1, 15, 7] (cx, cy, w, h, score0, score1, score2)
+    fake_preds = np.zeros((1, 7, 15), dtype=np.float32)
+    for k in range(10):
+        fake_preds[0, 0, k] = 320.0 + (k % 3)  # 微小偏移的重叠框
+        fake_preds[0, 1, k] = 240.0 + (k % 2)
+        fake_preds[0, 2, k] = 100.0
+        fake_preds[0, 3, k] = 100.0
+        fake_preds[0, 4, k] = 0.95 - k * 0.02  # score for class 0 (animal)
     mock_main_sess.run.return_value = [fake_preds]
     detector.session = mock_main_sess
 
@@ -251,10 +252,10 @@ def test_mobilenetv3_animal_cls_profiling():
     assert dets[0]['category'] == 'large_beast'
     assert dets[0]['species'] == 'american_black_bear'
 
-    # 核心断言: profiler 必须精准记录到 MobileNetV3-AnimalCls 的独立统计数据
+    # 核心断言: 先 NMS 后分类，10 个重叠 Anchor 框只能触发 1 次 MobileNetV3-AnimalCls！
     assert "MobileNetV3-AnimalCls" in profiler.model_stats
     stats = profiler.model_stats["MobileNetV3-AnimalCls"]
-    assert stats.call_count == 1, f"MobileNetV3-AnimalCls 预期调用 1 次，实际调用 {stats.call_count}"
+    assert stats.call_count == 1, f"NMS 前置去重失效！预期调用 1 次，实际调用 {stats.call_count} 次"
     assert stats.avg_gpu_ms == pytest.approx(3.8, rel=1e-3)
     assert stats.avg_ms > 0.0
 
@@ -326,4 +327,70 @@ def test_bytetrack_large_beast_hysteresis_latching():
     # 锁存解除
     st = tracker.get_track(tid)
     assert st.confirmed_large_beast is False
+
+
+def test_engine_animal_cls_track_level_caching_and_dedup():
+    """测试 7: 验证 CampingGuardEngine 轨迹级动物分类缓存 (连续 50 帧仅首次确认时调用 1 次，杜绝每帧重复推理)"""
+    from unittest.mock import MagicMock
+    from camping_guard.profiler import PipelineProfiler
+    from camping_guard.perception.detector import ONNXObjectDetector, ParallelEnsembleDetector
+
+    profiler = PipelineProfiler()
+    detector = ONNXObjectDetector("models/megadetector/md_v5a.onnx")
+    detector.is_megadetector = True
+    detector.input_name = "images"
+
+    # 每帧返回 15 个重叠 Anchor 候选框
+    mock_main_sess = MagicMock()
+    mock_main_sess.last_gpu_compute_ms = 25.0
+    fake_preds = np.zeros((1, 7, 20), dtype=np.float32)
+    for k in range(15):
+        fake_preds[0, 0, k] = 300.0 + (k % 3)
+        fake_preds[0, 1, k] = 220.0 + (k % 2)
+        fake_preds[0, 2, k] = 120.0
+        fake_preds[0, 3, k] = 100.0
+        fake_preds[0, 4, k] = 0.92 - k * 0.01
+    mock_main_sess.run.return_value = [fake_preds]
+    detector.session = mock_main_sess
+
+    mock_classifier = MagicMock()
+    mock_cls_sess = MagicMock()
+    mock_cls_sess.last_gpu_compute_ms = 3.1
+    mock_classifier.session = mock_cls_sess
+    mock_classifier.classify.return_value = ('large_beast', 0.91, 'american_black_bear', '美洲黑熊')
+    detector.animal_classifier = mock_classifier
+
+    ensemble = ParallelEnsembleDetector(main_detector=detector, fire_detector=None)
+    engine = CampingGuardEngine(
+        detector=ensemble,
+        animal_classifier=mock_classifier,
+        use_bytetrack=True,
+        profiler=profiler
+    )
+    engine.activate()
+    assert detector.defer_animal_cls is True, "Engine 应当自动激活 detector.defer_animal_cls！"
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    now = 2000.0
+
+    # 连续运行 50 帧 (原本 50 * 15 = 750 次调用)
+    for i in range(50):
+        engine.process_tick(
+            camera_frames={1: dummy_frame},
+            raw_detections=None,
+            current_time=now + i * 0.04
+        )
+        assert len(engine.active_targets) == 1
+        t = engine.active_targets[0]
+        assert t.category == 'large_beast'
+        assert t.species == 'american_black_bear'
+        assert t.species_cn == '美洲黑熊'
+
+    # 核心断言: 50 帧 (共 750 个原始候选框) 中，MobileNetV3-AnimalCls 仅在首帧建档时被调用 1 次！
+    assert mock_classifier.classify.call_count == 1, (
+        f"轨迹级缓存失效！50 帧内预期调用 1 次，实际调用了 {mock_classifier.classify.call_count} 次"
+    )
+    stats = profiler.model_stats["MobileNetV3-AnimalCls"]
+    assert stats.call_count == 1
+
 

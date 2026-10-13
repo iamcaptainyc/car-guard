@@ -122,6 +122,14 @@ class CampingGuardEngine:
         if self.detector is not None and getattr(self.detector, 'animal_classifier', None) is None:
             if hasattr(self.detector, 'animal_classifier'):
                 self.detector.animal_classifier = self.animal_classifier
+        if self.animal_classifier is None and self.detector is not None:
+            self.animal_classifier = getattr(self.detector, 'animal_classifier', None)
+
+        # 若启用了 ByteTracker 且挂载了二级动物分类器，开启检测器延迟分类模式 (defer_animal_cls=True)，
+        # 将二级细分类解耦至 ByteTrack 轨迹关联之后按需触发，彻底消除同目标多框与跨帧重复推理
+        if self.bytetracker is not None and self.animal_classifier is not None and self.detector is not None:
+            if hasattr(self.detector, 'defer_animal_cls'):
+                self.detector.defer_animal_cls = True
 
         # 注册模型元数据至 profiler (保持 key 与执行期 profile_model("...") 完全一致)
         if self.detector:
@@ -312,6 +320,60 @@ class CampingGuardEngine:
                         st.zone = zone
                         st.radial_speed = vr
                         st.track_uid = t.track_uid
+
+                    # 二级动物物种细分类 (按需触发 + 轨迹级状态锁存与冷却限频，杜绝逐帧重复调用)
+                    if t.category in ['animal', 'small_animal', 'large_beast'] and self.animal_classifier is not None and primary_frame is not None:
+                        last_cls_t = getattr(st, 'last_animal_cls_time', 0.0) if st else 0.0
+                        cls_locked = getattr(st, 'animal_cls_locked', False) if st else False
+                        need_animal_cls = (
+                            t.category == 'animal'
+                            or not t.species
+                            or (not cls_locked and (current_time - last_cls_t >= 1.0))
+                        )
+                        if need_animal_cls:
+                            fh, fw = primary_frame.shape[:2]
+                            bx, by, bw, bh = int(t.bbox.x), int(t.bbox.y), int(t.bbox.w), int(t.bbox.h)
+                            cx1, cy1 = max(0, min(fw - 1, bx)), max(0, min(fh - 1, by))
+                            cx2, cy2 = max(cx1 + 1, min(fw, bx + bw)), max(cy1 + 1, min(fh, by + bh))
+                            crop = primary_frame[cy1:cy2, cx1:cx2]
+                            cls_sess = getattr(self.animal_classifier, 'session', None)
+                            with self.profiler.profile_model("MobileNetV3-AnimalCls", condition=f"ID:{t.track_id} 动物物种细分类 (224x224)", session=cls_sess):
+                                cat, cls_conf, sp_en, sp_cn = self.animal_classifier.classify(crop)
+
+                            if st is not None:
+                                st.last_animal_cls_time = current_time
+                                st.animal_cls_count = getattr(st, 'animal_cls_count', 0) + 1
+                                if cat == 'large_beast':
+                                    st.confirmed_large_beast = True
+                                    st.category = 'large_beast'
+                                    st.species = sp_en
+                                    st.species_cn = sp_cn
+                                    if cls_conf >= 0.45 or st.animal_cls_count >= 2:
+                                        st.animal_cls_locked = True
+                                elif st.confirmed_large_beast:
+                                    st.category = 'large_beast'
+                                    if sp_en and sp_en not in ['unknown', 'unclassified_animal']:
+                                        st.species = sp_en
+                                    if sp_cn and sp_cn not in ['未知动物', '通用动物']:
+                                        st.species_cn = sp_cn
+                                else:
+                                    st.category = cat
+                                    st.species = sp_en
+                                    st.species_cn = sp_cn
+                                    if st.animal_cls_count >= 3 and sp_en not in ['unknown', 'unclassified_animal']:
+                                        st.animal_cls_locked = True
+
+                                t.category = st.category
+                                t.species = st.species
+                                t.species_cn = st.species_cn
+                            else:
+                                t.category = cat
+                                t.species = sp_en
+                                t.species_cn = sp_cn
+                    elif t.category == 'animal' and self.animal_classifier is None:
+                        t.category = 'small_animal'
+                        if st is not None:
+                            st.category = 'small_animal'
 
                     # 人员 ReID 特征建档 (仅在首次入场且无特征时建档 1 次)
                     if t.category == 'person' and self.reid_extractor and primary_frame is not None and t.reid_feature is None:

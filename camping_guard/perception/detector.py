@@ -43,6 +43,7 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.animal_classifier = animal_classifier
         self.custom_cls_map = custom_cls_map
         self.profiler = profiler
+        self.defer_animal_cls = False
 
         # COCO 类别映射到露营守卫规范类别
         self.coco_to_guard_map = {
@@ -219,8 +220,8 @@ class ONNXObjectDetector(BaseObjectDetector):
         else:
             cls_map = self.coco_to_guard_map
 
-        # 转换为 (x, y, w, h) 并做坐标还原
-        detections = []
+        # 1. 转换为 (x, y, w, h) 并做坐标还原 (严禁在 NMS 之前执行裁剪分类，杜绝同一目标十几个重叠 Anchor 框重复调用分类器)
+        raw_candidates = []
         for box, cid, score in zip(boxes, class_ids, confidences):
             cx, cy, bw, bh = box
             # 还原 letterbox
@@ -238,44 +239,45 @@ class ONNXObjectDetector(BaseObjectDetector):
             if base_cat == 'unknown':
                 continue
 
-            category = base_cat
-            species_en = None
-            species_cn = None
-            cls_conf = None
-
-            # 核心策略：仅在调用 MegaDetector 且识别到 animal 类目标时，调用二级动物细分类器
-            if is_megadetector and base_cat == 'animal':
-                if self.animal_classifier is not None:
-                    crop = frame[y:y+h, x:x+w]
-                    t_cls0 = time.perf_counter()
-                    category, cls_conf, species_en, species_cn = self.animal_classifier.classify(crop)
-                    t_cls_ms = (time.perf_counter() - t_cls0) * 1000.0
-
-                    if getattr(self, 'profiler', None) is not None:
-                        cls_sess = getattr(self.animal_classifier, 'session', None)
-                        cls_gpu_ms = getattr(cls_sess, 'last_gpu_compute_ms', 0.0) if cls_sess else 0.0
-                        self.profiler.record_model_call(
-                            model_name="MobileNetV3-AnimalCls",
-                            duration_ms=t_cls_ms,
-                            condition="MegaDetector二级动物细分类 (224x224)",
-                            gpu_ms=cls_gpu_ms
-                        )
-                else:
-                    category = 'small_animal'
-
-            det_item = {
+            raw_candidates.append({
                 'bbox': (x, y, w, h),
-                'category': category,
+                'category': base_cat,
                 'conf': float(score)
-            }
-            if species_en is not None:
-                det_item['species'] = species_en
-                det_item['species_cn'] = species_cn
-                det_item['cls_conf'] = cls_conf
+            })
 
-            detections.append(det_item)
+        # 2. 先执行 NMS 滤除同一目标周围的重叠冗余候选框
+        nms_detections = self._apply_nms(raw_candidates, iou_threshold=0.45, score_threshold=eff_conf)
 
-        return self._apply_nms(detections, iou_threshold=0.45, score_threshold=eff_conf)
+        # 3. 核心策略：仅对 NMS 去重后幸存的独立 animal 目标调用二级细分类器
+        # 若上层已启用 ByteTrack 轨迹级按需分类缓存 (defer_animal_cls=True)，则直接返回 'animal' 交由追踪器按需触发
+        if is_megadetector and not getattr(self, 'defer_animal_cls', False):
+            for det_item in nms_detections:
+                if det_item['category'] == 'animal':
+                    if self.animal_classifier is not None:
+                        x, y, w, h = det_item['bbox']
+                        crop = frame[y:y+h, x:x+w]
+                        t_cls0 = time.perf_counter()
+                        category, cls_conf, species_en, species_cn = self.animal_classifier.classify(crop)
+                        t_cls_ms = (time.perf_counter() - t_cls0) * 1000.0
+
+                        if getattr(self, 'profiler', None) is not None:
+                            cls_sess = getattr(self.animal_classifier, 'session', None)
+                            cls_gpu_ms = getattr(cls_sess, 'last_gpu_compute_ms', 0.0) if cls_sess else 0.0
+                            self.profiler.record_model_call(
+                                model_name="MobileNetV3-AnimalCls",
+                                duration_ms=t_cls_ms,
+                                condition="MegaDetector二级动物细分类 (224x224)",
+                                gpu_ms=cls_gpu_ms
+                            )
+                        det_item['category'] = category
+                        if species_en is not None:
+                            det_item['species'] = species_en
+                            det_item['species_cn'] = species_cn
+                            det_item['cls_conf'] = cls_conf
+                    else:
+                        det_item['category'] = 'small_animal'
+
+        return nms_detections
 
     def _apply_nms(self, dets: List[Dict], iou_threshold: float = 0.45, score_threshold: float = 0.2) -> List[Dict]:
         if not dets:
@@ -408,6 +410,15 @@ class ParallelEnsembleDetector(BaseObjectDetector):
     def animal_classifier(self, val):
         if hasattr(self.main_detector, 'animal_classifier'):
             self.main_detector.animal_classifier = val
+
+    @property
+    def defer_animal_cls(self) -> bool:
+        return getattr(self.main_detector, 'defer_animal_cls', False)
+
+    @defer_animal_cls.setter
+    def defer_animal_cls(self, val: bool):
+        if hasattr(self, 'main_detector') and self.main_detector is not None:
+            self.main_detector.defer_animal_cls = val
 
     def detect(self, frame: np.ndarray, conf_threshold: Optional[float] = None) -> List[Dict]:
         if frame is None:
