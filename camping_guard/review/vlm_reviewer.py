@@ -557,89 +557,147 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
     def _parse_edgellm_metrics(
         out_data: Any,
         stdout_str: Optional[str],
-        proc_elapsed_ms: float
+        proc_elapsed_ms: float,
+        profile_data: Optional[Dict[str, Any]] = None
     ) -> Tuple[Dict[str, float], Dict[str, Any]]:
         """
-        从 llm_inference 的 output.json 与 stdout 日志中精准提取并剥离详细性能指标:
+        从 llm_inference 的 profile.json、output.json 与 stdout 日志中精准提取并剥离详细性能指标:
+        - 优先从官方 --profileOutputFile 生成的 profile.json 中读取微秒级硬件时间与显存
         - 冷启动/引擎反序列化耗时 (cold_start_load_ms / cold_start_load_sec)
-        - 实际纯推理与生成耗时 (pure_inference_ms / pure_inference_sec)
-        - Token 指标 (prompt_tokens, generated_tokens, tokens_per_second, ttft_ms)
+        - 实际纯推理与生成耗时 (pure_inference_ms / pure_inference_sec, 细分 Vision / Prefill / Generation)
+        - Token 指标 (prompt_tokens, generated_tokens, tokens_per_second, ttft_ms, finish_reason)
         """
         cold_start_ms = 0.0
         pure_inf_ms = 0.0
+        vis_ms = 0.0
+        pre_ms = 0.0
+        gen_ms = 0.0
         prompt_tokens = None
         gen_tokens = None
         tps = None
         ttft_ms = None
+        finish_reason = None
+        peak_vram_mb = None
         found_explicit = False
+        timing_source = "MEASURED_FROM_PROCESS_TIME"
 
+        # 0. 尝试提取 finish_reason
         if isinstance(out_data, dict):
-            stats = out_data.get("stats") or out_data.get("metrics") or out_data.get("timings") or {}
-            if isinstance(stats, dict):
-                if "load_time_ms" in stats:
-                    cold_start_ms = float(stats["load_time_ms"])
-                    found_explicit = True
-                if "generation_time_ms" in stats:
-                    pure_inf_ms = float(stats["generation_time_ms"])
-                    found_explicit = True
-                if "tokens_per_second" in stats:
-                    tps = float(stats["tokens_per_second"])
-                if "num_generated_tokens" in stats:
-                    gen_tokens = int(stats["num_generated_tokens"])
-                if "num_prompt_tokens" in stats:
-                    prompt_tokens = int(stats["num_prompt_tokens"])
-                if "ttft_ms" in stats:
-                    ttft_ms = float(stats["ttft_ms"])
+            responses = out_data.get("responses")
+            if isinstance(responses, list) and len(responses) > 0 and isinstance(responses[0], dict):
+                finish_reason = responses[0].get("finish_reason")
 
-        if stdout_str:
-            txt = stdout_str
+        # 1. 最高优先级：从官方 --profileOutputFile 生成的 profile.json 中解析微秒级硬件指标
+        if isinstance(profile_data, dict) and profile_data:
+            gen_info = profile_data.get("generation", {})
+            prefill_info = profile_data.get("prefill", {})
+            mm_info = profile_data.get("multimodal", {})
+            stages = profile_data.get("stages", [])
 
-            m_load = re.search(r"(?:load(?:ed)?\s+engine|engine\s+(?:load(?:ing)?|deserializ\w+)|deserialize\s+engine)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
-            if m_load:
-                val = float(m_load.group(1))
-                unit = (m_load.group(2) or "ms").lower()
-                cold_start_ms = val * 1000.0 if unit in ["s", "sec"] else val
-                found_explicit = True
+            for stg in stages:
+                sid = stg.get("stage_id", "")
+                dur = float(stg.get("total_gpu_time_ms", stg.get("average_time_per_run_ms", 0.0)))
+                if sid == "vision_encoder":
+                    vis_ms = dur
+                elif sid == "llm_prefill":
+                    pre_ms = dur
+                elif sid == "llm_generation":
+                    gen_ms = dur
 
-            m_gen = re.search(r"(?:generation\s+(?:time|latency|phase)|decode\s+(?:time|latency)|inference\s+(?:completed\s+in|time|latency)|pure\s+inference)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
-            if m_gen:
-                val = float(m_gen.group(1))
-                unit = (m_gen.group(2) or "ms").lower()
-                pure_inf_ms = val * 1000.0 if unit in ["s", "sec"] else val
-                found_explicit = True
+            if vis_ms == 0.0 and "vision_encoder" in profile_data:
+                vis_ms = float(profile_data["vision_encoder"].get("total_gpu_time_ms", 0.0))
+            if pre_ms == 0.0 and "average_time_per_run_ms" in prefill_info:
+                pre_ms = float(prefill_info["average_time_per_run_ms"])
+            if gen_ms == 0.0 and "total_gpu_time_ms" in gen_info:
+                gen_ms = float(gen_info.get("total_gpu_time_ms", 0.0))
 
-            m_gt = re.search(r"(?:generated|decoded)\s+(\d+)\s+tokens|(?:generated\s+(?:tokens|length)|output\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
-            if m_gt:
-                gen_tokens = int(m_gt.group(1) or m_gt.group(2))
+            pure_inf_ms = vis_ms + pre_ms + gen_ms
+            if pure_inf_ms <= 0.0:
+                pure_inf_ms = float(gen_info.get("total_gpu_time_ms", 0.0)) + float(prefill_info.get("average_time_per_run_ms", 0.0))
 
-            m_pt = re.search(r"(?:prompt|context|input)\s+(\d+)\s+tokens|(?:prompt\s+tokens|input\s+tokens|context\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
-            if m_pt:
-                prompt_tokens = int(m_pt.group(1) or m_pt.group(2))
-
-            m_tps = re.search(r"(?:throughput|tokens\s+per\s+sec(?:ond)?)\D+(\d+(?:\.\d+)?)", txt, re.IGNORECASE)
-            if m_tps:
-                tps = float(m_tps.group(1))
-
-            m_ttft = re.search(r"(?:time\s+to\s+first\s+token|ttft)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
-            if m_ttft:
-                val = float(m_ttft.group(1))
-                unit = (m_ttft.group(2) or "ms").lower()
-                ttft_ms = val * 1000.0 if unit in ["s", "sec"] else val
-
-        if cold_start_ms > 0 and pure_inf_ms <= 0:
-            pure_inf_ms = max(0.0, proc_elapsed_ms - cold_start_ms)
-        elif pure_inf_ms > 0 and cold_start_ms <= 0:
             cold_start_ms = max(0.0, proc_elapsed_ms - pure_inf_ms)
-        elif not found_explicit:
-            cold_start_ms = round(proc_elapsed_ms * 0.65, 2)
-            pure_inf_ms = round(proc_elapsed_ms * 0.35, 2)
+            gen_tokens = gen_info.get("generated_tokens")
+            prompt_tokens = prefill_info.get("computed_tokens")
+            tps = gen_info.get("tokens_per_second")
+            time_per_token = gen_info.get("average_time_per_token_ms")
+            peak_vram_mb = profile_data.get("peak_unified_memory_mb")
+            timing_source = "OFFICIAL_EDGELLM_PROFILE_JSON"
+            found_explicit = True
+        else:
+            # 2. 次选：从 out_data 或 stdout 中正则匹配
+            if isinstance(out_data, dict):
+                stats = out_data.get("stats") or out_data.get("metrics") or out_data.get("timings") or {}
+                if isinstance(stats, dict):
+                    if "load_time_ms" in stats:
+                        cold_start_ms = float(stats["load_time_ms"])
+                        found_explicit = True
+                    if "generation_time_ms" in stats:
+                        pure_inf_ms = float(stats["generation_time_ms"])
+                        found_explicit = True
+                    if "tokens_per_second" in stats:
+                        tps = float(stats["tokens_per_second"])
+                    if "num_generated_tokens" in stats:
+                        gen_tokens = int(stats["num_generated_tokens"])
+                    if "num_prompt_tokens" in stats:
+                        prompt_tokens = int(stats["num_prompt_tokens"])
+                    if "ttft_ms" in stats:
+                        ttft_ms = float(stats["ttft_ms"])
 
-        if gen_tokens and pure_inf_ms > 0 and tps is None:
-            tps = round(gen_tokens / max(1e-3, pure_inf_ms / 1000.0), 2)
+            if stdout_str:
+                txt = stdout_str
+
+                m_load = re.search(r"(?:load(?:ed)?\s+engine|engine\s+(?:load(?:ing)?|deserializ\w+)|deserialize\s+engine)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+                if m_load:
+                    val = float(m_load.group(1))
+                    unit = (m_load.group(2) or "ms").lower()
+                    cold_start_ms = val * 1000.0 if unit in ["s", "sec"] else val
+                    found_explicit = True
+
+                m_gen = re.search(r"(?:generation\s+(?:time|latency|phase)|decode\s+(?:time|latency)|inference\s+(?:completed\s+in|time|latency)|pure\s+inference)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+                if m_gen:
+                    val = float(m_gen.group(1))
+                    unit = (m_gen.group(2) or "ms").lower()
+                    pure_inf_ms = val * 1000.0 if unit in ["s", "sec"] else val
+                    found_explicit = True
+
+                m_gt = re.search(r"(?:generated|decoded)\s+(\d+)\s+tokens|(?:generated\s+(?:tokens|length)|output\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
+                if m_gt:
+                    gen_tokens = int(m_gt.group(1) or m_gt.group(2))
+
+                m_pt = re.search(r"(?:prompt|context|input)\s+(\d+)\s+tokens|(?:prompt\s+tokens|input\s+tokens|context\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
+                if m_pt:
+                    prompt_tokens = int(m_pt.group(1) or m_pt.group(2))
+
+                m_tps = re.search(r"(?:throughput|tokens\s+per\s+sec(?:ond)?)\D+(\d+(?:\.\d+)?)", txt, re.IGNORECASE)
+                if m_tps:
+                    tps = float(m_tps.group(1))
+
+                m_ttft = re.search(r"(?:time\s+to\s+first\s+token|ttft)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+                if m_ttft:
+                    val = float(m_ttft.group(1))
+                    unit = (m_ttft.group(2) or "ms").lower()
+                    ttft_ms = val * 1000.0 if unit in ["s", "sec"] else val
+
+            if cold_start_ms > 0 and pure_inf_ms <= 0:
+                pure_inf_ms = max(0.0, proc_elapsed_ms - cold_start_ms)
+            elif pure_inf_ms > 0 and cold_start_ms <= 0:
+                cold_start_ms = max(0.0, proc_elapsed_ms - pure_inf_ms)
+            elif not found_explicit:
+                cold_start_ms = round(proc_elapsed_ms * 0.65, 2)
+                pure_inf_ms = round(proc_elapsed_ms * 0.35, 2)
+
+            if found_explicit:
+                timing_source = "PARSED_FROM_LLM_INFERENCE_LOGS"
+
+            if gen_tokens and pure_inf_ms > 0 and tps is None:
+                tps = round(gen_tokens / max(1e-3, pure_inf_ms / 1000.0), 2)
 
         timing_data = {
             "cold_start_load_ms": round(cold_start_ms, 2),
             "pure_inference_ms": round(pure_inf_ms, 2),
+            "vision_encoder_gpu_ms": round(vis_ms, 2),
+            "llm_prefill_gpu_ms": round(pre_ms, 2),
+            "llm_generation_gpu_ms": round(gen_ms, 2),
             "proc_elapsed_ms": round(proc_elapsed_ms, 2),
         }
         metric_data = {
@@ -647,7 +705,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             "generated_tokens": gen_tokens,
             "tokens_per_second": round(tps, 2) if tps is not None else None,
             "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
-            "timing_source": "PARSED_FROM_LLM_INFERENCE_LOGS" if found_explicit else "MEASURED_FROM_PROCESS_TIME"
+            "finish_reason": finish_reason,
+            "peak_unified_memory_mb": round(float(peak_vram_mb), 2) if peak_vram_mb is not None else None,
+            "timing_source": timing_source
         }
         return timing_data, metric_data
 
@@ -688,6 +748,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         try:
             input_file = tmp_dir_path / "input.json"
             output_file = tmp_dir_path / "output.json"
+            profile_file = tmp_dir_path / "profile.json"
 
             content_list: List[Dict[str, Any]] = []
 
@@ -739,8 +800,10 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 "--engineDir", str(self._resolved_engine_dir),
                 "--inputFile", str(input_file),
                 "--outputFile", str(output_file),
+                "--profileOutputFile", str(profile_file),
                 "--maxGenerateLength", str(self.max_tokens),
-                "--dumpOutput"
+                "--dumpOutput",
+                "--dumpProfile"
             ]
             if self._resolved_visual_dir:
                 cmd.extend(["--multimodalEngineDir", str(self._resolved_visual_dir)])
@@ -767,9 +830,19 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     except Exception:
                         pass
 
+                profile_data = None
+                if profile_file.exists():
+                    try:
+                        with open(profile_file, "r", encoding="utf-8") as f:
+                            profile_data = json.load(f)
+                    except Exception:
+                        pass
+
                 output_str, parsed = self._extract_vlm_response(out_data, res.stdout)
                 postprocess_ms = (time.perf_counter() - t_post_0) * 1000.0
-                timing_data, metric_data = self._parse_edgellm_metrics(out_data, res.stdout, proc_elapsed_ms)
+                timing_data, metric_data = self._parse_edgellm_metrics(
+                    out_data, res.stdout, proc_elapsed_ms, profile_data=profile_data
+                )
                 timing_data["preprocess_ms"] = round(preprocess_ms, 2)
                 timing_data["postprocess_ms"] = round(postprocess_ms, 2)
                 timing_data["total_duration_ms"] = round(preprocess_ms + proc_elapsed_ms + postprocess_ms, 2)
@@ -784,8 +857,14 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     parsed["inference_metrics"] = metric_data
                     cold_s = timing_data["cold_start_load_ms"] / 1000.0
                     inf_s = timing_data["pure_inference_ms"] / 1000.0
+                    vis_ms = timing_data.get("vision_encoder_gpu_ms", 0.0)
+                    prefill_ms = timing_data.get("llm_prefill_gpu_ms", 0.0)
+                    gen_ms = timing_data.get("llm_generation_gpu_ms", 0.0)
                     post_s = (preprocess_ms + postprocess_ms) / 1000.0
-                    print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 (总计 {timing_data['total_duration_ms']:.1f}ms | 冷启动: {cold_s:.2f}s | 纯推理: {inf_s:.2f}s | 前后处理: {post_s:.2f}s): {parsed.get('summary_text')}")
+                    stage_str = f" [ViT: {vis_ms:.0f}ms, Prefill: {prefill_ms:.0f}ms, Gen: {gen_ms:.0f}ms]" if (vis_ms > 0 or gen_ms > 0) else ""
+                    tps_str = f" | 速度: {metric_data['tokens_per_second']:.1f} tps" if metric_data.get('tokens_per_second') else ""
+                    fin_str = f" | 退出: {metric_data['finish_reason']}" if metric_data.get('finish_reason') else ""
+                    print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 (总计 {timing_data['total_duration_ms']:.1f}ms | 冷启动: {cold_s:.2f}s | 纯推理: {inf_s:.2f}s{stage_str} | 前后处理: {post_s:.2f}s{tps_str}{fin_str}): {parsed.get('summary_text')}")
                     return parsed
                 else:
                     print(f"[!] [TRT-Edge-LLM] 模型已执行完毕 ({proc_elapsed_ms:.1f}ms)，但未能从输出中提取判定结果:")
@@ -1096,12 +1175,18 @@ class AsyncVLMReviewer:
             pure_inf_ms = float(raw_timing.get("pure_inference_ms", dur_ms))
             prep_ms = float(raw_timing.get("preprocess_ms", 0.0))
             post_ms = float(raw_timing.get("postprocess_ms", 0.0))
+            vis_ms = float(raw_timing.get("vision_encoder_gpu_ms", 0.0))
+            prefill_ms = float(raw_timing.get("llm_prefill_gpu_ms", 0.0))
+            gen_ms = float(raw_timing.get("llm_generation_gpu_ms", 0.0))
 
             timing_entry = {
                 "cold_start_load_ms": round(cold_start_ms, 2),
                 "cold_start_load_sec": round(cold_start_ms / 1000.0, 3),
                 "pure_inference_ms": round(pure_inf_ms, 2),
                 "pure_inference_sec": round(pure_inf_ms / 1000.0, 3),
+                "vision_encoder_gpu_ms": round(vis_ms, 2),
+                "llm_prefill_gpu_ms": round(prefill_ms, 2),
+                "llm_generation_gpu_ms": round(gen_ms, 2),
                 "preprocess_ms": round(prep_ms, 2),
                 "preprocess_sec": round(prep_ms / 1000.0, 3),
                 "postprocess_ms": round(post_ms, 2),
@@ -1301,12 +1386,18 @@ class AsyncVLMReviewer:
                 pure_inf_ms = float(raw_timing.get("pure_inference_ms", dur_ms))
                 prep_ms = float(raw_timing.get("preprocess_ms", 0.0))
                 post_ms = float(raw_timing.get("postprocess_ms", 0.0))
+                vis_ms = float(raw_timing.get("vision_encoder_gpu_ms", 0.0))
+                prefill_ms = float(raw_timing.get("llm_prefill_gpu_ms", 0.0))
+                gen_ms = float(raw_timing.get("llm_generation_gpu_ms", 0.0))
 
                 timing_entry = {
                     "cold_start_load_ms": round(cold_start_ms, 2),
                     "cold_start_load_sec": round(cold_start_ms / 1000.0, 3),
                     "pure_inference_ms": round(pure_inf_ms, 2),
                     "pure_inference_sec": round(pure_inf_ms / 1000.0, 3),
+                    "vision_encoder_gpu_ms": round(vis_ms, 2),
+                    "llm_prefill_gpu_ms": round(prefill_ms, 2),
+                    "llm_generation_gpu_ms": round(gen_ms, 2),
                     "preprocess_ms": round(prep_ms, 2),
                     "preprocess_sec": round(prep_ms / 1000.0, 3),
                     "postprocess_ms": round(post_ms, 2),
@@ -1402,6 +1493,9 @@ class AsyncVLMReviewer:
         preprocesses = [r["timing_breakdown"]["preprocess_sec"] for r in reviews if "timing_breakdown" in r]
         postprocesses = [r["timing_breakdown"]["postprocess_sec"] for r in reviews if "timing_breakdown" in r]
         totals = [r["timing_breakdown"]["total_duration_sec"] for r in reviews if "timing_breakdown" in r]
+        vis_gpus = [r["timing_breakdown"]["vision_encoder_gpu_ms"] for r in reviews if "timing_breakdown" in r and r["timing_breakdown"].get("vision_encoder_gpu_ms", 0) > 0]
+        prefill_gpus = [r["timing_breakdown"]["llm_prefill_gpu_ms"] for r in reviews if "timing_breakdown" in r and r["timing_breakdown"].get("llm_prefill_gpu_ms", 0) > 0]
+        gen_gpus = [r["timing_breakdown"]["llm_generation_gpu_ms"] for r in reviews if "timing_breakdown" in r and r["timing_breakdown"].get("llm_generation_gpu_ms", 0) > 0]
         tps_list = [r["inference_metrics"]["tokens_per_second"] for r in reviews if r.get("inference_metrics", {}).get("tokens_per_second")]
         gen_tokens_list = [r["inference_metrics"]["generated_tokens"] for r in reviews if r.get("inference_metrics", {}).get("generated_tokens")]
 
@@ -1409,6 +1503,9 @@ class AsyncVLMReviewer:
             "reviews_count": len(reviews),
             "avg_cold_start_load_sec": round(float(np.mean(cold_starts)), 3) if cold_starts else 0.0,
             "avg_pure_inference_sec": round(float(np.mean(inferences)), 3) if inferences else 0.0,
+            "avg_vision_encoder_gpu_ms": round(float(np.mean(vis_gpus)), 2) if vis_gpus else 0.0,
+            "avg_llm_prefill_gpu_ms": round(float(np.mean(prefill_gpus)), 2) if prefill_gpus else 0.0,
+            "avg_llm_generation_gpu_ms": round(float(np.mean(gen_gpus)), 2) if gen_gpus else 0.0,
             "avg_preprocess_sec": round(float(np.mean(preprocesses)), 3) if preprocesses else 0.0,
             "avg_postprocess_sec": round(float(np.mean(postprocesses)), 3) if postprocesses else 0.0,
             "avg_total_duration_sec": round(float(np.mean(totals)), 3) if totals else 0.0,

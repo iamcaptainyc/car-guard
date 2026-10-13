@@ -729,7 +729,81 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     from camping_guard.profiler import PipelineProfiler
     from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
 
-    # 1. 验证 _parse_edgellm_metrics 从 C++ 日志解析
+    # 1. 验证 _parse_edgellm_metrics 从官方 profile.json 硬件级微秒 Profile 解析
+    sample_profile = {
+        "generation": {
+            "average_time_per_token_ms": 18.866,
+            "average_tokens_per_run": 160.0,
+            "generated_tokens": 160,
+            "tokens_per_second": 53.0,
+            "total_runs": 1
+        },
+        "multimodal": {
+            "average_time_per_token_ms": 0.163,
+            "total_audio_tokens": 0,
+            "total_image_tokens": 1008,
+            "total_multimodal_tokens": 1008,
+            "total_runs": 1
+        },
+        "peak_unified_memory_bytes": 1761693696,
+        "peak_unified_memory_mb": 1680.08,
+        "prefill": {
+            "average_time_per_run_ms": 388.95,
+            "average_time_per_token_ms": 0.378,
+            "average_tokens_per_run": 1027.0,
+            "computed_tokens": 1027,
+            "reused_tokens": 0,
+            "tokens_per_second": 2640.4,
+            "total_runs": 1
+        },
+        "stages": [
+            {
+                "average_time_per_run_ms": 164.86,
+                "stage_id": "vision_encoder",
+                "total_gpu_time_ms": 164.86,
+                "total_runs": 1
+            },
+            {
+                "average_time_per_run_ms": 18.98,
+                "stage_id": "llm_generation",
+                "total_gpu_time_ms": 3018.56,
+                "total_runs": 159
+            },
+            {
+                "average_time_per_run_ms": 388.95,
+                "stage_id": "llm_prefill",
+                "total_gpu_time_ms": 388.95,
+                "total_runs": 1
+            }
+        ]
+    }
+    sample_out_data = {
+        "responses": [
+            {
+                "finish_reason": "end-of-sequence",
+                "text": "测试场景描述"
+            }
+        ]
+    }
+    timing_data_prof, metric_data_prof = TRTEdgeLLMOnDemandBackend._parse_edgellm_metrics(
+        out_data=sample_out_data,
+        stdout_str="",
+        proc_elapsed_ms=8200.0,
+        profile_data=sample_profile
+    )
+    assert timing_data_prof["vision_encoder_gpu_ms"] == 164.86
+    assert timing_data_prof["llm_prefill_gpu_ms"] == 388.95
+    assert timing_data_prof["llm_generation_gpu_ms"] == 3018.56
+    assert timing_data_prof["pure_inference_ms"] == round(164.86 + 388.95 + 3018.56, 2)
+    assert timing_data_prof["cold_start_load_ms"] == round(8200.0 - timing_data_prof["pure_inference_ms"], 2)
+    assert metric_data_prof["tokens_per_second"] == 53.0
+    assert metric_data_prof["prompt_tokens"] == 1027
+    assert metric_data_prof["generated_tokens"] == 160
+    assert metric_data_prof["finish_reason"] == "end-of-sequence"
+    assert metric_data_prof["peak_unified_memory_mb"] == 1680.08
+    assert metric_data_prof["timing_source"] == "OFFICIAL_EDGELLM_PROFILE_JSON"
+
+    # 2. 验证 _parse_edgellm_metrics 从 C++ 日志正则解析回退
     sample_stdout = (
         "[INFO] Loaded engine in 4520.5 ms\n"
         "[INFO] Context phase latency: 240.0 ms\n"
@@ -750,7 +824,7 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     assert metric_data["ttft_ms"] == 260.0
     assert metric_data["timing_source"] == "PARSED_FROM_LLM_INFERENCE_LOGS"
 
-    # 2. 验证端到端 Reviewer 审计记录与 JSON 报告聚合
+    # 3. 验证端到端 Reviewer 审计记录与 JSON 报告聚合
     profiler = PipelineProfiler()
     mock_backend = MockVLMBackend(simulated_delay_sec=0.05)
     reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=False, profiler=profiler)
@@ -774,6 +848,9 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     assert "avg_pure_inference_sec" in aggr
     assert "avg_cold_start_load_sec" in aggr
     assert "avg_total_duration_sec" in aggr
+    assert "avg_vision_encoder_gpu_ms" in aggr
+    assert "avg_llm_prefill_gpu_ms" in aggr
+    assert "avg_llm_generation_gpu_ms" in aggr
     assert aggr["avg_pure_inference_sec"] >= 0.04
 
     # 3. 验证 JSON 报告导出
