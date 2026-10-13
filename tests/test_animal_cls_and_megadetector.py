@@ -394,3 +394,178 @@ def test_engine_animal_cls_track_level_caching_and_dedup():
     assert stats.call_count == 1
 
 
+def test_coco_yolo_animal_classes_route_to_classifier():
+    """测试 8: 验证 COCO 10 种动物类别统一映射为 'animal' 并路由至二级细分类器"""
+    from unittest.mock import MagicMock
+    from camping_guard.perception.detector import ONNXObjectDetector
+
+    # 1. 模拟 ONNXObjectDetector 载入 COCO 模型输出
+    detector = ONNXObjectDetector("models/yolo/yolo11s.onnx")
+    detector.is_megadetector = False
+    detector.input_name = "images"
+
+    mock_sess = MagicMock()
+    # 模拟输出：1个人 (cid 0), 1辆车 (cid 2), 1只熊 (cid 21), 1只狗 (cid 16)
+    # 形状 [1, 84, 100] 符合 YOLO 标准输出 (C=84, N=100)
+    fake_preds = np.zeros((1, 84, 100), dtype=np.float32)
+    # box 0: person
+    fake_preds[0, 0, 0] = 100.0; fake_preds[0, 1, 0] = 100.0; fake_preds[0, 2, 0] = 50.0; fake_preds[0, 3, 0] = 100.0
+    fake_preds[0, 4 + 0, 0] = 0.90 # cid 0 (person)
+    # box 1: car
+    fake_preds[0, 0, 1] = 200.0; fake_preds[0, 1, 1] = 200.0; fake_preds[0, 2, 1] = 100.0; fake_preds[0, 3, 1] = 80.0
+    fake_preds[0, 4 + 2, 1] = 0.88 # cid 2 (car)
+    # box 2: bear (COCO cid 21)
+    fake_preds[0, 0, 2] = 350.0; fake_preds[0, 1, 2] = 200.0; fake_preds[0, 2, 2] = 80.0; fake_preds[0, 3, 2] = 80.0
+    fake_preds[0, 4 + 21, 2] = 0.85 # cid 21 (bear)
+    # box 3: dog (COCO cid 16)
+    fake_preds[0, 0, 3] = 450.0; fake_preds[0, 1, 3] = 250.0; fake_preds[0, 2, 3] = 60.0; fake_preds[0, 3, 3] = 60.0
+    fake_preds[0, 4 + 16, 3] = 0.82 # cid 16 (dog)
+
+    mock_sess.run.return_value = [fake_preds]
+    detector.session = mock_sess
+
+    # 挂载细分类器
+    mock_cls = MagicMock()
+    mock_cls.classify.side_effect = [
+        ('large_beast', 0.93, 'brown_bear', '棕熊'),
+        ('small_animal', 0.89, 'border_collie', '边境牧羊犬')
+    ]
+    detector.animal_classifier = mock_cls
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    dets = detector.detect(dummy_frame)
+
+    assert len(dets) == 4
+    p_det = next(d for d in dets if d['category'] == 'person')
+    c_det = next(d for d in dets if d['category'] == 'car')
+    bear_det = next(d for d in dets if d.get('species') == 'brown_bear')
+    dog_det = next(d for d in dets if d.get('species') == 'border_collie')
+
+    assert p_det is not None
+    assert c_det is not None
+    assert bear_det['category'] == 'large_beast'
+    assert bear_det['species_cn'] == '棕熊'
+    assert dog_det['category'] == 'small_animal'
+    assert dog_det['species_cn'] == '边境牧羊犬'
+
+    # 分类器仅被调用 2 次 (仅针对动物，人与车绝不调用)
+    assert mock_cls.classify.call_count == 2
+
+
+def test_quality_gating_and_multi_frame_self_correction():
+    """测试 9: 验证画质门控与多帧滑动自适应纠偏 (模糊帧误判不会永久锁死 ID，清晰帧立即破局纠偏)"""
+    from unittest.mock import MagicMock
+    from camping_guard.engine import CampingGuardEngine
+
+    mock_classifier = MagicMock()
+    engine = CampingGuardEngine(
+        detector=None,
+        animal_classifier=mock_classifier,
+        use_bytetrack=True
+    )
+    engine.activate()
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    t0 = 1000.0
+
+    # 阶段 1: 早期远距离模糊帧 (35x35 极小剪裁块，area=1225<1600)，分类器误识别为小狗 (small_animal)
+    mock_classifier.classify.return_value = ('small_animal', 0.40, 'domestic_dog', '家犬')
+    dets_f1 = [{
+        'bbox': (200, 200, 35, 35),
+        'conf': 0.70,
+        'category': 'animal'
+    }]
+    engine.process_tick(
+        camera_frames={1: dummy_frame},
+        raw_detections=dets_f1,
+        current_time=t0
+    )
+    assert len(engine.active_targets) == 1
+    t1 = engine.active_targets[0]
+    tid = t1.track_id
+    st = engine.bytetracker.get_track(tid)
+    assert st is not None
+    # 关键断言 1: 极小模糊帧绝不允许进入稳定态锁定 (cls_stable 必须为 False)！
+    assert st.cls_stable is False
+    assert st.category == 'small_animal'
+
+    # 阶段 2: 目标逐渐逼近 (0.7s 后，进入探索期重检)，出现大尺寸清晰帧 (55x55, area=3025>1600)，确凿识别为黑熊 (large_beast)
+    mock_classifier.classify.return_value = ('large_beast', 0.90, 'american_black_bear', '美洲黑熊')
+    dets_f2 = [{
+        'bbox': (190, 190, 55, 55),
+        'conf': 0.92,
+        'category': 'animal'
+    }]
+    engine.process_tick(
+        camera_frames={1: dummy_frame},
+        raw_detections=dets_f2,
+        current_time=t0 + 0.7
+    )
+    assert len(engine.active_targets) == 1
+    t2 = engine.active_targets[0]
+    assert t2.track_id == tid  # 确认轨迹成功匹配保持连续性
+    # 关键断言 2: 高确信猛兽破局纠偏生效，彻底推翻并清除过往模糊小动物观测，升级为大型猛兽！
+    st = engine.bytetracker.get_track(tid)
+    assert st.category == 'large_beast'
+    assert st.confirmed_large_beast is True
+    assert st.species == 'american_black_bear'
+    assert st.species_cn == '美洲黑熊'
+    assert st.cls_stable is True  # 清晰高确信度帧完成收敛进入稳定态
+    assert t2.category == 'large_beast'
+    assert t2.species_cn == '美洲黑熊'
+
+
+def test_adaptive_throttling_and_approach_retrigger():
+    """测试 10: 验证自适应分频与目标大幅逼近突变重检"""
+    from unittest.mock import MagicMock
+    from camping_guard.engine import CampingGuardEngine
+
+    mock_classifier = MagicMock()
+    # 首次识别为稳定野兔 (small_animal)
+    mock_classifier.classify.return_value = ('small_animal', 0.88, 'hare', '野兔')
+    engine = CampingGuardEngine(
+        detector=None,
+        animal_classifier=mock_classifier,
+        use_bytetrack=True
+    )
+    engine.activate()
+
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    t0 = 2000.0
+
+    # 帧 1: 首次建档 (70x70)
+    engine.process_tick(
+        camera_frames={1: dummy_frame},
+        raw_detections=[{'bbox': (100, 100, 70, 70), 'conf': 0.85, 'category': 'animal'}],
+        current_time=t0
+    )
+    assert mock_classifier.classify.call_count == 1
+    tid = engine.active_targets[0].track_id
+    st = engine.bytetracker.get_track(tid)
+    assert st.cls_stable is True
+
+    # 帧 2~20: 稳定跟踪，同一尺寸连续运动 (累计 1.0 秒)，因稳定冷却 (3.0s) 不会调用分类器
+    for i in range(1, 20):
+        engine.process_tick(
+            camera_frames={1: dummy_frame},
+            raw_detections=[{'bbox': (100 + i, 100, 70, 70), 'conf': 0.85, 'category': 'animal'}],
+            current_time=t0 + i * 0.05
+        )
+    assert mock_classifier.classify.call_count == 1, "稳定态维持期间不应频繁重复调用分类器！"
+
+    # 帧 21: 目标突然大幅逼近 (面积从 4900 激增至 12100，膨胀 > 140%)
+    # 模拟近距离看清其实是野猪 (large_beast, wild_boar)
+    mock_classifier.classify.return_value = ('large_beast', 0.92, 'wild_boar', '野猪')
+    engine.process_tick(
+        camera_frames={1: dummy_frame},
+        raw_detections=[{'bbox': (120, 100, 110, 110), 'conf': 0.90, 'category': 'animal'}],
+        current_time=t0 + 1.2
+    )
+    # 关键断言: 目标逼近突变成功绕过常规 3.0s 冷却，立即唤醒分类器完成重检并更正为大型猛兽！
+    assert mock_classifier.classify.call_count == 2
+    st = engine.bytetracker.get_track(tid)
+    assert st.category == 'large_beast'
+    assert st.species == 'wild_boar'
+    assert st.species_cn == '野猪'
+
+

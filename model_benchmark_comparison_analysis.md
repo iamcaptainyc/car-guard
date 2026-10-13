@@ -162,21 +162,21 @@
 
 ```mermaid
 flowchart TD
-    subgraph S0 [S0: 极低功耗待机]
+    subgraph S0 ["S0: 极低功耗待机"]
         A["毫米波雷达 / 超声波微动扫描<br>(功耗 < 0.5W)"]
     end
 
-    subgraph S1 [S1: 车外周界粗筛]
+    subgraph S1 ["S1: 车外周界粗筛"]
         B["yolo11n-fisheye / yolo26n (3~5 FPS 轮询)<br>纯GPU耗时: 3.4~4.0 ms | 算力占用: ~1.7%~2.0%"]
     end
 
-    subgraph S2 [S2: 目标锁定与动作研判]
+    subgraph S2 ["S2: 目标锁定与动作研判"]
         C["ByteTrack 轨迹追踪 + osnet_x0_25 (长时锁ID)"]
         D["rtmpose-s 关键点动作提取<br>(纯GPU耗时: 1.18 ms | 准确率: 72.2%)"]
         E["det_500m + w600k_mbf 人脸白名单鉴权<br>(双模型总耗时: 3.0 ms)"]
     end
 
-    subgraph S3 [S3: 仲裁响应]
+    subgraph S3 ["S3: 仲裁响应"]
         F["车主免打扰 (静默)"]
         G["触发灯光微警 / 车内推送 / 录像存盘"]
     end

@@ -571,30 +571,39 @@ def run_video_pipeline(
         det_str = str(chosen_detector_path).lower()
         is_md = ("mdv" in det_str or "megadetector" in det_str)
 
-    # 1.1 二级动物细分类器初始化 (核心规范：仅在加载 MegaDetector 时才激活生效，YOLO 模式下绝不加载)
+    # 1.1 二级动物细分类器初始化 (统一规范：无论 YOLO 检出 10 类动物还是 MegaDetector 检出 animal，均支持二级细分类)
     animal_classifier = None
-    if is_md:
-        chosen_cls_path = cls_onnx_path
-        if chosen_cls_path and not os.path.exists(chosen_cls_path):
-            for search_dir in ["models/cls", "models"]:
-                sub_cand = os.path.join(search_dir, chosen_cls_path)
-                if os.path.exists(sub_cand):
-                    chosen_cls_path = sub_cand
-                    break
-        if chosen_cls_path and os.path.exists(chosen_cls_path):
-            try:
-                from camping_guard.perception.animal_classifier import AnimalClassifier
-                animal_classifier = AnimalClassifier(model_path=chosen_cls_path, use_trt=use_trt)
-            except Exception as e:
-                pass
-    else:
-        # 当前为主流人车 YOLO 检测器，二级物种细分类模型 (cls) 保持休眠，不加载进显存
-        animal_classifier = None
+    chosen_cls_path = cls_onnx_path
+    if chosen_cls_path and not os.path.exists(chosen_cls_path):
+        for search_dir in ["models/cls", "models"]:
+            sub_cand = os.path.join(search_dir, chosen_cls_path)
+            if os.path.exists(sub_cand):
+                chosen_cls_path = sub_cand
+                break
+    if not chosen_cls_path:
+        for cand in [
+            "models/cls/mobilenetv3-large.engine" if use_trt else None,
+            "models/cls/mobilenetv3.engine" if use_trt else None,
+            "models/cls/mobilenetv3-large.onnx",
+            "models/cls/mobilenetv3.onnx"
+        ]:
+            if cand and os.path.exists(cand):
+                chosen_cls_path = cand
+                break
+    if chosen_cls_path and os.path.exists(chosen_cls_path):
+        try:
+            from camping_guard.perception.animal_classifier import AnimalClassifier
+            animal_classifier = AnimalClassifier(model_path=chosen_cls_path, use_trt=use_trt)
+        except Exception as e:
+            pass
 
     if chosen_detector_path and os.path.exists(chosen_detector_path):
         tag = "[TensorRT Engine]" if str(chosen_detector_path).endswith(".engine") else "[ONNX]"
-        model_type_str = "MegaDetector (野生动物监测模式)" if is_md else "YOLO (人车防卫模式)"
+        model_type_str = "MegaDetector (野生动物监测模式)" if is_md else "YOLO (人车/野生动物统一检测模式)"
         print(f"[*] 正在挂载 {model_type_str} 目标检测模型 {tag}: {chosen_detector_path} (置信度阈值: {conf_threshold:.2f})")
+        if animal_classifier is not None and getattr(animal_classifier, 'session', None) is not None:
+            cls_tag = "[TensorRT Engine]" if str(animal_classifier.model_path).endswith(".engine") else "[ONNX]"
+            print(f"[*] 已级联挂载二级动物物种细分类器 {cls_tag}: {animal_classifier.model_path}")
         det_input_size = (detector_size, detector_size) if detector_size else (640, 640)
         detector = ONNXObjectDetector(
             model_path=chosen_detector_path,
@@ -1409,8 +1418,8 @@ def main():
                         help="手动覆盖相机俯仰角 (度，向下为负，默认从 --config 读取)")
     parser.add_argument("--camera-yaw", type=float, default=None,
                         help="手动覆盖相机偏航角 (度，0前, 90左, -90右, 180后，默认从 --config 读取)")
-    parser.add_argument("--detector", type=str, default=None,
-                        help="YOLO 目标检测 ONNX 模型文件或名称 (支持自动在 models/yolo/ 查找，如 yolo11n-fisheye.onnx / yolo11s.onnx / yolov8m.onnx / yolo11x-fisheye.onnx)")
+    parser.add_argument("--detector", "--megadetector", type=str, default=None,
+                        help="目标检测模型路径或名称 (支持自由传入 YOLO 或 MegaDetector，如 yolo11s.onnx / yolo11n.engine / MDV6-yolov10-c.onnx，默认自动发现最佳模型)")
     parser.add_argument("--conf", "--conf-threshold", dest="conf_threshold", type=float, default=0.25,
                         help="目标检测置信度阈值 (默认 0.25，鱼眼边缘大畸变视角可调低至 0.15~0.20)")
     parser.add_argument("--sidebar", action="store_true", default=False,

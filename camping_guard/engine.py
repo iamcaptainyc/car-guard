@@ -322,59 +322,128 @@ class CampingGuardEngine:
                         st.radial_speed = vr
                         st.track_uid = t.track_uid
 
-                    # 二级动物物种细分类 (按需触发 + 轨迹级状态锁存与冷却限频，杜绝逐帧重复调用)
+                    # 二级动物物种细分类 (质量门控 + 多帧滑动证据融合 + 猛兽破局纠偏 + 自适应分频)
                     if t.category in ['animal', 'small_animal', 'large_beast'] and self.animal_classifier is not None and primary_frame is not None:
+                        bx, by, bw, bh = int(t.bbox.x), int(t.bbox.y), int(t.bbox.w), int(t.bbox.h)
+                        area = float(bw * bh)
+                        min_dim = min(bw, bh)
                         last_cls_t = getattr(st, 'last_animal_cls_time', 0.0) if st else 0.0
-                        cls_locked = getattr(st, 'animal_cls_locked', False) if st else False
+                        cls_obs = getattr(st, 'cls_observations', []) if st else []
+                        cls_stable = getattr(st, 'cls_stable', False) if st else False
+                        stable_area = getattr(st, 'stable_bbox_area', 0.0) if st else 0.0
+                        time_since_last = current_time - last_cls_t
+
                         need_animal_cls = (
-                            t.category == 'animal'
+                            len(cls_obs) == 0
                             or not t.species
-                            or (not cls_locked and (current_time - last_cls_t >= 1.0))
+                            or t.category == 'animal'
+                            or (cls_stable and stable_area > 0 and (area >= 1.5 * stable_area) and (time_since_last >= 0.5))
+                            or (not cls_stable and (time_since_last >= 0.6))
+                            or (cls_stable and (time_since_last >= 3.0))
                         )
                         if need_animal_cls:
                             fh, fw = primary_frame.shape[:2]
-                            bx, by, bw, bh = int(t.bbox.x), int(t.bbox.y), int(t.bbox.w), int(t.bbox.h)
                             cx1, cy1 = max(0, min(fw - 1, bx)), max(0, min(fh - 1, by))
                             cx2, cy2 = max(cx1 + 1, min(fw, bx + bw)), max(cy1 + 1, min(fh, by + bh))
                             crop = primary_frame[cy1:cy2, cx1:cx2]
-                            cls_sess = getattr(self.animal_classifier, 'session', None)
-                            with self.profiler.profile_model("MobileNetV3-AnimalCls", condition=f"ID:{t.track_id} 动物物种细分类 (224x224)", session=cls_sess):
-                                cat, cls_conf, sp_en, sp_cn = self.animal_classifier.classify(crop)
+                            if crop.size > 0:
+                                cls_sess = getattr(self.animal_classifier, 'session', None)
+                                with self.profiler.profile_model("MobileNetV3-AnimalCls", condition=f"ID:{t.track_id} 动物物种细分类 (224x224)", session=cls_sess):
+                                    cat, cls_conf, sp_en, sp_cn = self.animal_classifier.classify(crop)
 
-                            if st is not None:
-                                st.last_animal_cls_time = current_time
-                                st.animal_cls_count = getattr(st, 'animal_cls_count', 0) + 1
-                                if cat == 'large_beast':
-                                    st.confirmed_large_beast = True
-                                    st.category = 'large_beast'
-                                    st.species = sp_en
-                                    st.species_cn = sp_cn
-                                    if cls_conf >= 0.45 or st.animal_cls_count >= 2:
-                                        st.animal_cls_locked = True
-                                elif st.confirmed_large_beast:
-                                    st.category = 'large_beast'
-                                    if sp_en and sp_en not in ['unknown', 'unclassified_animal']:
+                                # 1. 画质与尺寸前置门控 (Quality Gating)
+                                # 极小或边缘模糊裁剪块 (边长<40 或面积<1600) 权重降权，且严禁直接稳定锁存
+                                is_low_quality = (min_dim < 40 or area < 1600)
+                                q_size = min(1.0, (area ** 0.5) / 160.0)
+                                obs_weight = float(cls_conf) * (0.2 if is_low_quality else q_size)
+
+                                new_obs = {
+                                    'cat': cat,
+                                    'cls_conf': float(cls_conf),
+                                    'sp_en': sp_en,
+                                    'sp_cn': sp_cn,
+                                    'weight': obs_weight,
+                                    'area': area,
+                                    'time': current_time,
+                                    'is_high_quality': not is_low_quality
+                                }
+
+                                if st is not None:
+                                    st.last_animal_cls_time = current_time
+                                    st.animal_cls_count = getattr(st, 'animal_cls_count', 0) + 1
+                                    if not hasattr(st, 'cls_observations') or st.cls_observations is None:
+                                        st.cls_observations = []
+
+                                    # 2. 安全优先：猛兽确信破局覆盖 (Breakthrough Override)
+                                    # 当捕捉到高置信度大型猛兽时 (conf >= 0.55 且非模糊小图)，立即破除过往小动物观察并拉响警报
+                                    if cat == 'large_beast' and cls_conf >= 0.55 and not is_low_quality:
+                                        st.confirmed_large_beast = True
+                                        st.category = 'large_beast'
                                         st.species = sp_en
-                                    if sp_cn and sp_cn not in ['未知动物', '通用动物']:
                                         st.species_cn = sp_cn
-                                else:
-                                    st.category = cat
-                                    st.species = sp_en
-                                    st.species_cn = sp_cn
-                                    if st.animal_cls_count >= 3 and sp_en not in ['unknown', 'unclassified_animal']:
-                                        st.animal_cls_locked = True
+                                        st.cls_observations = [o for o in st.cls_observations if o['cat'] == 'large_beast']
+                                        st.cls_observations.append(new_obs)
+                                        if cls_conf >= 0.80:
+                                            st.cls_stable = True
+                                            st.stable_bbox_area = area
+                                    else:
+                                        st.cls_observations.append(new_obs)
+                                        if len(st.cls_observations) > 5:
+                                            st.cls_observations.pop(0)
 
-                                t.category = st.category
-                                t.species = st.species
-                                t.species_cn = st.species_cn
-                            else:
-                                t.category = cat
-                                t.species = sp_en
-                                t.species_cn = sp_cn
+                                        # 3. 多帧滑动证据加权融合 (Multi-Frame Rolling Evidence Fusion)
+                                        beast_weight = sum(o['weight'] for o in st.cls_observations if o['cat'] == 'large_beast')
+                                        small_weight = sum(o['weight'] for o in st.cls_observations if o['cat'] == 'small_animal')
+                                        total_weight = beast_weight + small_weight
+
+                                        if total_weight > 0:
+                                            if beast_weight > small_weight:
+                                                winning_cat = 'large_beast'
+                                            else:
+                                                winning_cat = 'small_animal'
+
+                                            sp_weights = {}
+                                            for o in st.cls_observations:
+                                                if o['cat'] == winning_cat and o['sp_en'] and o['sp_en'] not in ['unknown', 'unclassified_animal']:
+                                                    key = (o['sp_en'], o['sp_cn'])
+                                                    sp_weights[key] = sp_weights.get(key, 0.0) + o['weight']
+
+                                            if sp_weights:
+                                                best_sp_en, best_sp_cn = max(sp_weights.items(), key=lambda x: x[1])[0]
+                                            else:
+                                                best_sp_en = sp_en
+                                                best_sp_cn = sp_cn
+
+                                            st.category = winning_cat
+                                            st.species = best_sp_en
+                                            st.species_cn = best_sp_cn
+
+                                            if winning_cat == 'large_beast':
+                                                st.confirmed_large_beast = True
+                                            else:
+                                                # 动态自愈纠偏：若早前模糊误报为猛兽，但后续积累了 >= 2 个高质量小动物证据且权重占比 >= 80%
+                                                hq_small_count = sum(1 for o in st.cls_observations if o['is_high_quality'] and o['cat'] == 'small_animal')
+                                                if hq_small_count >= 2 and (small_weight / total_weight) >= 0.80:
+                                                    st.confirmed_large_beast = False
+
+                                            # 4. 稳定态收敛判定 (Convergence Gate)
+                                            hq_obs_count = sum(1 for o in st.cls_observations if o['is_high_quality'])
+                                            winning_ratio = max(beast_weight, small_weight) / total_weight
+                                            if (not is_low_quality and cls_conf >= 0.80) or (hq_obs_count >= 2 and winning_ratio >= 0.70):
+                                                st.cls_stable = True
+                                                st.stable_bbox_area = area
+
+                                    t.category = st.category
+                                    t.species = st.species
+                                    t.species_cn = st.species_cn
+                                else:
+                                    t.category = cat
+                                    t.species = sp_en
+                                    t.species_cn = sp_cn
                     elif t.category == 'animal' and self.animal_classifier is None:
-                        t.category = 'small_animal'
+                        t.category = getattr(t, 'fallback_category', 'small_animal')
                         if st is not None:
-                            st.category = 'small_animal'
+                            st.category = t.category
 
                     # 人员 ReID 特征建档 (仅在首次入场且无特征时建档 1 次)
                     if t.category == 'person' and self.reid_extractor and primary_frame is not None and t.reid_feature is None:
@@ -678,8 +747,10 @@ class CampingGuardEngine:
                 event_record.vlm_summary = vlm_res.get("summary_text")
                 # 若 VLM 经安全沙箱仲裁调整了威胁等级 (如纯视觉 L2 降级为 L1)
                 if "final_threat" in vlm_res:
-                    event_record.final_threat_level = vlm_res["final_threat"]
-                    highest_threat = vlm_res["final_threat"]
+                    # 权限沙箱原则：凡是有车身物理接触信号的已确认高危 (L3)，异步保底绝不可降级
+                    if not (event_record.has_contact_signal and highest_threat == ThreatLevel.L3_CRITICAL and vlm_res["final_threat"] != ThreatLevel.L3_CRITICAL):
+                        event_record.final_threat_level = vlm_res["final_threat"]
+                        highest_threat = vlm_res["final_threat"]
 
         # 13 & 14. 响应执行器输出动作与存证录像锁存
         with self.profiler.profile_stage("Actuator_and_Evidence_Lock"):

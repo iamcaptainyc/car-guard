@@ -91,36 +91,31 @@ def check_required_engines(
         "vlm": None
     }
 
-    # 1. YOLO 目标检测
-    if custom_detector and Path(custom_detector).is_file():
-        engine_status["yolo"] = Path(custom_detector)
+    # 1. 主目标检测器 (YOLO 与 MegaDetector 统一自由替换)
+    chosen_det_input = custom_detector or custom_megadetector
+    if chosen_det_input and Path(chosen_det_input).is_file():
+        engine_status["detector"] = Path(chosen_det_input)
     else:
-        yolo_cands = [
+        det_cands = [
             models_dir / "yolo" / "yolo11s.engine",
             models_dir / "yolo" / "yolo11n.engine",
+            models_dir / "megadetector" / "MDV6-yolov10-c.engine",
+            models_dir / "yolo" / "MDV6-yolov10-c.engine",
             models_dir / "yolo" / "yolo11n-fisheye.engine",
             models_dir / "yolo" / "yolo26n.engine",
             models_dir / "yolo" / "yolov8n.engine",
-        ]
-        for c in yolo_cands:
-            if c.is_file():
-                engine_status["yolo"] = c
-                break
-
-    # 1.1 MegaDetector 野生动物与人车检测器
-    if custom_megadetector and Path(custom_megadetector).is_file():
-        engine_status["megadetector"] = Path(custom_megadetector)
-    else:
-        md_cands = [
-            models_dir / "megadetector" / "MDV6-yolov10-c.engine",
-            models_dir / "yolo" / "MDV6-yolov10-c.engine",
             models_dir / "megadetector" / "MDV6-yolov10-c.onnx",
             models_dir / "yolo" / "MDV6-yolov10-c.onnx",
+            models_dir / "yolo" / "yolo11s.onnx",
+            models_dir / "yolo" / "yolo11n.onnx"
         ]
-        for c in md_cands:
+        for c in det_cands:
             if c.is_file():
-                engine_status["megadetector"] = c
+                engine_status["detector"] = c
                 break
+
+    engine_status["yolo"] = engine_status["detector"]
+    engine_status["megadetector"] = engine_status["detector"]
 
     # 1.2 二级动物细分类器 (MobileNetV3)
     if custom_cls and Path(custom_cls).is_file():
@@ -257,10 +252,8 @@ def main():
                         help="强制调用 batch_convert_trt.py 检查并编译所有 ONNX 为 TensorRT .engine 文件")
     parser.add_argument("--config", type=str, default="vehicle_calib.json",
                         help="全车标定配置文件 (默认: vehicle_calib.json)")
-    parser.add_argument("--detector", type=str, default=None,
-                        help="显式指定 YOLO .engine 模型路径 (如 models/yolo/yolo11n.engine)")
-    parser.add_argument("--megadetector", type=str, default=None,
-                        help="显式指定 MegaDetector 模型路径 (如 models/megadetector/MDV6-yolov10-c.engine)")
+    parser.add_argument("--detector", "--megadetector", type=str, default=None,
+                        help="显式指定目标检测器模型路径 (支持 YOLO 或 MegaDetector，如 models/yolo/yolo11s.engine 或 models/megadetector/MDV6-yolov10-c.engine)")
     parser.add_argument("--cls", "--animal-cls", dest="cls_model", type=str, default=None,
                         help="显式指定二级动物细分类模型路径 (如 models/cls/mobilenetv3-large.engine，默认自动发现)")
     parser.add_argument("--pose", type=str, default=None,
@@ -317,61 +310,26 @@ def main():
         vlm_model_dir=args.vlm_model_dir,
         vlm_engine=args.vlm_engine,
         custom_detector=args.detector,
-        custom_megadetector=args.megadetector,
         custom_cls=args.cls_model,
         custom_pose=args.pose,
         custom_fire=args.fire_detector,
         enable_fire=not args.no_fire
     )
-    # 判定当前主检测模式 (YOLO 与 MegaDetector 互斥二选一)
-    is_md = False
-    if args.megadetector:
-        chosen_det = args.megadetector
-        is_md = True
-    elif args.detector:
-        chosen_det = args.detector
-        is_md = ("mdv" in str(chosen_det).lower() or "megadetector" in str(chosen_det).lower())
-    else:
-        # 默认模式：优先选用 YOLO 通用人车检测器；若无 YOLO 则回退 MegaDetector
-        if engines["yolo"]:
-            chosen_det = str(engines["yolo"])
-            is_md = False
-        elif engines["megadetector"]:
-            chosen_det = str(engines["megadetector"])
-            is_md = True
-        else:
-            chosen_det = None
-            is_md = False
+    # 统一主检测器与二级动物细分类器 (自由指定 YOLO 或 MegaDetector)
+    chosen_det = args.detector or (str(engines["detector"]) if engines["detector"] else None)
+    chosen_cls = args.cls_model or (str(engines["cls"]) if engines["cls"] else None)
 
-    # 核心准则：二级动物细分类器 (cls) 仅在检测器为 MegaDetector 时按需加载，YOLO 模式下绝不加载
-    if is_md:
-        chosen_cls = args.cls_model or (str(engines["cls"]) if engines["cls"] else None)
-    else:
-        chosen_cls = None
+    is_md = ("mdv" in str(chosen_det).lower() or "megadetector" in str(chosen_det).lower()) if chosen_det else False
+    det_mode_str = "MegaDetector (野生动物监测模式)" if is_md else "YOLO (人车/野生动物统一检测模式)"
 
     print("\n[*] 检查 TensorRT Engine 模型挂载状态:")
     for k, p in engines.items():
-        if k == "yolo":
-            if not is_md and p:
-                status = f"✅ 已激活 (主检测器: 人车防卫模式): {p}"
-            elif p:
-                status = f"⏸️ 待命休眠: {p} (当前已选用 MegaDetector)"
-            else:
-                status = "⚠️ 未找到对应 .engine 文件"
-        elif k == "megadetector":
-            if is_md and p:
-                status = f"✅ 已激活 (主检测器: 野生动物监测模式): {p}"
-            elif p:
-                status = f"⏸️ 待命休眠: {p} (当前使用 YOLO，传入 --megadetector 切换)"
-            else:
-                status = "⚠️ 未找到对应 .engine 文件"
+        if k in ["yolo", "megadetector"]:
+            continue
+        elif k == "detector":
+            status = f"✅ 已激活 (主检测器: {det_mode_str}): {chosen_det}" if chosen_det else "⚠️ 未找到对应 .engine 文件"
         elif k == "cls":
-            if is_md and p:
-                status = f"✅ 已激活 (配合 MegaDetector 级联细分类): {p}"
-            elif p:
-                status = f"⏸️ 待命休眠: {p} (仅在启用 MegaDetector 时按需加载)"
-            else:
-                status = "⚠️ 未找到对应 .engine 文件"
+            status = f"✅ 已激活 (二级动物物种细分类): {p}" if p else "⏸️ 待命休眠 (未找到细分类模型，使用先验回退策略)"
         elif k == "fire_det":
             if p == "builtin:VisualFlameDetector":
                 status = "✅ 已激活 (自适应视觉火焰并发引擎, 默认开启)"
@@ -385,8 +343,8 @@ def main():
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
         print(f"    - {k:<12}: {status}")
 
-    if not engines["yolo"] and not args.detector:
-        print("\n[!] 提示: 检测到尚未编译 YOLO TensorRT Engine。")
+    if not chosen_det:
+        print("\n[!] 提示: 检测到尚未编译或未找到主目标检测器 Engine。")
         print("    可在启动命令后追加 --compile 自动一键编译，或单独运行:")
         print("    python batch_convert_trt.py models --precision fp16")
 

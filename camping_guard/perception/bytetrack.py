@@ -144,7 +144,17 @@ class STrack:
         self.species_cn: Optional[str] = None
         self.last_animal_cls_time: float = 0.0
         self.animal_cls_count: int = 0
-        self.animal_cls_locked: bool = False
+        self.cls_observations: List[Dict[str, Any]] = []
+        self.cls_stable: bool = False
+        self.stable_bbox_area: float = 0.0
+
+    @property
+    def animal_cls_locked(self) -> bool:
+        return self.cls_stable
+
+    @animal_cls_locked.setter
+    def animal_cls_locked(self, val: bool):
+        self.cls_stable = bool(val)
 
     @property
     def tlwh(self) -> Tuple[float, float, float, float]:
@@ -194,9 +204,11 @@ class STrack:
                 if sp_cn and sp_cn not in ['未知动物', '通用动物']:
                     self.species_cn = sp_cn
             else:
-                # 若检测确凿变为人员或车辆等完全不相干物理类别，解除猛兽锁存
+                # 若检测确凿变为人员或车辆等完全不相干物理类别，解除猛兽锁存与分类观测
                 self.confirmed_large_beast = False
-                self.animal_cls_locked = False
+                self.cls_stable = False
+                self.cls_observations = []
+                self.stable_bbox_area = 0.0
                 self.category = new_track.category
                 self.species = getattr(new_track, 'species', None)
                 self.species_cn = getattr(new_track, 'species_cn', None)

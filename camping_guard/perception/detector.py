@@ -13,6 +13,27 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 
+# COCO 数据集 10 类动物 (Class ID: 14~23)
+COCO_ANIMAL_IDS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+COCO_ANIMAL_HINTS = {
+    14: ('bird', '鸟类'),
+    15: ('cat', '猫类'),
+    16: ('dog', '犬类'),
+    17: ('horse', '马类'),
+    18: ('sheep', '羊类'),
+    19: ('cow', '牛类'),
+    20: ('elephant', '大象'),
+    21: ('bear', '熊类'),
+    22: ('zebra', '斑马'),
+    23: ('giraffe', '长颈鹿')
+}
+# 无二级细分类模型时的优雅后备映射
+COCO_FALLBACK_ANIMAL_MAP = {
+    14: 'small_animal', 15: 'small_animal', 16: 'small_animal',
+    17: 'small_animal', 18: 'small_animal', 19: 'small_animal',
+    20: 'large_beast', 21: 'large_beast', 22: 'small_animal', 23: 'large_beast'
+}
+
 class BaseObjectDetector(abc.ABC):
     @abc.abstractmethod
     def detect(self, frame: np.ndarray, conf_threshold: float = 0.35) -> List[Dict]:
@@ -46,12 +67,13 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.defer_animal_cls = False
 
         # COCO 类别映射到露营守卫规范类别
+        # 10 种动物类别 (14~23) 统一映射为 'animal'，统一路由至二级动物细分类器 (MobileNetV3) 判定物种与猛兽/小型动物
         self.coco_to_guard_map = {
             0: 'person',
             2: 'car', 5: 'car', 7: 'car', # 轿车, 公交车, 卡车
-            14: 'small_animal', 15: 'small_animal', 16: 'small_animal', # 鸟, 猫, 狗
-            17: 'small_animal', 18: 'small_animal', 19: 'small_animal', # 马, 羊, 牛
-            21: 'large_beast', # 熊 (大型猛兽)
+            14: 'animal', 15: 'animal', 16: 'animal', # 鸟, 猫, 狗
+            17: 'animal', 18: 'animal', 19: 'animal', # 马, 羊, 牛
+            20: 'animal', 21: 'animal', 22: 'animal', 23: 'animal', # 大象, 熊, 斑马, 长颈鹿
             80: 'fire', 81: 'smoke' # 扩展类
         }
 
@@ -148,13 +170,13 @@ class ONNXObjectDetector(BaseObjectDetector):
             except Exception:
                 pass
 
-        # 若当前为 MegaDetector 且尚未挂载动物分类器，尝试自动挂载 models/cls 下的模型
-        if self.is_megadetector and self.animal_classifier is None:
+        # 若尚未挂载动物分类器且当前模型非火灾专用模型，尝试自动挂载 models/cls 下的动物分类器 (支持 YOLO 与 MegaDetector)
+        if self.animal_classifier is None and not self.is_fire_model:
             try:
                 from camping_guard.perception.animal_classifier import AnimalClassifier
                 self.animal_classifier = AnimalClassifier(use_trt=use_trt)
                 if self.animal_classifier.session is not None:
-                    print(f"[ObjectDetector] 已为 MegaDetector 自动级联挂载二级动物细分类器: {self.animal_classifier.model_path}")
+                    print(f"[ObjectDetector] 自动级联挂载二级动物细分类器: {self.animal_classifier.model_path}")
             except Exception as e:
                 pass
 
@@ -269,20 +291,26 @@ class ONNXObjectDetector(BaseObjectDetector):
             if base_cat == 'unknown':
                 continue
 
-            raw_candidates.append({
+            item = {
                 'bbox': (x, y, w, h),
                 'category': base_cat,
                 'conf': float(score)
-            })
+            }
+            if int(cid) in COCO_ANIMAL_HINTS:
+                sp_en, sp_cn = COCO_ANIMAL_HINTS[int(cid)]
+                item['detector_hint_species'] = sp_en
+                item['detector_hint_species_cn'] = sp_cn
+                item['fallback_category'] = COCO_FALLBACK_ANIMAL_MAP.get(int(cid), 'small_animal')
+            raw_candidates.append(item)
 
         # 2. 先执行 NMS 滤除同一目标周围的重叠冗余候选框
         nms_detections = self._apply_nms(raw_candidates, iou_threshold=0.45, score_threshold=eff_conf)
         self.last_postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
         self._sync_session_timing()
 
-        # 3. 核心策略：仅对 NMS 去重后幸存的独立 animal 目标调用二级细分类器
+        # 3. 核心策略：仅对 NMS 去重后幸存的独立 animal 目标调用二级细分类器 (无论前端为 YOLO 还是 MegaDetector)
         # 若上层已启用 ByteTrack 轨迹级按需分类缓存 (defer_animal_cls=True)，则直接返回 'animal' 交由追踪器按需触发
-        if is_megadetector and not getattr(self, 'defer_animal_cls', False):
+        if not getattr(self, 'defer_animal_cls', False):
             for det_item in nms_detections:
                 if det_item['category'] == 'animal':
                     if self.animal_classifier is not None:
@@ -300,7 +328,7 @@ class ONNXObjectDetector(BaseObjectDetector):
                             self.profiler.record_model_call(
                                 model_name="MobileNetV3-AnimalCls",
                                 duration_ms=t_cls_ms,
-                                condition="MegaDetector二级动物细分类 (224x224)",
+                                condition="二级动物细分类 (224x224)",
                                 gpu_ms=cls_gpu_ms,
                                 preprocess_ms=cls_pre_ms,
                                 postprocess_ms=cls_post_ms
@@ -311,7 +339,10 @@ class ONNXObjectDetector(BaseObjectDetector):
                             det_item['species_cn'] = species_cn
                             det_item['cls_conf'] = cls_conf
                     else:
-                        det_item['category'] = 'small_animal'
+                        det_item['category'] = det_item.get('fallback_category', 'small_animal')
+                        if det_item.get('detector_hint_species'):
+                            det_item['species'] = det_item['detector_hint_species']
+                            det_item['species_cn'] = det_item.get('detector_hint_species_cn')
 
         return nms_detections
 

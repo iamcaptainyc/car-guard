@@ -921,7 +921,7 @@ class AsyncVLMReviewer:
                 "last_threat_rank": curr_rank,
                 "had_contact": has_contact,
                 "in_flight": True,
-                "last_real_result": prev.get("last_real_result") if prev else None,
+                "last_real_result": None if is_escalated else (prev.get("last_real_result") if prev else None),
             }
             self._active_tasks_count += 1
             self.total_submitted_tasks += 1
