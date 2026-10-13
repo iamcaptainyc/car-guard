@@ -799,6 +799,7 @@ class PipelineProfiler:
             "models": summary.get("models", {}),
             "pipeline_stages": summary.get("stages", {}),
             "vlm_audit_summary": vlm_audit_data,
+            "vlm_detailed_timing_breakdown": vlm_audit_data.get("timing_aggregates", {}),
             "memory_and_hardware": summary.get("memory", {}),
             "slowest_frames_top10": slowest_top10,
             "frame_timeseries": timeseries,

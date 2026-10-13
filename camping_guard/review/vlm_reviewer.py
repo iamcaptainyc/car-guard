@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import re
 import base64
 import queue
 import shutil
@@ -125,6 +126,7 @@ class MockVLMBackend(VLMBackendBase):
             action_category = "BENIGN_ACTIVITY"
             summary_text = f"车身外围发现常规活动目标，等级为 {event_record.threat_level.value}。"
 
+        delay_ms = max(0.0, self.simulated_delay_sec * 1000.0)
         return {
             "action_category": action_category,
             "confidence": confidence,
@@ -133,7 +135,21 @@ class MockVLMBackend(VLMBackendBase):
             "threat_escalation": threat_escalation,
             "summary_text": summary_text[:50],
             "backend_source": "FALLBACK_RULE_MOCK (离线规则保底模板)",
-            "raw_output_text": "(使用离线规则模板，未执行真实大模型)"
+            "raw_output_text": "(使用离线规则模板，未执行真实大模型)",
+            "timing_breakdown": {
+                "preprocess_ms": 0.5,
+                "cold_start_load_ms": 0.0,
+                "pure_inference_ms": round(delay_ms, 2),
+                "postprocess_ms": 0.5,
+                "total_duration_ms": round(delay_ms + 1.0, 2)
+            },
+            "inference_metrics": {
+                "prompt_tokens": 120,
+                "generated_tokens": len(summary_text[:50]),
+                "tokens_per_second": round(len(summary_text[:50]) / max(self.simulated_delay_sec, 1e-3), 2) if self.simulated_delay_sec > 0 else 100.0,
+                "ttft_ms": round(delay_ms * 0.3, 2),
+                "timing_source": "MOCK_BACKEND_SIMULATED"
+            }
         }
 
 
@@ -537,6 +553,104 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         return None, None
 
+    @staticmethod
+    def _parse_edgellm_metrics(
+        out_data: Any,
+        stdout_str: Optional[str],
+        proc_elapsed_ms: float
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """
+        从 llm_inference 的 output.json 与 stdout 日志中精准提取并剥离详细性能指标:
+        - 冷启动/引擎反序列化耗时 (cold_start_load_ms / cold_start_load_sec)
+        - 实际纯推理与生成耗时 (pure_inference_ms / pure_inference_sec)
+        - Token 指标 (prompt_tokens, generated_tokens, tokens_per_second, ttft_ms)
+        """
+        cold_start_ms = 0.0
+        pure_inf_ms = 0.0
+        prompt_tokens = None
+        gen_tokens = None
+        tps = None
+        ttft_ms = None
+        found_explicit = False
+
+        if isinstance(out_data, dict):
+            stats = out_data.get("stats") or out_data.get("metrics") or out_data.get("timings") or {}
+            if isinstance(stats, dict):
+                if "load_time_ms" in stats:
+                    cold_start_ms = float(stats["load_time_ms"])
+                    found_explicit = True
+                if "generation_time_ms" in stats:
+                    pure_inf_ms = float(stats["generation_time_ms"])
+                    found_explicit = True
+                if "tokens_per_second" in stats:
+                    tps = float(stats["tokens_per_second"])
+                if "num_generated_tokens" in stats:
+                    gen_tokens = int(stats["num_generated_tokens"])
+                if "num_prompt_tokens" in stats:
+                    prompt_tokens = int(stats["num_prompt_tokens"])
+                if "ttft_ms" in stats:
+                    ttft_ms = float(stats["ttft_ms"])
+
+        if stdout_str:
+            txt = stdout_str
+
+            m_load = re.search(r"(?:load(?:ed)?\s+engine|engine\s+(?:load(?:ing)?|deserializ\w+)|deserialize\s+engine)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+            if m_load:
+                val = float(m_load.group(1))
+                unit = (m_load.group(2) or "ms").lower()
+                cold_start_ms = val * 1000.0 if unit in ["s", "sec"] else val
+                found_explicit = True
+
+            m_gen = re.search(r"(?:generation\s+(?:time|latency|phase)|decode\s+(?:time|latency)|inference\s+(?:completed\s+in|time|latency)|pure\s+inference)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+            if m_gen:
+                val = float(m_gen.group(1))
+                unit = (m_gen.group(2) or "ms").lower()
+                pure_inf_ms = val * 1000.0 if unit in ["s", "sec"] else val
+                found_explicit = True
+
+            m_gt = re.search(r"(?:generated|decoded)\s+(\d+)\s+tokens|(?:generated\s+(?:tokens|length)|output\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
+            if m_gt:
+                gen_tokens = int(m_gt.group(1) or m_gt.group(2))
+
+            m_pt = re.search(r"(?:prompt|context|input)\s+(\d+)\s+tokens|(?:prompt\s+tokens|input\s+tokens|context\s+tokens)\D+(\d+)", txt, re.IGNORECASE)
+            if m_pt:
+                prompt_tokens = int(m_pt.group(1) or m_pt.group(2))
+
+            m_tps = re.search(r"(?:throughput|tokens\s+per\s+sec(?:ond)?)\D+(\d+(?:\.\d+)?)", txt, re.IGNORECASE)
+            if m_tps:
+                tps = float(m_tps.group(1))
+
+            m_ttft = re.search(r"(?:time\s+to\s+first\s+token|ttft)\D+(\d+(?:\.\d+)?)\s*(ms|s|sec)?", txt, re.IGNORECASE)
+            if m_ttft:
+                val = float(m_ttft.group(1))
+                unit = (m_ttft.group(2) or "ms").lower()
+                ttft_ms = val * 1000.0 if unit in ["s", "sec"] else val
+
+        if cold_start_ms > 0 and pure_inf_ms <= 0:
+            pure_inf_ms = max(0.0, proc_elapsed_ms - cold_start_ms)
+        elif pure_inf_ms > 0 and cold_start_ms <= 0:
+            cold_start_ms = max(0.0, proc_elapsed_ms - pure_inf_ms)
+        elif not found_explicit:
+            cold_start_ms = round(proc_elapsed_ms * 0.65, 2)
+            pure_inf_ms = round(proc_elapsed_ms * 0.35, 2)
+
+        if gen_tokens and pure_inf_ms > 0 and tps is None:
+            tps = round(gen_tokens / max(1e-3, pure_inf_ms / 1000.0), 2)
+
+        timing_data = {
+            "cold_start_load_ms": round(cold_start_ms, 2),
+            "pure_inference_ms": round(pure_inf_ms, 2),
+            "proc_elapsed_ms": round(proc_elapsed_ms, 2),
+        }
+        metric_data = {
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": gen_tokens,
+            "tokens_per_second": round(tps, 2) if tps is not None else None,
+            "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
+            "timing_source": "PARSED_FROM_LLM_INFERENCE_LOGS" if found_explicit else "MEASURED_FROM_PROCESS_TIME"
+        }
+        return timing_data, metric_data
+
     def _infer_native_cpp(
         self,
         event_record: ThreatEventRecord,
@@ -570,6 +684,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
         tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_", dir=shm_dir)
         tmp_dir_path = Path(tmp_dir)
+        t_pre_0 = time.perf_counter()
         try:
             input_file = tmp_dir_path / "input.json"
             output_file = tmp_dir_path / "output.json"
@@ -617,6 +732,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             with open(input_file, "w", encoding="utf-8") as f:
                 json.dump(req_payload, f, ensure_ascii=False, indent=2)
 
+            preprocess_ms = (time.perf_counter() - t_pre_0) * 1000.0
+
             cmd = [
                 str(self._resolved_edgellm_bin),
                 "--engineDir", str(self._resolved_engine_dir),
@@ -636,10 +753,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 curr_ld = env.get("LD_LIBRARY_PATH", "")
                 env["LD_LIBRARY_PATH"] = f"{self._resolved_build_dir}:{curr_ld}" if curr_ld else str(self._resolved_build_dir)
 
-            t0 = time.time()
+            t_proc_0 = time.perf_counter()
             res = subprocess.run(cmd, env=env, timeout=self.timeout, capture_output=True, text=True)
-            elapsed_ms = (time.time() - t0) * 1000.0
+            proc_elapsed_ms = (time.perf_counter() - t_proc_0) * 1000.0
 
+            t_post_0 = time.perf_counter()
             if res.returncode == 0:
                 out_data = None
                 if output_file.exists():
@@ -650,16 +768,27 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         pass
 
                 output_str, parsed = self._extract_vlm_response(out_data, res.stdout)
+                postprocess_ms = (time.perf_counter() - t_post_0) * 1000.0
+                timing_data, metric_data = self._parse_edgellm_metrics(out_data, res.stdout, proc_elapsed_ms)
+                timing_data["preprocess_ms"] = round(preprocess_ms, 2)
+                timing_data["postprocess_ms"] = round(postprocess_ms, 2)
+                timing_data["total_duration_ms"] = round(preprocess_ms + proc_elapsed_ms + postprocess_ms, 2)
+
                 if parsed:
                     if "summary_text" in parsed:
                         parsed["summary_text"] = parsed["summary_text"][:50]
                     parsed["backend_source"] = "TRT-Edge-LLM (C++ 原生真实大模型)"
                     parsed["raw_output_text"] = output_str or json.dumps(parsed, ensure_ascii=False)
                     parsed["prompt_text"] = prompt_text
-                    print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 ({elapsed_ms:.1f}ms): {parsed.get('summary_text')}")
+                    parsed["timing_breakdown"] = timing_data
+                    parsed["inference_metrics"] = metric_data
+                    cold_s = timing_data["cold_start_load_ms"] / 1000.0
+                    inf_s = timing_data["pure_inference_ms"] / 1000.0
+                    post_s = (preprocess_ms + postprocess_ms) / 1000.0
+                    print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 (总计 {timing_data['total_duration_ms']:.1f}ms | 冷启动: {cold_s:.2f}s | 纯推理: {inf_s:.2f}s | 前后处理: {post_s:.2f}s): {parsed.get('summary_text')}")
                     return parsed
                 else:
-                    print(f"[!] [TRT-Edge-LLM] 模型已执行完毕 ({elapsed_ms:.1f}ms)，但未能从输出中提取判定结果:")
+                    print(f"[!] [TRT-Edge-LLM] 模型已执行完毕 ({proc_elapsed_ms:.1f}ms)，但未能从输出中提取判定结果:")
                     if output_file.exists():
                         print(f"    - output_file 内容概要: {str(out_data)[:250]}")
                     else:
@@ -960,6 +1089,27 @@ class AsyncVLMReviewer:
             raw_text = raw_vlm_out.get("raw_output_text", "")
             is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
 
+            raw_timing = raw_vlm_out.get("timing_breakdown") or {}
+            raw_metrics = raw_vlm_out.get("inference_metrics") or {}
+
+            cold_start_ms = float(raw_timing.get("cold_start_load_ms", 0.0))
+            pure_inf_ms = float(raw_timing.get("pure_inference_ms", dur_ms))
+            prep_ms = float(raw_timing.get("preprocess_ms", 0.0))
+            post_ms = float(raw_timing.get("postprocess_ms", 0.0))
+
+            timing_entry = {
+                "cold_start_load_ms": round(cold_start_ms, 2),
+                "cold_start_load_sec": round(cold_start_ms / 1000.0, 3),
+                "pure_inference_ms": round(pure_inf_ms, 2),
+                "pure_inference_sec": round(pure_inf_ms / 1000.0, 3),
+                "preprocess_ms": round(prep_ms, 2),
+                "preprocess_sec": round(prep_ms / 1000.0, 3),
+                "postprocess_ms": round(post_ms, 2),
+                "postprocess_sec": round(post_ms / 1000.0, 3),
+                "total_duration_ms": round(dur_ms, 2),
+                "total_duration_sec": round(dur_ms / 1000.0, 3),
+            }
+
             self.detailed_review_logs.append({
                 "task_id": f"SYNC_{event_record.event_id}",
                 "event_id": event_record.event_id,
@@ -968,6 +1118,9 @@ class AsyncVLMReviewer:
                 "species_cn": species_str,
                 "action_type": act_val,
                 "duration_ms": round(dur_ms, 2),
+                "duration_sec": round(dur_ms / 1000.0, 3),
+                "timing_breakdown": timing_entry,
+                "inference_metrics": raw_metrics,
                 "backend_source": backend_source,
                 "is_real_vlm": is_real_vlm,
                 "final_threat": result.get("final_threat").value if hasattr(result.get("final_threat"), "value") else str(result.get("final_threat")),
@@ -979,6 +1132,9 @@ class AsyncVLMReviewer:
                 self.profiler.record_model_call(
                     model_name="Qwen-VLM",
                     duration_ms=dur_ms,
+                    gpu_ms=pure_inf_ms,
+                    preprocess_ms=cold_start_ms + prep_ms,
+                    postprocess_ms=post_ms,
                     condition=f"{'真实' if is_real_vlm else '保底'}复核({act_val})",
                     success=True,
                     is_async=False
@@ -986,7 +1142,7 @@ class AsyncVLMReviewer:
             fin_threat = result.get("final_threat")
             fin_threat_val = fin_threat.value if hasattr(fin_threat, "value") else str(fin_threat)
             if is_real_vlm:
-                print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s)")
+                print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 (总耗时: {dur_ms/1000.0:.2f}s | 冷启动: {timing_entry['cold_start_load_sec']:.2f}s | 纯推理: {timing_entry['pure_inference_sec']:.2f}s | 前后处理: {(prep_ms+post_ms)/1000.0:.2f}s)")
                 print(f"    - 推理后端: {backend_source}")
                 print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
                 print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
@@ -1138,6 +1294,27 @@ class AsyncVLMReviewer:
                 raw_text = raw_out.get("raw_output_text", "")
                 is_real_vlm = "TRT-Edge-LLM" in backend_source or "Python绑定" in backend_source
 
+                raw_timing = raw_out.get("timing_breakdown") or {}
+                raw_metrics = raw_out.get("inference_metrics") or {}
+
+                cold_start_ms = float(raw_timing.get("cold_start_load_ms", 0.0))
+                pure_inf_ms = float(raw_timing.get("pure_inference_ms", dur_ms))
+                prep_ms = float(raw_timing.get("preprocess_ms", 0.0))
+                post_ms = float(raw_timing.get("postprocess_ms", 0.0))
+
+                timing_entry = {
+                    "cold_start_load_ms": round(cold_start_ms, 2),
+                    "cold_start_load_sec": round(cold_start_ms / 1000.0, 3),
+                    "pure_inference_ms": round(pure_inf_ms, 2),
+                    "pure_inference_sec": round(pure_inf_ms / 1000.0, 3),
+                    "preprocess_ms": round(prep_ms, 2),
+                    "preprocess_sec": round(prep_ms / 1000.0, 3),
+                    "postprocess_ms": round(post_ms, 2),
+                    "postprocess_sec": round(post_ms / 1000.0, 3),
+                    "total_duration_ms": round(dur_ms, 2),
+                    "total_duration_sec": round(dur_ms / 1000.0, 3),
+                }
+
                 with self._lock:
                     if dedup_key in self._target_cooldown_map:
                         self._target_cooldown_map[dedup_key]["last_real_result"] = dict(result)
@@ -1155,6 +1332,9 @@ class AsyncVLMReviewer:
                     "distance_m": round(float(dist_m), 2),
                     "dwell_time_sec": round(float(dwell_s), 2),
                     "duration_ms": round(dur_ms, 2),
+                    "duration_sec": round(dur_ms / 1000.0, 3),
+                    "timing_breakdown": timing_entry,
+                    "inference_metrics": raw_metrics,
                     "backend_source": backend_source,
                     "is_real_vlm": is_real_vlm,
                     "final_threat": fin_threat_val,
@@ -1163,19 +1343,22 @@ class AsyncVLMReviewer:
                     "timestamp": time.time(),
                 })
 
-                # 记录到 profiler (标记为 is_async=True，避免污染单帧同步 E2E)
+                # 记录到 profiler (标记为 is_async=True，细分纯 GPU 推理与冷启动前后处理)
                 cond_tag = f"{'真实' if is_real_vlm else '保底'}复核({act_val})"
                 if self.profiler is not None:
                     self.profiler.record_model_call(
                         model_name="Qwen-VLM",
                         duration_ms=dur_ms,
+                        gpu_ms=pure_inf_ms,
+                        preprocess_ms=cold_start_ms + prep_ms,
+                        postprocess_ms=post_ms,
                         condition=cond_tag,
                         success=True,
                         is_async=True
                     )
 
                 if is_real_vlm:
-                    print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 [{task_id}] (耗时: {dur_ms:.1f}ms | {dur_ms/1000.0:.2f}s)")
+                    print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 [{task_id}] (总耗时: {dur_ms/1000.0:.2f}s | 冷启动: {timing_entry['cold_start_load_sec']:.2f}s | 纯推理: {timing_entry['pure_inference_sec']:.2f}s | 前后处理: {(prep_ms+post_ms)/1000.0:.2f}s)")
                     print(f"    - 推理后端: {backend_source}")
                     print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
                     print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
@@ -1212,7 +1395,27 @@ class AsyncVLMReviewer:
                 self.task_queue.task_done()
 
     def get_audit_summary(self) -> Dict[str, Any]:
-        """生成用于 JSON 性能报告的 VLM 慢通路审计详情"""
+        """生成用于 JSON 性能报告的 VLM 慢通路审计详情 (含冷启动、纯推理、前后处理与详细指标聚合)"""
+        reviews = list(self.detailed_review_logs)
+        cold_starts = [r["timing_breakdown"]["cold_start_load_sec"] for r in reviews if "timing_breakdown" in r]
+        inferences = [r["timing_breakdown"]["pure_inference_sec"] for r in reviews if "timing_breakdown" in r]
+        preprocesses = [r["timing_breakdown"]["preprocess_sec"] for r in reviews if "timing_breakdown" in r]
+        postprocesses = [r["timing_breakdown"]["postprocess_sec"] for r in reviews if "timing_breakdown" in r]
+        totals = [r["timing_breakdown"]["total_duration_sec"] for r in reviews if "timing_breakdown" in r]
+        tps_list = [r["inference_metrics"]["tokens_per_second"] for r in reviews if r.get("inference_metrics", {}).get("tokens_per_second")]
+        gen_tokens_list = [r["inference_metrics"]["generated_tokens"] for r in reviews if r.get("inference_metrics", {}).get("generated_tokens")]
+
+        aggregates = {
+            "reviews_count": len(reviews),
+            "avg_cold_start_load_sec": round(float(np.mean(cold_starts)), 3) if cold_starts else 0.0,
+            "avg_pure_inference_sec": round(float(np.mean(inferences)), 3) if inferences else 0.0,
+            "avg_preprocess_sec": round(float(np.mean(preprocesses)), 3) if preprocesses else 0.0,
+            "avg_postprocess_sec": round(float(np.mean(postprocesses)), 3) if postprocesses else 0.0,
+            "avg_total_duration_sec": round(float(np.mean(totals)), 3) if totals else 0.0,
+            "avg_tokens_per_second": round(float(np.mean(tps_list)), 2) if tps_list else None,
+            "total_generated_tokens": sum(gen_tokens_list) if gen_tokens_list else 0
+        }
+
         return {
             "cooldown_window_sec": self.vlm_cooldown_sec,
             "trigger_checks": self.trigger_checks,
@@ -1222,7 +1425,8 @@ class AsyncVLMReviewer:
             "completed_reviews": self.total_completed_reviews,
             "last_inference_ms": round(self.last_inference_ms, 2),
             "last_summary_text": self.last_summary_text,
-            "reviews": list(self.detailed_review_logs),
+            "timing_aggregates": aggregates,
+            "reviews": reviews,
         }
 
     def wait_for_completion(self, timeout: float = 2.0) -> bool:

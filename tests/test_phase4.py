@@ -724,5 +724,83 @@ def test_vlm_profiler_and_timing_integration():
     assert "异步并发" in summary_table
 
 
+def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
+    """验证 VLM 性能指标细分剥离 (冷启动/纯推理/前后处理/Token指标) 与 JSON 报表完整导出"""
+    from camping_guard.profiler import PipelineProfiler
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    # 1. 验证 _parse_edgellm_metrics 从 C++ 日志解析
+    sample_stdout = (
+        "[INFO] Loaded engine in 4520.5 ms\n"
+        "[INFO] Context phase latency: 240.0 ms\n"
+        "[INFO] Generation phase latency: 2150.2 ms\n"
+        "[INFO] Generated 80 tokens\n"
+        "[INFO] Tokens per second: 37.2\n"
+        "[INFO] Time to first token: 260 ms\n"
+    )
+    timing_data, metric_data = TRTEdgeLLMOnDemandBackend._parse_edgellm_metrics(
+        out_data={},
+        stdout_str=sample_stdout,
+        proc_elapsed_ms=7100.0
+    )
+    assert timing_data["cold_start_load_ms"] == 4520.5
+    assert timing_data["pure_inference_ms"] == 2150.2
+    assert metric_data["generated_tokens"] == 80
+    assert metric_data["tokens_per_second"] == 37.2
+    assert metric_data["ttft_ms"] == 260.0
+    assert metric_data["timing_source"] == "PARSED_FROM_LLM_INFERENCE_LOGS"
+
+    # 2. 验证端到端 Reviewer 审计记录与 JSON 报告聚合
+    profiler = PipelineProfiler()
+    mock_backend = MockVLMBackend(simulated_delay_sec=0.05)
+    reviewer = AsyncVLMReviewer(backend=mock_backend, enable_worker_thread=False, profiler=profiler)
+
+    record = ThreatEventRecord(
+        event_id="EVT_METRIC_001",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.DOOR_HANDLE_PULL,
+        description="门把手微动测试",
+        has_contact_signal=True
+    )
+    res = reviewer.review_event_sync(record)
+    assert "timing_breakdown" in res or len(reviewer.detailed_review_logs) > 0
+
+    audit = reviewer.get_audit_summary()
+    assert "timing_aggregates" in audit
+    aggr = audit["timing_aggregates"]
+    assert aggr["reviews_count"] == 1
+    assert "avg_pure_inference_sec" in aggr
+    assert "avg_cold_start_load_sec" in aggr
+    assert "avg_total_duration_sec" in aggr
+    assert aggr["avg_pure_inference_sec"] >= 0.04
+
+    # 3. 验证 JSON 报告导出
+    temp_dir = tempfile.mkdtemp()
+    try:
+        json_file = Path(temp_dir) / "test_perf_report.json"
+        profiler.set_runtime_context(vlm_audit=audit)
+        saved_path = profiler.export_json_report(json_file)
+        assert Path(saved_path).is_file()
+
+        with open(saved_path, "r", encoding="utf-8") as f:
+            report_json = json.load(f)
+
+        assert "vlm_audit_summary" in report_json
+        assert "vlm_detailed_timing_breakdown" in report_json
+        assert report_json["vlm_detailed_timing_breakdown"]["reviews_count"] == 1
+        reviews = report_json["vlm_audit_summary"]["reviews"]
+        assert len(reviews) == 1
+        assert "timing_breakdown" in reviews[0]
+        assert "cold_start_load_sec" in reviews[0]["timing_breakdown"]
+        assert "pure_inference_sec" in reviews[0]["timing_breakdown"]
+        assert "preprocess_sec" in reviews[0]["timing_breakdown"]
+        assert "postprocess_sec" in reviews[0]["timing_breakdown"]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
 
 
