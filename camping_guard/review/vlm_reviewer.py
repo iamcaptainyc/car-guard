@@ -997,7 +997,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             pass
         return None
 
-    def _is_server_alive(self) -> bool:
+    def _is_server_alive(self, log_reason: bool = False) -> bool:
         """探测 vlm_server 常驻服务是否就绪 (/health)"""
         url = f"http://{self.server_host}:{self.server_port}/health"
         try:
@@ -1006,8 +1006,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
                     return bool(data.get("status") == "ready" or data.get("model_ready", False))
-        except Exception:
-            pass
+        except Exception as e:
+            if log_reason:
+                print(f"[*] [TRT-Edge-LLM] [就绪探测] {url} 暂未连通: {e}")
         return False
 
     def _ensure_server_running(self) -> Tuple[bool, float]:
@@ -1095,7 +1096,21 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             now_t = time.perf_counter()
             if now_t - last_heartbeat >= 5.0:
                 elapsed_s = now_t - t_spawn_0
-                print(f"[*] [TRT-Edge-LLM] 等待 vlm_server 模型反序列化与就绪 (已耗时 {elapsed_s:.1f}s / 门限 {max_wait:.1f}s)...")
+                # 抓取一条最新的服务端日志行
+                curr_srv_log = ""
+                try:
+                    if hasattr(self, "_server_log_fp") and self._server_log_fp:
+                        self._server_log_fp.flush()
+                    if self._server_log_path.is_file():
+                        with open(self._server_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                            if lines:
+                                curr_srv_log = lines[-1]
+                except Exception:
+                    pass
+                log_hint = f" | 服务最新日志: \"{curr_srv_log[:80]}\"" if curr_srv_log else ""
+                print(f"[*] [TRT-Edge-LLM] 等待 vlm_server 就绪 (已耗时 {elapsed_s:.1f}s / 门限 {max_wait:.1f}s){log_hint}")
+                self._is_server_alive(log_reason=True)
                 last_heartbeat = now_t
 
             time.sleep(poll_interval)
