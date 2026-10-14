@@ -998,7 +998,16 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         return None
 
     def _is_server_alive(self, log_reason: bool = False) -> bool:
-        """探测 vlm_server 常驻服务是否就绪 (/health)"""
+        """探测 vlm_server 常驻服务是否就绪 (/health)，使用极速 TCP 预检避免 urllib 阻塞挂起"""
+        import socket
+        try:
+            with socket.create_connection((self.server_host, self.server_port), timeout=0.05):
+                pass
+        except Exception as e:
+            if log_reason:
+                print(f"[*] [TRT-Edge-LLM] [就绪探测] 端口 {self.server_port} 暂未开启: {e}")
+            return False
+
         url = f"http://{self.server_host}:{self.server_port}/health"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "CampingGuard-VLMClient/1.0"})
@@ -1073,7 +1082,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             return False, 0.0
 
         max_wait = max(self.timeout * 2.5, 90.0)
-        poll_interval = 0.3
+        poll_interval = 0.1
         last_heartbeat = t_spawn_0
         while time.perf_counter() - t_spawn_0 < max_wait:
             if self._server_proc.poll() is not None:
