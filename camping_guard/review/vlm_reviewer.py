@@ -1218,6 +1218,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             gen_ms = float(srv_timing.get("llm_generation_gpu_ms", 0.0))
             tps = srv_metrics.get("tokens_per_second") or srv_timing.get("tokens_per_second")
             gen_tokens = srv_metrics.get("generated_tokens") or srv_timing.get("generated_tokens")
+            if (gen_tokens is None or gen_tokens == 0) and out_text:
+                # 兜底：若服务端指标未上报，使用中英混合字词粗估生成的 Token 数
+                gen_tokens = max(1, len([c for c in out_text if ord(c) > 127]) + len([w for w in out_text.split() if any(ord(c) <= 127 for c in w)]))
+            if (tps is None or tps == 0.0) and gen_tokens and pure_inf_ms > 0:
+                tps = round(float(gen_tokens) / (pure_inf_ms / 1000.0), 2)
             prompt_tokens = srv_metrics.get("prompt_tokens") or srv_timing.get("prompt_tokens")
             finish_reason = srv_metrics.get("finish_reason") or resp_json.get("finish_reason")
 
