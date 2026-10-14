@@ -418,6 +418,10 @@ def run_video_pipeline(
     build_dir: Optional[str] = None,
     vlm_timeout: float = 35.0,
     vlm_max_tokens: int = 128,
+    vlm_mode: str = "auto",
+    vlm_server_port: int = 8090,
+    vlm_idle_timeout: int = 60,
+    vlm_server_bin: Optional[str] = None,
     cls_onnx_path: Optional[str] = None,
     fire_detector_path: Optional[str] = None,
     enable_fire: bool = True,
@@ -732,7 +736,7 @@ def run_video_pipeline(
     print(f"[*] 系统激活状态: {msg}")
     engine.vehicle_bus.uwb_key_pos = None # 默认钥匙不在现场
 
-    # 挂载端侧按需低功耗 Qwen-VLM 后端 (严格显式配置，无常驻后台服务)
+    # 挂载端侧按需低功耗 Qwen-VLM 后端 (支持 vlm_server 持久化服务与 llm_inference 自动降级)
     from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
     vlm_backend = TRTEdgeLLMOnDemandBackend(
         model_dir=vlm_model_dir,
@@ -740,7 +744,11 @@ def run_video_pipeline(
         visual_engine_path=vlm_visual_engine_path,
         build_dir=build_dir or edgellm_dir,
         timeout=vlm_timeout,
-        max_tokens=vlm_max_tokens
+        max_tokens=vlm_max_tokens,
+        mode=vlm_mode,
+        server_bin=vlm_server_bin,
+        server_port=vlm_server_port,
+        server_idle_timeout=vlm_idle_timeout
     )
     engine.vlm_reviewer.backend = vlm_backend
     engine.vlm_reviewer.profiler = profiler
@@ -1461,6 +1469,14 @@ def main():
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
     parser.add_argument("--vlm-max-tokens", type=int, default=128,
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
+    parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "server", "subprocess"],
+                        help="端侧 VLM 推理模式: auto (优先常驻持久化服务 vlm_server 零冷启动，自动降级 llm_inference), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
+    parser.add_argument("--vlm-server-port", type=int, default=8090,
+                        help="vlm_server 监听的 HTTP 端口 (默认 8090)")
+    parser.add_argument("--vlm-idle-timeout", type=int, default=60,
+                        help="vlm_server 空闲自动退出卸载显存超时 (秒，默认 60)")
+    parser.add_argument("--vlm-server-bin", type=str, default=None,
+                        help="显式指定 vlm_server 可执行程序路径 (默认自动在 build 目录检索)")
     parser.add_argument("--cls", "--animal-cls", dest="cls_model", type=str, default=None,
                         help="二级动物细分类模型文件或路径 (支持自动在 models/cls/ 查找，如 mobilenetv3-large.onnx / mobilenetv3-large.engine)")
     parser.add_argument("--fire-detector", "--fire", dest="fire_detector", type=str, default=None,
@@ -1508,6 +1524,10 @@ def main():
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
+        vlm_mode=args.vlm_mode,
+        vlm_server_port=args.vlm_server_port,
+        vlm_idle_timeout=args.vlm_idle_timeout,
+        vlm_server_bin=args.vlm_server_bin,
         cls_onnx_path=args.cls_model,
         fire_detector_path=args.fire_detector,
         enable_fire=not args.no_fire,

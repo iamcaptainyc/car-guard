@@ -878,6 +878,189 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_vlm_server_client_inference_and_metrics():
+    """验证 TRTEdgeLLMOnDemandBackend 连接常驻守护服务 (vlm_server) 零冷启动推理与指标解析"""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    received_requests = []
+    shutdown_received = []
+
+    class MockVLMServerHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                resp = json.dumps({"status": "ready", "model_ready": True, "idle_remaining_sec": 59.5})
+                self.wfile.write(resp.encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_len) if content_len > 0 else b""
+            body_str = body_bytes.decode('utf-8', errors='ignore')
+
+            if self.path == "/generate":
+                received_requests.append(body_str)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+
+                out_payload = {
+                    "action_category": "DOOR_HANDLE_TAMPERING",
+                    "confidence": 0.94,
+                    "is_human_contact": True,
+                    "is_false_alarm": False,
+                    "threat_escalation": "CONFIRM_OR_UPGRADE",
+                    "summary_text": "复核确认有人在拉扯左前门把手，已锁定存证。"
+                }
+                resp_json = {
+                    "status": "success",
+                    "output_text": json.dumps(out_payload, ensure_ascii=False),
+                    "finish_reason": "stop",
+                    "timing": {
+                        "pure_inference_ms": 1150.2,
+                        "cold_start_load_ms": 0.0,
+                        "vision_encoder_gpu_ms": 112.5,
+                        "llm_prefill_gpu_ms": 280.4,
+                        "llm_generation_gpu_ms": 757.3,
+                        "tokens_per_second": 48.5,
+                        "generated_tokens": 42,
+                        "prompt_tokens": 850
+                    },
+                    "inference_metrics": {
+                        "prompt_tokens": 850,
+                        "generated_tokens": 42,
+                        "tokens_per_second": 48.5,
+                        "finish_reason": "stop",
+                        "timing_source": "PERSISTENT_DAEMON_RUNTIME"
+                    }
+                }
+                self.wfile.write(json.dumps(resp_json, ensure_ascii=False).encode('utf-8'))
+            elif self.path == "/shutdown":
+                shutdown_received.append(True)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"shutting down"}')
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), MockVLMServerHandler)
+    server_port = server.server_port
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        backend = TRTEdgeLLMOnDemandBackend(
+            mode="server",
+            server_host="127.0.0.1",
+            server_port=server_port,
+            timeout=5.0
+        )
+
+        record = ThreatEventRecord(
+            event_id="EVT_SRV_001",
+            timestamp=time.time(),
+            threat_level=ThreatLevel.L2_WARNING,
+            operating_mode=OperatingMode.IN_CAR,
+            action_type=ActionType.DOOR_HANDLE_PULL,
+            description="门把手微动测试",
+            has_contact_signal=True
+        )
+
+        # 模拟 100x100 关键帧
+        dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        # 1. 验证通过常驻服务获得推理结果
+        result = backend.infer(record, keyframes=[dummy_frame])
+        assert result is not None
+        assert result["action_category"] == "DOOR_HANDLE_TAMPERING"
+        assert result["backend_source"] == "TRT-Edge-LLM (vlm_server 常驻持久化服务)"
+        assert len(received_requests) == 1
+        assert "拉门撬锁" in received_requests[0]
+
+        # 2. 验证硬件细分指标与零冷启动
+        tb = result["timing_breakdown"]
+        assert tb["pure_inference_ms"] == 1150.2
+        assert tb["cold_start_load_ms"] == 0.0 # 常驻状态 0 冷启动！
+        assert tb["vision_encoder_gpu_ms"] == 112.5
+        assert tb["llm_prefill_gpu_ms"] == 280.4
+        assert tb["llm_generation_gpu_ms"] == 757.3
+
+        metrics = result["inference_metrics"]
+        assert metrics["tokens_per_second"] == 48.5
+        assert metrics["prompt_tokens"] == 850
+        assert metrics["generated_tokens"] == 42
+        assert metrics["finish_reason"] == "stop"
+
+        # 3. 验证优雅退出指令发送
+        backend.shutdown()
+        assert len(shutdown_received) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_vlm_mode_fallback_and_selection():
+    """验证 --vlm-mode (auto / server / subprocess) 分流与平滑自动降级策略"""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    # 1. auto 模式在无 server 环境自动平滑降级至规则保底 (且保留完整战报生成)
+    backend_auto = TRTEdgeLLMOnDemandBackend(
+        mode="auto",
+        server_host="127.0.0.1",
+        server_port=65432, # 未监听的无效端口
+        timeout=1.0
+    )
+    record = ThreatEventRecord(
+        event_id="EVT_AUTO_FALLBACK",
+        timestamp=time.time(),
+        threat_level=ThreatLevel.L2_WARNING,
+        operating_mode=OperatingMode.IN_CAR,
+        action_type=ActionType.WINDOW_PEEKING,
+        description="窥探测试",
+        has_contact_signal=False
+    )
+    res_auto = backend_auto.infer(record)
+    assert res_auto is not None
+    assert "车窗" in res_auto["summary_text"]
+    assert "FALLBACK_RULE_MOCK" in res_auto["backend_source"]
+
+    # 2. subprocess 模式：即使指定了 server 端口也不连接 server，直接走一次性子进程/离线降级
+    backend_sub = TRTEdgeLLMOnDemandBackend(
+        mode="subprocess",
+        server_host="127.0.0.1",
+        server_port=65432,
+        timeout=1.0
+    )
+    res_sub = backend_sub.infer(record)
+    assert res_sub is not None
+    assert "车窗" in res_sub["summary_text"]
+
+    # 3. server 模式：服务不可用时显式标记强制 server 失败回退
+    backend_srv = TRTEdgeLLMOnDemandBackend(
+        mode="server",
+        server_host="127.0.0.1",
+        server_port=65432,
+        timeout=1.0
+    )
+    res_srv = backend_srv.infer(record)
+    assert res_srv is not None
+    assert "FALLBACK_RULE_MOCK (强制server模式不可用回退)" in res_srv["backend_source"]
+
+
+
 
 
 

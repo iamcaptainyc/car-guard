@@ -281,8 +281,14 @@ def main():
                         help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
     parser.add_argument("--vlm-timeout", type=float, default=35.0,
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
-    parser.add_argument("--vlm-max-tokens", type=int, default=128,
-                        help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
+    parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "server", "subprocess"],
+                        help="端侧 VLM 推理模式: auto (优先使用常驻持久化服务 vlm_server 零冷启动，自动降级 llm_inference), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
+    parser.add_argument("--vlm-server-port", type=int, default=8090,
+                        help="vlm_server 监听的 HTTP 端口 (默认 8090)")
+    parser.add_argument("--vlm-idle-timeout", type=int, default=60,
+                        help="vlm_server 空闲自动退出卸载显存超时 (秒，默认 60)")
+    parser.add_argument("--vlm-server-bin", type=str, default=None,
+                        help="显式指定 vlm_server 可执行程序路径 (默认自动在 build 目录检索)")
     parser.add_argument("--realtime", action="store_true", default=True, help="启用真实时间 30 FPS 物理流速控制 (默认开启)")
     parser.add_argument("--fire-detector", "--fire", dest="fire_detector", type=str, default=None,
                         help="显式指定火灾/浓烟目标检测 .engine 模型路径 (默认已启用火焰检测并发)")
@@ -338,7 +344,8 @@ def main():
             else:
                 status = "⏸️ 已禁用 (--no-fire 显式关闭)"
         elif k == "vlm":
-            status = f"✅ 已就绪: {p}" if p else "⚠️ 未指定/未挂载 (可传入 --model-dir 指定，当前使用端侧离线保底)"
+            mode_desc = f"模式: {args.vlm_mode}"
+            status = f"✅ 已就绪 ({mode_desc}): {p}" if p else f"⚠️ 未指定/未挂载 ({mode_desc}，可传入 --model-dir 指定，当前使用端侧离线保底)"
         else:
             status = f"✅ 已就绪: {p}" if p else "⚠️ 未找到对应 .engine 文件 (将降级使用 ONNXRuntime 或跳过)"
         print(f"    - {k:<12}: {status}")
@@ -405,6 +412,10 @@ def main():
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
+        vlm_mode=args.vlm_mode,
+        vlm_server_port=args.vlm_server_port,
+        vlm_idle_timeout=args.vlm_idle_timeout,
+        vlm_server_bin=args.vlm_server_bin,
         cls_onnx_path=chosen_cls,
         fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] and str(engines["fire_det"]) != "builtin:VisualFlameDetector" else None),
         enable_fire=not args.no_fire,
