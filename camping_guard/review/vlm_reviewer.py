@@ -1055,28 +1055,35 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
         t_spawn_0 = time.perf_counter()
         try:
+            log_dir = Path("logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._server_log_path = log_dir / "vlm_server.log"
+            self._server_log_fp = open(self._server_log_path, "w", encoding="utf-8", buffering=1)
             self._server_proc = subprocess.Popen(
                 cmd,
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
+                stdout=self._server_log_fp,
+                stderr=subprocess.STDOUT
             )
         except Exception as e:
             print(f"[!] [TRT-Edge-LLM] 启动 vlm_server 守护进程失败: {e}")
             return False, 0.0
 
-        max_wait = max(self.timeout, 25.0)
-        poll_interval = 0.2
+        max_wait = max(self.timeout * 2.5, 90.0)
+        poll_interval = 0.5
+        last_heartbeat = t_spawn_0
         while time.perf_counter() - t_spawn_0 < max_wait:
             if self._server_proc.poll() is not None:
-                err_out = ""
+                err_tail = ""
                 try:
-                    _, err_bytes = self._server_proc.communicate(timeout=1.0)
-                    if err_bytes:
-                        err_out = err_bytes.decode('utf-8', errors='ignore')
+                    if hasattr(self, "_server_log_fp") and self._server_log_fp:
+                        self._server_log_fp.flush()
+                    if self._server_log_path.is_file():
+                        with open(self._server_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                            err_tail = "".join(f.readlines()[-15:])
                 except Exception:
                     pass
-                print(f"[!] [TRT-Edge-LLM] vlm_server 异常退出 (exit code {self._server_proc.returncode}): {err_out.strip()[-300:]}")
+                print(f"[!] [TRT-Edge-LLM] vlm_server 异常退出 (exit code {self._server_proc.returncode}):\n{err_tail.strip()[-500:]}")
                 self._server_proc = None
                 return False, 0.0
 
@@ -1085,9 +1092,32 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 print(f"[+] [TRT-Edge-LLM] vlm_server 守护服务就绪 (首帧冷启动耗时: {cold_ms/1000.0:.2f}s, 进入 0 冷启动保活状态)")
                 return True, cold_ms
 
+            now_t = time.perf_counter()
+            if now_t - last_heartbeat >= 5.0:
+                elapsed_s = now_t - t_spawn_0
+                print(f"[*] [TRT-Edge-LLM] 等待 vlm_server 模型反序列化与就绪 (已耗时 {elapsed_s:.1f}s / 门限 {max_wait:.1f}s)...")
+                last_heartbeat = now_t
+
             time.sleep(poll_interval)
 
-        print(f"[!] [TRT-Edge-LLM] 等待 vlm_server 服务就绪超时 ({max_wait:.1f}s)")
+        # 超时处理：终止未就绪进程并输出日志尾部
+        tail_lines = ""
+        try:
+            if hasattr(self, "_server_log_fp") and self._server_log_fp:
+                self._server_log_fp.flush()
+            if self._server_log_path.is_file():
+                with open(self._server_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    tail_lines = "".join(f.readlines()[-15:])
+        except Exception:
+            pass
+        print(f"[!] [TRT-Edge-LLM] 等待 vlm_server 服务就绪超时 ({max_wait:.1f}s)，日志尾部:\n{tail_lines.strip()}")
+        if self._server_proc is not None:
+            try:
+                self._server_proc.terminate()
+                self._server_proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            self._server_proc = None
         return False, 0.0
 
     def _infer_server(
