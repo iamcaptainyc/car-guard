@@ -1060,6 +1060,120 @@ def test_vlm_mode_fallback_and_selection():
     assert "FALLBACK_RULE_MOCK (强制server模式不可用回退)" in res_srv["backend_source"]
 
 
+def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
+    """测试 TensorRT-Edge-LLM 原生 libvlm_engine.so C-API 进程内直调流程 (首帧 5s 加载，后续 0 冷启动 3.5s 推理)"""
+    import ctypes
+    from camping_guard.review.vlm_reviewer import TRTEdgeLLMOnDemandBackend
+
+    temp_dir = tempfile.mkdtemp(prefix="test_vlm_so_")
+    try:
+        mock_so = Path(temp_dir) / "libvlm_engine.so"
+        mock_so.touch()
+
+        mock_engine = Path(temp_dir) / "qwen3.5-2b"
+        mock_engine.mkdir()
+        (mock_engine / "config.json").touch()
+        (mock_engine / "llm.engine").touch()
+
+        simulated_response = json.dumps({
+            "action_category": "CABIN_PEEKING",
+            "confidence": 0.98,
+            "is_human_contact": False,
+            "is_false_alarm": False,
+            "threat_escalation": "MAINTAIN",
+            "summary_text": "在主驾驶车窗处发现人员近距离窥探，已自动提高警戒级别。"
+        }, ensure_ascii=False).encode('utf-8')
+
+        created_handles = []
+        destroyed_handles = []
+        generated_calls = []
+
+        class DummyCtypesFunc:
+            def __init__(self, name):
+                self.name = name
+                self.argtypes = []
+                self.restype = None
+
+            def __call__(self, *args):
+                if self.name == "vlm_create":
+                    handle = 0x12345678
+                    created_handles.append(handle)
+                    return handle
+                elif self.name == "vlm_generate":
+                    generated_calls.append(args)
+                    return simulated_response
+                elif self.name == "vlm_get_cold_start_ms":
+                    return 5120.0
+                elif self.name == "vlm_get_last_inference_ms":
+                    return 3450.0
+                elif self.name == "vlm_get_last_generated_tokens":
+                    return 38
+                elif self.name == "vlm_destroy":
+                    destroyed_handles.append(args[0])
+                    return None
+                return None
+
+        class DummyCDLL:
+            def __init__(self, path):
+                self.path = path
+                self.vlm_create = DummyCtypesFunc("vlm_create")
+                self.vlm_generate = DummyCtypesFunc("vlm_generate")
+                self.vlm_get_cold_start_ms = DummyCtypesFunc("vlm_get_cold_start_ms")
+                self.vlm_get_last_inference_ms = DummyCtypesFunc("vlm_get_last_inference_ms")
+                self.vlm_get_last_generated_tokens = DummyCtypesFunc("vlm_get_last_generated_tokens")
+                self.vlm_destroy = DummyCtypesFunc("vlm_destroy")
+
+        monkeypatch.setattr(ctypes, "CDLL", lambda p: DummyCDLL(p))
+
+        backend = TRTEdgeLLMOnDemandBackend(
+            engine_path=str(mock_engine),
+            engine_so_path=str(mock_so),
+            mode="auto"
+        )
+
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        event = ThreatEventRecord(
+            event_id="EVT_SO_001",
+            timestamp=time.time(),
+            threat_level=ThreatLevel.L2_WARNING,
+            operating_mode=OperatingMode.IN_CAR,
+            action_type=ActionType.WINDOW_PEEKING,
+            description="车窗窥视测试",
+            target_dwell_time=8.0,
+            target_distance=0.9
+        )
+
+        # 1. 首次推理：触发冷启动加载 (5.12s)
+        res1 = backend.infer(event, keyframes=[dummy_frame])
+        assert res1 is not None
+        assert res1["action_category"] == "CABIN_PEEKING"
+        assert "窥探" in res1["summary_text"]
+        assert "libvlm_engine.so" in res1["backend_source"]
+        assert len(created_handles) == 1
+        assert len(generated_calls) == 1
+        t1 = res1["timing_breakdown"]
+        assert t1["cold_start_load_ms"] == 5120.0
+        assert t1["pure_inference_ms"] == 3450.0
+
+        # 2. 第二次推理：0 冷启动常驻直调 (cold_start_load_ms == 0.0)
+        res2 = backend.infer(event, keyframes=[dummy_frame])
+        assert res2 is not None
+        assert len(created_handles) == 1
+        assert len(generated_calls) == 2
+        t2 = res2["timing_breakdown"]
+        assert t2["cold_start_load_ms"] == 0.0
+        assert t2["pure_inference_ms"] == 3450.0
+
+        # 3. 验证显存释放与优雅析构
+        backend.shutdown()
+        assert len(destroyed_handles) == 1
+        assert destroyed_handles[0] == 0x12345678
+        assert backend._inprocess_handle is None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
 
 
 

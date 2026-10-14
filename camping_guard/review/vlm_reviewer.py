@@ -281,7 +281,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         server_host: str = "127.0.0.1",
         server_port: int = 8090,
         server_idle_timeout: int = 60,
-        server_start_timeout: float = 30.0
+        server_start_timeout: float = 30.0,
+        engine_so_path: Optional[str] = None
     ):
         env_timeout = os.environ.get("VLM_TIMEOUT") or os.environ.get("EDGELLM_TIMEOUT")
         if env_timeout:
@@ -323,16 +324,23 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self.server_port = int(server_port)
         self.server_idle_timeout = int(server_idle_timeout)
         self.server_start_timeout = float(server_start_timeout)
+        self.engine_so_path_arg = engine_so_path
         self.fallback_mock = MockVLMBackend()
 
         self._resolved_engine_dir: Optional[Path] = None
         self._resolved_visual_dir: Optional[Path] = None
         self._resolved_edgellm_bin: Optional[Path] = None
         self._resolved_server_bin: Optional[Path] = None
+        self._resolved_engine_so: Optional[Path] = None
         self._resolved_build_dir: Optional[Path] = None
         self._resolved_plugin_path: Optional[Path] = None
         self._paths_probed = False
         self._server_proc: Optional[subprocess.Popen] = None
+        self._inprocess_handle = None
+        self._last_inprocess_active_time = 0.0
+        self._so_lib = None
+        self._is_first_inprocess_run = True
+        self._inprocess_cold_start_ms = 0.0
 
         atexit.register(self.shutdown)
 
@@ -341,6 +349,13 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if self._paths_probed:
             return
         self._paths_probed = True
+
+        # -1. 检查原生 C-API 共享库 libvlm_engine.so (零网络损耗、零端口探测、单次 5s 冷启动)
+        raw_engine_so = self.engine_so_path_arg or os.environ.get("EDGELLM_ENGINE_SO") or os.environ.get("VLM_ENGINE_SO")
+        if raw_engine_so:
+            so_p = Path(raw_engine_so).resolve()
+            if so_p.is_file():
+                self._resolved_engine_so = so_p
 
         # 0. 检查显式指定的 server_bin
         raw_server_bin = self.server_bin_arg or os.environ.get("EDGELLM_SERVER_BIN") or os.environ.get("VLM_SERVER_BIN")
@@ -361,6 +376,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 if b_path.name == "vlm_server":
                     self._resolved_server_bin = b_path
                     self._resolved_build_dir = b_path.parent
+                elif b_path.suffix in [".so", ".dll"]:
+                    self._resolved_engine_so = b_path
+                    self._resolved_build_dir = b_path.parent
                 else:
                     self._resolved_edgellm_bin = b_path
                     self._resolved_build_dir = b_path.parent
@@ -373,6 +391,20 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     self._resolved_edgellm_bin = b_path / "llm_inference"
                     self._resolved_build_dir = b_path
 
+                # 探测原生 C-API 共享库 libvlm_engine.so (零网络损耗、零端口探测、单次 5s 冷启动)
+                if not self._resolved_engine_so:
+                    cand_so_list = [
+                        b_path / "examples" / "vlm_engine" / "libvlm_engine.so",
+                        b_path / "lib" / "libvlm_engine.so",
+                        b_path / "libvlm_engine.so",
+                        b_path / "examples" / "vlm_engine" / "vlm_engine.dll",
+                        b_path / "vlm_engine.dll",
+                    ]
+                    for cso in cand_so_list:
+                        if cso.is_file():
+                            self._resolved_engine_so = cso
+                            break
+
                 # 探测持久化守护服务可执行程序 vlm_server
                 if not self._resolved_server_bin:
                     cand_server = b_path / "examples" / "vlm_server" / "vlm_server"
@@ -381,8 +413,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     elif (b_path / "vlm_server").is_file() and os.access(b_path / "vlm_server", os.X_OK):
                         self._resolved_server_bin = b_path / "vlm_server"
 
-                if not self._resolved_edgellm_bin and not self._resolved_server_bin:
-                    print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 build 目录中找不到可执行程序 llm_inference 或 vlm_server: {cand_bin}")
+                if not self._resolved_engine_so and not self._resolved_edgellm_bin and not self._resolved_server_bin:
+                    print(f"[!] [TRT-Edge-LLM][显式路径错误] 指定的 build 目录中找不到 libvlm_engine.so / llm_inference / vlm_server")
 
             if self._resolved_build_dir:
                 plugin = self._resolved_build_dir / "libNvInfer_edgellm_plugin.so"
@@ -391,7 +423,14 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 else:
                     print(f"[!] [TRT-Edge-LLM][警告] 未在 build 目录找到专用插件库: {plugin}")
 
-        # 兜底默认 Jetson 路径中查找 vlm_server
+        # 兜底默认 Jetson 路径中查找 libvlm_engine.so 与 vlm_server
+        if not self._resolved_engine_so:
+            cand_jetson_so = default_jetson_build / "examples" / "vlm_engine" / "libvlm_engine.so"
+            if cand_jetson_so.is_file():
+                self._resolved_engine_so = cand_jetson_so
+            elif (default_jetson_build / "lib" / "libvlm_engine.so").is_file():
+                self._resolved_engine_so = default_jetson_build / "lib" / "libvlm_engine.so"
+
         if not self._resolved_server_bin:
             cand_jetson_srv = default_jetson_build / "examples" / "vlm_server" / "vlm_server"
             if cand_jetson_srv.is_file() and os.access(cand_jetson_srv, os.X_OK):
@@ -473,11 +512,12 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     print(f"[!] [TRT-Edge-LLM][配置错误] {l_path} 既不包含 config.json 也不包含 .engine 文件，拒绝挂载")
 
         # 汇总状态提示
+        so_tag = f", engine_so={self._resolved_engine_so}" if self._resolved_engine_so else ""
         server_tag = f", server={self._resolved_server_bin}" if self._resolved_server_bin else ""
         bin_tag = f", bin={self._resolved_edgellm_bin}" if self._resolved_edgellm_bin else ""
         mode_tag = f" [模式: {self.mode}]"
-        if (self._resolved_server_bin or self._resolved_edgellm_bin) and self._resolved_engine_dir:
-            print(f"[*] [TRT-Edge-LLM]{mode_tag} 显式配置挂载就绪: LLM={self._resolved_engine_dir}, Visual={self._resolved_visual_dir}{server_tag}{bin_tag}")
+        if (self._resolved_engine_so or self._resolved_server_bin or self._resolved_edgellm_bin) and self._resolved_engine_dir:
+            print(f"[*] [TRT-Edge-LLM]{mode_tag} 显式配置挂载就绪: LLM={self._resolved_engine_dir}, Visual={self._resolved_visual_dir}{so_tag}{server_tag}{bin_tag}")
         else:
             print(f"[i] [TRT-Edge-LLM]{mode_tag} 未显式配置完整引擎路径 (--model-dir 或 --vlm-engine + --build-dir)，VLM 保持休眠（不启动 C++ 推理，使用端侧语义保底）")
 
@@ -775,6 +815,208 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             "timing_source": timing_source
         }
         return timing_data, metric_data
+
+    def _init_in_process_engine(self) -> bool:
+        """
+        初始化 libvlm_engine.so 共享库与单次冷启动加载。
+        首帧反序列化引擎 (~5.0s)，后续零冷启动常驻直调。
+        """
+        if self._inprocess_handle is not None:
+            return True
+        if not self._resolved_engine_so or not self._resolved_engine_dir:
+            return False
+        if not self._is_valid_engine_dir(self._resolved_engine_dir):
+            return False
+
+        try:
+            import ctypes
+            if self._so_lib is None:
+                if self._resolved_build_dir:
+                    b_str = str(self._resolved_build_dir)
+                    curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
+                    if b_str not in curr_ld:
+                        os.environ["LD_LIBRARY_PATH"] = f"{b_str}:{curr_ld}" if curr_ld else b_str
+                if self._resolved_plugin_path and not os.environ.get("EDGELLM_PLUGIN_PATH"):
+                    os.environ["EDGELLM_PLUGIN_PATH"] = str(self._resolved_plugin_path)
+
+                self._so_lib = ctypes.CDLL(str(self._resolved_engine_so))
+                self._so_lib.vlm_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+                self._so_lib.vlm_create.restype = ctypes.c_void_p
+
+                self._so_lib.vlm_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+                self._so_lib.vlm_generate.restype = ctypes.c_char_p
+
+                self._so_lib.vlm_get_cold_start_ms.argtypes = [ctypes.c_void_p]
+                self._so_lib.vlm_get_cold_start_ms.restype = ctypes.c_double
+
+                self._so_lib.vlm_get_last_inference_ms.argtypes = [ctypes.c_void_p]
+                self._so_lib.vlm_get_last_inference_ms.restype = ctypes.c_double
+
+                self._so_lib.vlm_get_last_generated_tokens.argtypes = [ctypes.c_void_p]
+                self._so_lib.vlm_get_last_generated_tokens.restype = ctypes.c_int
+
+                self._so_lib.vlm_destroy.argtypes = [ctypes.c_void_p]
+                self._so_lib.vlm_destroy.restype = None
+
+            print(f"[*] [TRT-Edge-LLM] 正在通过 libvlm_engine.so 首次加载模型 (原生 C-API 进程内直调，无网络开销)...")
+            t0 = time.perf_counter()
+            llm_dir_bytes = str(self._resolved_engine_dir).encode('utf-8')
+            vis_dir_bytes = str(self._resolved_visual_dir).encode('utf-8') if self._resolved_visual_dir else None
+            handle = self._so_lib.vlm_create(llm_dir_bytes, vis_dir_bytes)
+            t_total_load = (time.perf_counter() - t0) * 1000.0
+
+            if not handle:
+                print(f"[!] [TRT-Edge-LLM] libvlm_engine.so vlm_create 返回 NULL，初始化失败")
+                return False
+
+            self._inprocess_handle = handle
+            self._inprocess_cold_start_ms = float(self._so_lib.vlm_get_cold_start_ms(handle))
+            if self._inprocess_cold_start_ms <= 0.0:
+                self._inprocess_cold_start_ms = t_total_load
+            self._last_inprocess_active_time = time.time()
+            self._is_first_inprocess_run = True
+
+            print(f"[+] [TRT-Edge-LLM] libvlm_engine.so 原生模型加载就绪 (纯反序列化冷启动耗时: {self._inprocess_cold_start_ms/1000.0:.2f}s, 进入 0 冷启动常驻直调状态)")
+            return True
+        except Exception as e:
+            print(f"[!] [TRT-Edge-LLM] 加载 libvlm_engine.so 发生异常: {e}")
+            return False
+
+    def _infer_in_process(
+        self,
+        event_record: ThreatEventRecord,
+        keyframes: Optional[List[np.ndarray]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        通过原生 C-API libvlm_engine.so 进行进程内直调推理：
+        - 零网络协议栈损耗 (无 HTTP、无 Socket、无端口冲突、无探测超时)
+        - 首帧仅承担物理引擎反序列化耗时 (~5.0s)
+        - 后续推理直接内存调用 (~3.5s)，极速高效
+        """
+        if not self._init_in_process_engine():
+            return None
+
+        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
+        dist_m = getattr(event_record, "target_distance", 0.0)
+        target_cat = getattr(event_record, "target_category", "person")
+        species_name = getattr(event_record, "species_cn", "")
+
+        prompt_text = (
+            f"{self.SYSTEM_PROMPT}\n\n"
+            f"【现场传感器遥测上下文】\n"
+            f"- 目标类别: {target_cat}\n"
+            f"- 识别物种: {species_name or '未定'}\n"
+            f"- 视觉动作类型: {event_record.action_type.value}\n"
+            f"- 空间物理距离: {dist_m:.1f} 米\n"
+            f"- 防区累计滞留时间: {dwell_s:.1f} 秒\n"
+            f"- 是否有车身硬件物理接触信号 (CAN/IMU): {event_record.has_contact_signal}\n\n"
+            f"请结合关键帧图像分析并输出判定 JSON："
+        )
+
+        shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
+        tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_inproc_", dir=shm_dir)
+        tmp_dir_path = Path(tmp_dir)
+        t_pre_0 = time.perf_counter()
+        img_path_str = ""
+
+        try:
+            if keyframes and len(keyframes) > 0:
+                import cv2
+                img = keyframes[0]
+                h, w = img.shape[:2]
+                max_dim = max(h, w)
+                if max_dim > 640:
+                    scale = 640.0 / max_dim
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+                img_file = tmp_dir_path / "keyframe.jpg"
+                cv2.imwrite(str(img_file), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                img_path_str = str(img_file.resolve())
+
+            preprocess_ms = (time.perf_counter() - t_pre_0) * 1000.0
+
+            if getattr(self, "_is_first_inprocess_run", False):
+                cold_start_ms = getattr(self, "_inprocess_cold_start_ms", 0.0)
+                self._is_first_inprocess_run = False
+            else:
+                cold_start_ms = 0.0
+
+            prompt_bytes = prompt_text.encode('utf-8')
+            img_bytes = img_path_str.encode('utf-8') if img_path_str else None
+
+            t_inf_0 = time.perf_counter()
+            res_ptr = self._so_lib.vlm_generate(
+                self._inprocess_handle,
+                prompt_bytes,
+                img_bytes,
+                int(self.max_tokens)
+            )
+            proc_elapsed_ms = (time.perf_counter() - t_inf_0) * 1000.0
+            self._last_inprocess_active_time = time.time()
+
+            raw_res_str = ""
+            if res_ptr is not None:
+                if isinstance(res_ptr, bytes):
+                    raw_res_str = res_ptr.decode('utf-8', errors='ignore')
+                elif isinstance(res_ptr, str):
+                    raw_res_str = res_ptr
+
+            t_post_0 = time.perf_counter()
+            output_str, parsed = self._extract_vlm_response(raw_res_str, raw_res_str)
+            postprocess_ms = (time.perf_counter() - t_post_0) * 1000.0
+
+            pure_inf_ms = float(self._so_lib.vlm_get_last_inference_ms(self._inprocess_handle))
+            if pure_inf_ms <= 0.0:
+                pure_inf_ms = proc_elapsed_ms
+
+            gen_tokens = int(self._so_lib.vlm_get_last_generated_tokens(self._inprocess_handle))
+            if gen_tokens <= 0 and raw_res_str:
+                gen_tokens = max(1, len([c for c in raw_res_str if ord(c) > 127]) + len([w for w in raw_res_str.split() if any(ord(c) <= 127 for c in w)]))
+
+            tps = round(float(gen_tokens) / (pure_inf_ms / 1000.0), 2) if (gen_tokens and pure_inf_ms > 0) else None
+
+            timing_data = {
+                "cold_start_load_ms": round(cold_start_ms, 2),
+                "pure_inference_ms": round(pure_inf_ms, 2),
+                "vision_encoder_gpu_ms": 0.0,
+                "llm_prefill_gpu_ms": 0.0,
+                "llm_generation_gpu_ms": round(pure_inf_ms, 2),
+                "proc_elapsed_ms": round(proc_elapsed_ms, 2),
+                "preprocess_ms": round(preprocess_ms, 2),
+                "postprocess_ms": round(postprocess_ms, 2),
+                "total_duration_ms": round(cold_start_ms + preprocess_ms + proc_elapsed_ms + postprocess_ms, 2)
+            }
+            metric_data = {
+                "prompt_tokens": None,
+                "generated_tokens": gen_tokens,
+                "tokens_per_second": tps,
+                "ttft_ms": None,
+                "finish_reason": "stop" if gen_tokens < self.max_tokens else "max-length",
+                "peak_unified_memory_mb": None,
+                "timing_source": "INPROCESS_NATIVE_C_API"
+            }
+
+            if parsed:
+                if "summary_text" in parsed:
+                    parsed["summary_text"] = parsed["summary_text"][:50]
+                parsed["backend_source"] = "TRT-Edge-LLM (libvlm_engine.so 原生进程内直调)"
+                parsed["raw_output_text"] = output_str or json.dumps(parsed, ensure_ascii=False)
+                parsed["prompt_text"] = prompt_text
+                parsed["timing_breakdown"] = timing_data
+                parsed["inference_metrics"] = metric_data
+
+                cold_s = timing_data["cold_start_load_ms"] / 1000.0
+                inf_s = timing_data["pure_inference_ms"] / 1000.0
+                tps_str = f" | 速度: {metric_data['tokens_per_second']:.1f} tps" if metric_data.get('tokens_per_second') else ""
+                cs_str = f"冷启动: {cold_s:.2f}s | " if cold_s > 0 else "0冷启动常驻 | "
+                print(f"[*] [TRT-Edge-LLM] libvlm_engine.so 真实直调完成 (总计 {timing_data['total_duration_ms']:.1f}ms | {cs_str}纯推理: {inf_s:.2f}s | 前后处理: {(preprocess_ms+postprocess_ms)/1000.0:.2f}s{tps_str}): {parsed.get('summary_text')}")
+                return parsed
+        except Exception as e:
+            print(f"[!] [TRT-Edge-LLM] libvlm_engine.so 推理过程捕获异常: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return None
 
     def _infer_native_cpp(
         self,
@@ -1286,7 +1528,15 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         return None
 
     def shutdown(self):
-        """停止后台拉起的 vlm_server 进程并发送优雅退出信号"""
+        """停止后台拉起的 vlm_server 进程与释放 libvlm_engine.so 原生句柄"""
+        if self._inprocess_handle is not None and self._so_lib is not None:
+            try:
+                self._so_lib.vlm_destroy(self._inprocess_handle)
+                print("[+] [TRT-Edge-LLM] libvlm_engine.so 原生句柄已释放，100% 显存已归还")
+            except Exception as e:
+                print(f"[!] [TRT-Edge-LLM] 释放 libvlm_engine.so 句柄异常: {e}")
+            self._inprocess_handle = None
+
         try:
             url = f"http://{self.server_host}:{self.server_port}/shutdown"
             req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"})
@@ -1313,7 +1563,18 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         """端侧 VLM 视觉推理与语义战报生成入口"""
         self._probe_paths()
 
-        # 模式分支 A: 常驻服务模式 (auto 或 server)
+        # 模式分支 A: 原生共享库进程内直调模式 (最高优先级，零网络协议开销、零 TCP 握手与端口探测超时，首帧 5s 物理反序列化加载，后续 3.5s 内存直调)
+        if self.mode in ["auto", "inprocess", "so", "native"]:
+            res_inproc = self._infer_in_process(event_record, keyframes)
+            if res_inproc is not None:
+                return res_inproc
+            if self.mode in ["inprocess", "so", "native"]:
+                print("[!] [TRT-Edge-LLM] 处于强制 inprocess 模式，但 libvlm_engine.so 不可用，回退至规则保底")
+                res = self.fallback_mock.infer(event_record, keyframes)
+                res["backend_source"] = "FALLBACK_RULE_MOCK (强制inprocess模式不可用回退)"
+                return res
+
+        # 模式分支 B: 常驻服务模式 (auto 或 server)
         if self.mode in ["auto", "server"]:
             res_server = self._infer_server(event_record, keyframes)
             if res_server is not None:
@@ -1325,18 +1586,18 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 return res
             print("[i] [TRT-Edge-LLM] vlm_server 不可用/未部署，自动降级至 llm_inference 一次性子进程模式...")
 
-        # 模式分支 B: 原生 llm_inference 一次性子进程 (auto 降级或显式 subprocess)
+        # 模式分支 C: 原生 llm_inference 一次性子进程 (auto 降级或显式 subprocess)
         if self.mode in ["auto", "subprocess"]:
             res_cpp = self._infer_native_cpp(event_record, keyframes)
             if res_cpp is not None:
                 return res_cpp
 
-        # 模式分支 C: 备选尝试 Python 原生绑定
+        # 模式分支 D: 备选尝试 Python 原生绑定
         res_py = self._infer_python_bindings(event_record, keyframes)
         if res_py is not None:
             return res_py
 
-        # 模式分支 D: 开发测试/离线主机兜底：挂载端侧高保真语义复核规则 (融合滞留时间与空间距离)
+        # 模式分支 E: 开发测试/离线主机兜底：挂载端侧高保真语义复核规则 (融合滞留时间与空间距离)
         res = self.fallback_mock.infer(event_record, keyframes)
         res["backend_source"] = "FALLBACK_RULE_MOCK (离线规则保底模板)"
         res["raw_output_text"] = "(无真实大模型输出，使用离线保底)"

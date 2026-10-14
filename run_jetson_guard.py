@@ -283,8 +283,10 @@ def main():
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
     parser.add_argument("--vlm-max-tokens", type=int, default=128,
                         help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
-    parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "server", "subprocess"],
-                        help="端侧 VLM 推理模式: auto (优先使用常驻持久化服务 vlm_server 零冷启动，自动降级 llm_inference), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
+    parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "inprocess", "server", "subprocess"],
+                        help="端侧 VLM 推理模式: auto (优先使用 libvlm_engine.so 原生直调，次选 vlm_server，自动降级 llm_inference), inprocess (强制原生 C-API 进程内直调), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
+    parser.add_argument("--vlm-engine-so", type=str, default=None,
+                        help="显式指定 libvlm_engine.so 共享库路径 (默认自动在 build 目录检索)")
     parser.add_argument("--vlm-server-port", type=int, default=8090,
                         help="vlm_server 监听的 HTTP 端口 (默认 8090)")
     parser.add_argument("--vlm-idle-timeout", type=int, default=60,
@@ -415,6 +417,7 @@ def main():
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=getattr(args, "vlm_max_tokens", 128),
         vlm_mode=getattr(args, "vlm_mode", "auto"),
+        vlm_engine_so=getattr(args, "vlm_engine_so", None),
         vlm_server_port=getattr(args, "vlm_server_port", 8090),
         vlm_idle_timeout=getattr(args, "vlm_idle_timeout", 60),
         vlm_server_bin=getattr(args, "vlm_server_bin", None),

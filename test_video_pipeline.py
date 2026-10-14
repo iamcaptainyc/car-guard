@@ -419,6 +419,7 @@ def run_video_pipeline(
     vlm_timeout: float = 35.0,
     vlm_max_tokens: int = 128,
     vlm_mode: str = "auto",
+    vlm_engine_so: Optional[str] = None,
     vlm_server_port: int = 8090,
     vlm_idle_timeout: int = 60,
     vlm_server_bin: Optional[str] = None,
@@ -746,6 +747,7 @@ def run_video_pipeline(
         timeout=vlm_timeout,
         max_tokens=vlm_max_tokens,
         mode=vlm_mode,
+        engine_so_path=vlm_engine_so,
         server_bin=vlm_server_bin,
         server_port=vlm_server_port,
         server_idle_timeout=vlm_idle_timeout
