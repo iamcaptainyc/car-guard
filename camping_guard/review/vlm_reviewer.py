@@ -1002,9 +1002,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         url = f"http://{self.server_host}:{self.server_port}/health"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "CampingGuard-VLMClient/1.0"})
-            with urllib.request.urlopen(req, timeout=1.0) as resp:
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
+                    if "cold_start_load_ms" in data and float(data["cold_start_load_ms"]) > 0:
+                        self._last_server_cold_start_ms = float(data["cold_start_load_ms"])
                     return bool(data.get("status") == "ready" or data.get("model_ready", False))
         except Exception as e:
             if log_reason:
@@ -1071,7 +1073,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             return False, 0.0
 
         max_wait = max(self.timeout * 2.5, 90.0)
-        poll_interval = 0.5
+        poll_interval = 0.3
         last_heartbeat = t_spawn_0
         while time.perf_counter() - t_spawn_0 < max_wait:
             if self._server_proc.poll() is not None:
@@ -1089,8 +1091,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 return False, 0.0
 
             if self._is_server_alive():
-                cold_ms = (time.perf_counter() - t_spawn_0) * 1000.0
-                print(f"[+] [TRT-Edge-LLM] vlm_server 守护服务就绪 (首帧冷启动耗时: {cold_ms/1000.0:.2f}s, 进入 0 冷启动保活状态)")
+                proc_spawn_ms = (time.perf_counter() - t_spawn_0) * 1000.0
+                cold_ms = getattr(self, "_last_server_cold_start_ms", proc_spawn_ms)
+                print(f"[+] [TRT-Edge-LLM] vlm_server 守护服务就绪 (纯模型反序列化: {cold_ms/1000.0:.2f}s | 进程启动与Graph捕获总耗时: {proc_spawn_ms/1000.0:.2f}s, 进入 0 冷启动保活状态)")
                 return True, cold_ms
 
             now_t = time.perf_counter()
