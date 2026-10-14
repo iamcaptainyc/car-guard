@@ -281,6 +281,8 @@ def main():
                         help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
     parser.add_argument("--vlm-timeout", type=float, default=35.0,
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
+    parser.add_argument("--vlm-max-tokens", type=int, default=128,
+                        help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
     parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "server", "subprocess"],
                         help="端侧 VLM 推理模式: auto (优先使用常驻持久化服务 vlm_server 零冷启动，自动降级 llm_inference), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
     parser.add_argument("--vlm-server-port", type=int, default=8090,
@@ -411,11 +413,11 @@ def main():
         edgellm_dir=args.edgellm_dir,
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
-        vlm_max_tokens=args.vlm_max_tokens,
-        vlm_mode=args.vlm_mode,
-        vlm_server_port=args.vlm_server_port,
-        vlm_idle_timeout=args.vlm_idle_timeout,
-        vlm_server_bin=args.vlm_server_bin,
+        vlm_max_tokens=getattr(args, "vlm_max_tokens", 128),
+        vlm_mode=getattr(args, "vlm_mode", "auto"),
+        vlm_server_port=getattr(args, "vlm_server_port", 8090),
+        vlm_idle_timeout=getattr(args, "vlm_idle_timeout", 60),
+        vlm_server_bin=getattr(args, "vlm_server_bin", None),
         cls_onnx_path=chosen_cls,
         fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] and str(engines["fire_det"]) != "builtin:VisualFlameDetector" else None),
         enable_fire=not args.no_fire,
