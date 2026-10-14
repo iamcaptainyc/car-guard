@@ -33,15 +33,11 @@ else
     echo "[i] examples/CMakeLists.txt 已包含 vlm_engine"
 fi
 
-echo "[*] 3. 执行编译 (make vlm_engine)..."
+echo "[*] 3. 重新生成构建规则与编译 (cmake .. && make vlm_engine)..."
 BUILD_DIR="${EDGELLM_DIR}/build"
-if [ ! -d "${BUILD_DIR}" ]; then
-    mkdir -p "${BUILD_DIR}"
-    cd "${BUILD_DIR}"
-    cmake ..
-else
-    cd "${BUILD_DIR}"
-fi
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
+cmake ..
 
 make -j$(nproc) vlm_engine
 
