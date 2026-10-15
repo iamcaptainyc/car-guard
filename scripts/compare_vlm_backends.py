@@ -271,21 +271,58 @@ def test_inprocess_mode(
     lib.vlm_destroy.argtypes = [ctypes.c_void_p]
     lib.vlm_destroy.restype = None
 
+    if hasattr(lib, "vlm_get_graph_capture_ms"):
+        lib.vlm_get_graph_capture_ms.argtypes = [ctypes.c_void_p]
+        lib.vlm_get_graph_capture_ms.restype = ctypes.c_double
+
     prompt_bytes = prompt.encode("utf-8")
     img_bytes = str(img_path.resolve()).encode("utf-8")
     llm_bytes = str(llm_dir.resolve()).encode("utf-8")
     vis_bytes = str(vis_dir.resolve()).encode("utf-8")
 
-    # 1. 首帧冷启动
+    # 1. 首帧冷启动 (通过 OS 级别文件描述符重定向捕获 C++ 初始化详细日志与各子阶段时间戳)
     print("[*] 正在执行 vlm_create (首帧初始化与反序列化)...")
-    t_create_0 = time.perf_counter()
-    handle = lib.vlm_create(llm_bytes, vis_bytes)
-    t_create_wall_ms = (time.perf_counter() - t_create_0) * 1000.0
+    log_fd, log_temp_path = tempfile.mkstemp(prefix="vlm_inproc_log_")
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+
+    try:
+        t_create_0 = time.perf_counter()
+        handle = lib.vlm_create(llm_bytes, vis_bytes)
+        t_create_wall_ms = (time.perf_counter() - t_create_0) * 1000.0
+    finally:
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(log_fd)
+
+    inproc_init_log = ""
+    if os.path.exists(log_temp_path):
+        try:
+            with open(log_temp_path, "r", encoding="utf-8", errors="replace") as f:
+                inproc_init_log = f.read()
+            os.remove(log_temp_path)
+        except Exception:
+            pass
+
+    # 将捕获的底层日志输出至控制台供实时查看
+    if inproc_init_log.strip():
+        print(inproc_init_log.strip())
 
     if not handle:
         raise RuntimeError("libvlm_engine.so vlm_create 失败，返回 NULL")
 
     native_cold_ms = float(lib.vlm_get_cold_start_ms(handle))
+    cpp_stages_b = parse_cpp_log_timestamps(inproc_init_log)
+
+    # 若日志解析未能完全覆盖，尝试从 C-API 辅助函数获取 Graph 耗时
+    if "cpp_graph_capture_ms" not in cpp_stages_b and hasattr(lib, "vlm_get_graph_capture_ms"):
+        graph_ms = float(lib.vlm_get_graph_capture_ms(handle))
+        if graph_ms > 0:
+            cpp_stages_b["cpp_graph_capture_ms"] = round(graph_ms, 1)
 
     # 首帧生成
     t_gen1_0 = time.perf_counter()
@@ -301,13 +338,27 @@ def test_inprocess_mode(
         "cold_start_ms": native_cold_ms if native_cold_ms > 0 else t_create_wall_ms,
         "pure_gpu_inference_ms": native_gen1_ms,
         "generated_tokens": tokens1,
-        "output_text": out1[:100]
+        "output_text": out1[:100],
+        "cpp_stages": cpp_stages_b,
+        "raw_stdout": inproc_init_log
     }
 
-    print(f"[*] 方案 B [首帧] 完成:")
+    print(f"\n[*] 方案 B [首帧] 完成:")
     print(f"    - 总墙钟耗时: {run1['wall_ms']:.1f} ms ({run1['wall_ms']/1000.0:.2f} s)")
     print(f"    - 引擎反序列化冷启动: {run1['cold_start_ms']:.1f} ms ({run1['cold_start_ms']/1000.0:.2f} s)")
     print(f"    - 纯硬件推理耗时: {native_gen1_ms:.1f} ms ({native_gen1_ms/1000.0:.2f} s)")
+    if cpp_stages_b:
+        print(f"    - C++ 底层启动阶段分解:")
+        if "cpp_llm_engine_ms" in cpp_stages_b:
+            print(f"      * LLM 引擎反序列化 : {cpp_stages_b['cpp_llm_engine_ms']:.1f} ms ({cpp_stages_b['cpp_llm_engine_ms']/1000.0:.2f}s)")
+        if "cpp_vocab_load_ms" in cpp_stages_b:
+            print(f"      * 词表加载 (loadVocab) : {cpp_stages_b['cpp_vocab_load_ms']:.1f} ms ({cpp_stages_b['cpp_vocab_load_ms']/1000.0:.2f}s)")
+        if "cpp_vis_engine_ms" in cpp_stages_b:
+            print(f"      * Visual 引擎反序列化: {cpp_stages_b['cpp_vis_engine_ms']:.1f} ms ({cpp_stages_b['cpp_vis_engine_ms']/1000.0:.2f}s)")
+        if "cpp_graph_capture_ms" in cpp_stages_b:
+            print(f"      * CUDA Graph 预捕获 : {cpp_stages_b['cpp_graph_capture_ms']:.1f} ms ({cpp_stages_b['cpp_graph_capture_ms']/1000.0:.2f}s)")
+        if "cpp_total_init_ms" in cpp_stages_b:
+            print(f"      * C++ 底层总初始化耗时: {cpp_stages_b['cpp_total_init_ms']:.1f} ms ({cpp_stages_b['cpp_total_init_ms']/1000.0:.2f}s)")
 
     # 2. 第二次请求 (0 冷启动复用)
     print("\n[*] 正在执行第 2 次直调 (验证常驻 0 冷启动)...")
@@ -410,15 +461,22 @@ def main():
     print("-" * 95)
 
     cpp_a = res_a.get("cpp_stages", {})
+    cpp_b = res_b_cold.get("cpp_stages", {})
+
     llm_load_a = f"{cpp_a.get('cpp_llm_engine_ms', 0):.0f} ms" if "cpp_llm_engine_ms" in cpp_a else "未捕获"
     vocab_load_a = f"{cpp_a.get('cpp_vocab_load_ms', 0):.0f} ms" if "cpp_vocab_load_ms" in cpp_a else "未捕获"
     vis_load_a = f"{cpp_a.get('cpp_vis_engine_ms', 0):.0f} ms" if "cpp_vis_engine_ms" in cpp_a else "未捕获"
     graph_load_a = f"{cpp_a.get('cpp_graph_capture_ms', 0):.0f} ms" if "cpp_graph_capture_ms" in cpp_a else "未捕获"
 
-    print(f"{'[C++] LLM 引擎反序列化':<30} | {llm_load_a:<20} | {'~2240 ms':<20} | {'0 ms (已常驻)':<20}")
-    print(f"{'[C++] 词表解析 (loadVocab)':<30} | {vocab_load_a:<20} | {'~7430 ms':<20} | {'0 ms (已常驻)':<20}")
-    print(f"{'[C++] Visual 引擎反序列化':<30} | {vis_load_a:<20} | {'~1570 ms':<20} | {'0 ms (已常驻)':<20}")
-    print(f"{'[C++] CUDA Graph 预捕获':<30} | {graph_load_a:<20} | {'~600 ms':<20} | {'0 ms (已常驻)':<20}")
+    llm_load_b = f"{cpp_b.get('cpp_llm_engine_ms', 0):.0f} ms" if "cpp_llm_engine_ms" in cpp_b else "未捕获"
+    vocab_load_b = f"{cpp_b.get('cpp_vocab_load_ms', 0):.0f} ms" if "cpp_vocab_load_ms" in cpp_b else "未捕获"
+    vis_load_b = f"{cpp_b.get('cpp_vis_engine_ms', 0):.0f} ms" if "cpp_vis_engine_ms" in cpp_b else "未捕获"
+    graph_load_b = f"{cpp_b.get('cpp_graph_capture_ms', 0):.0f} ms" if "cpp_graph_capture_ms" in cpp_b else "未捕获"
+
+    print(f"{'[C++] LLM 引擎反序列化':<30} | {llm_load_a:<20} | {llm_load_b:<20} | {'0 ms (已常驻)':<20}")
+    print(f"{'[C++] 词表解析 (loadVocab)':<30} | {vocab_load_a:<20} | {vocab_load_b:<20} | {'0 ms (已常驻)':<20}")
+    print(f"{'[C++] Visual 引擎反序列化':<30} | {vis_load_a:<20} | {vis_load_b:<20} | {'0 ms (已常驻)':<20}")
+    print(f"{'[C++] CUDA Graph 预捕获':<30} | {graph_load_a:<20} | {graph_load_b:<20} | {'0 ms (已常驻)':<20}")
     print("-" * 95)
     print(f"{'真实冷启动装载耗时':<30} | {res_a['cold_start_ms']:.1f} ms ({res_a['cold_start_ms']/1000.0:.2f}s)   | {res_b_cold['cold_start_ms']:.1f} ms ({res_b_cold['cold_start_ms']/1000.0:.2f}s)   | {'0.0 ms (0冷启动)':<20}")
     print(f"{'纯硬件推理耗时 (ViT+LLM)':<30} | {res_a['pure_gpu_inference_ms']:.1f} ms ({res_a['pure_gpu_inference_ms']/1000.0:.2f}s)   | {res_b_cold['pure_gpu_inference_ms']:.1f} ms ({res_b_cold['pure_gpu_inference_ms']/1000.0:.2f}s)   | {res_b_warm['pure_gpu_inference_ms']:.1f} ms ({res_b_warm['pure_gpu_inference_ms']/1000.0:.2f}s)")

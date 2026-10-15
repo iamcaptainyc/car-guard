@@ -33,11 +33,11 @@ else
     echo "[i] examples/CMakeLists.txt 已包含 vlm_engine"
 fi
 
-echo "[*] 3. 重新生成构建规则与编译 (cmake .. && make vlm_engine)..."
+echo "[*] 3. 重新生成构建规则与优化编译 (cmake -DCMAKE_BUILD_TYPE=Release .. && make vlm_engine)..."
 BUILD_DIR="${EDGELLM_DIR}/build"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
-cmake ..
+cmake -DCMAKE_BUILD_TYPE=Release ..
 
 make -j$(nproc) vlm_engine
 

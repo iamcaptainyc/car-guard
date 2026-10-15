@@ -9,10 +9,15 @@ add_library(${TARGET_NAME} SHARED
 
 target_compile_definitions(${TARGET_NAME} PRIVATE VLM_ENGINE_EXPORTS)
 
+# Match llm_inference release optimizations and symbols
+target_compile_options(${TARGET_NAME} PRIVATE -O3 -DNDEBUG -fvisibility=default)
+
 target_include_directories(${TARGET_NAME}
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${COMMON_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/cpp
+        ${CMAKE_SOURCE_DIR}/examples/utils
 )
 
 target_link_libraries(${TARGET_NAME}
@@ -21,6 +26,8 @@ target_link_libraries(${TARGET_NAME}
         exampleUtils
         commonLibraryExt
 )
+
+add_cross_build_link_options(${TARGET_NAME})
 
 set_target_properties(${TARGET_NAME} PROPERTIES
     CXX_STANDARD 17

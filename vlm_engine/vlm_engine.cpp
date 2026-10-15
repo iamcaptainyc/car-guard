@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -31,11 +32,13 @@ namespace
 {
 struct VLMEngineContext
 {
+    std::unique_ptr<void, DlDeleter> pluginHandles{nullptr};
     std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream{nullptr};
     std::mutex mtx;
 
     double coldStartMs{0.0};
+    double graphCaptureMs{0.0};
     double lastInferenceMs{0.0};
     int lastGeneratedTokens{0};
     std::string lastOutputBuffer;
@@ -91,19 +94,26 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
         }
     }
 
-    auto pluginHandles = loadEdgellmPluginLib();
-    (void) pluginHandles;
-
     auto ctx = std::make_unique<VLMEngineContext>();
+    ctx->pluginHandles = loadEdgellmPluginLib();
+
     CUDA_CHECK(cudaStreamCreate(&ctx->stream));
 
     auto t0 = std::chrono::high_resolution_clock::now();
     std::unordered_map<std::string, std::string> loraMap;
     std::string mmDir = (multimodalEngineDir && std::strlen(multimodalEngineDir) > 0) ? multimodalEngineDir : "";
 
+    std::filesystem::path normEngineDir(engineDir);
+    if (!std::filesystem::exists(normEngineDir))
+    {
+        std::cerr << "[VLMEngine] [Fatal] engineDir does not exist: " << engineDir << std::endl;
+        return nullptr;
+    }
+
     try
     {
-        ctx->runtime = std::make_unique<rt::LLMInferenceRuntime>(engineDir, mmDir, loraMap, ctx->stream);
+        ctx->runtime = std::make_unique<rt::LLMInferenceRuntime>(
+            normEngineDir.string(), mmDir, loraMap, ctx->stream);
     }
     catch (std::exception const& e)
     {
@@ -115,14 +125,27 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
         return nullptr;
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    ctx->coldStartMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto tRuntime = std::chrono::high_resolution_clock::now();
+    double runtimeLoadMs = std::chrono::duration<double, std::milli>(tRuntime - t0).count();
 
-    // Capture decoding CUDA graph
-    ctx->runtime->captureDecodingCUDAGraph(ctx->stream);
+    // Capture decoding CUDA graph (matching llm_inference standard process)
+    auto tGraph0 = std::chrono::high_resolution_clock::now();
+    bool graphCaptured = ctx->runtime->captureDecodingCUDAGraph(ctx->stream);
+    auto tGraph1 = std::chrono::high_resolution_clock::now();
+    ctx->graphCaptureMs = std::chrono::duration<double, std::milli>(tGraph1 - tGraph0).count();
 
-    std::cout << "[VLMEngine] [Ready] VLM in-process engine instantiated. Pure engine load: "
-              << ctx->coldStartMs << " ms (" << (ctx->coldStartMs / 1000.0) << " s)." << std::endl;
+    if (!graphCaptured)
+    {
+        std::cerr << "[VLMEngine] [Warning] Failed to capture CUDA graph for decoding, proceeding with normal execution." << std::endl;
+    }
+
+    auto tTotal = std::chrono::high_resolution_clock::now();
+    ctx->coldStartMs = std::chrono::duration<double, std::milli>(tTotal - t0).count();
+
+    std::cout << "[VLMEngine] [Ready] VLM in-process engine instantiated. "
+              << "Runtime load: " << std::fixed << std::setprecision(1) << runtimeLoadMs << " ms, "
+              << "CUDA Graph capture: " << ctx->graphCaptureMs << " ms, "
+              << "Total cold start: " << ctx->coldStartMs << " ms (" << (ctx->coldStartMs / 1000.0) << " s)." << std::endl;
     std::cout.flush();
 
     return ctx.release();
@@ -213,6 +236,12 @@ double vlm_get_cold_start_ms(void* handle)
     return static_cast<VLMEngineContext*>(handle)->coldStartMs;
 }
 
+double vlm_get_graph_capture_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->graphCaptureMs;
+}
+
 double vlm_get_last_inference_ms(void* handle)
 {
     if (!handle) return 0.0;
@@ -240,6 +269,7 @@ void vlm_destroy(void* handle)
             cudaStreamDestroy(ctx->stream);
             ctx->stream = nullptr;
         }
+        ctx->pluginHandles.reset();
     }
     delete ctx;
     std::cout << "[VLMEngine] [Clean] Engine destroyed, 100% Unified Memory reclaimed." << std::endl;

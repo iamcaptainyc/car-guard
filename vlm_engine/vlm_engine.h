@@ -39,9 +39,14 @@ VLM_API void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
 VLM_API const char* vlm_generate(void* handle, const char* prompt, const char* imagePath, int maxTokens);
 
 /**
- * @brief Get the cold start engine load time in milliseconds.
+ * @brief Get the total cold start load and initialization time in milliseconds.
  */
 VLM_API double vlm_get_cold_start_ms(void* handle);
+
+/**
+ * @brief Get the decoding CUDA Graph pre-capture time in milliseconds.
+ */
+VLM_API double vlm_get_graph_capture_ms(void* handle);
 
 /**
  * @brief Get the pure inference time in milliseconds of the most recent vlm_generate call.
@@ -124,6 +129,11 @@ public:
     double getColdStartMs() const noexcept
     {
         return handle_ ? vlm_get_cold_start_ms(handle_) : 0.0;
+    }
+
+    double getGraphCaptureMs() const noexcept
+    {
+        return handle_ ? vlm_get_graph_capture_ms(handle_) : 0.0;
     }
 
     double getLastInferenceMs() const noexcept
