@@ -1049,6 +1049,7 @@ def run_video_pipeline(
 
         # 4. 算法研判分发 (铁律 1：100% 帧框同源合一，当前帧同步推理并直接在该帧上绘制 OpenCV 检测框与骨骼点)
         camera_dict = {camera_id: frame}
+        run_detection = (frame_idx % detect_interval == 0) if detect_interval > 1 else True
         try:
             tick_res = engine.process_tick(
                 camera_frames=camera_dict,
