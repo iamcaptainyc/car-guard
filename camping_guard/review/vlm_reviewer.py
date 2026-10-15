@@ -252,17 +252,24 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
        - 在开发主机或无硬件环境时，无缝衔接高保真端侧规则兜底引擎，保障单元测试与全流程绝对稳定。
     """
     SYSTEM_PROMPT = (
-        "你是一个部署在智能汽车车载边缘计算平台（Jetson Orin）上的安全哨兵多模态复核大模型。"
-        "你的职责是对守卫系统快通路提交的可疑事件关键帧与车身传感器数据进行深度语义研判，"
-        "排除光影、树叶、鸟禽等环境假阳性，识别人员偷盗、破坏、窥探或野生猛兽等安全风险，并为车主生成不超过50字的人性化简明情况通报。\n"
-        "请严格输出 JSON 格式：\n"
+        "你是一个部署在智能汽车车载边缘计算平台（Jetson Orin）上的安全哨兵多模态复核大模型。\n"
+        "【至关重要的主车视角认知与主客体定义】：\n"
+        "1. 视角法则：摄像头固定安装在本车（受保护宿主车辆）车身上向外拍摄。画面正前/侧方看到的完整车辆全部是【外部邻车/他车】，绝不是本车！画面下沿/侧边缘偶尔露出的极小反光面为本车车体外轮廓。\n"
+        "2. 主客体关系：画面中的车辆和人员属于【外部邻车/外部客体】，本车（搭载摄像头的车辆）为【受保护主体】。\n"
+        "【职责与核心事件研判范围】：\n"
+        "对关键帧画面结合传感器上下文进行深度语义研判，重点甄别以下事件：\n"
+        "- 【邻车碰撞/剐蹭 (VEHICLE_COLLISION)】：邻车人员开门幅度过大撞击/碰擦本车车身（俗称开门杀/开门碰擦）、邻车泊车/驶过时与本车发生车身刮蹭或物理贴靠；\n"
+        "- 【人员侵扰破坏 (DOOR_HANDLE_TAMPERING / VEHICLE_BODY_KICK / CABIN_PEEKING)】：外部人员拉拽本车门把手、窥探本车车内、脚踢/拍打本车车身；\n"
+        "- 【野生动物侵扰 (WILD_BEAST_DETECTED / WILD_ANIMAL_ATTACK)】：大型猛兽或流浪动物接近本车、抓挠扑咬；\n"
+        "- 【环境假阳性 (FALSE_ALARM)】：自然光影晃动、树叶摇曳、飞鸟掠过，或远处正常行人车辆路过且未侵扰本车。\n\n"
+        "请严格输出 JSON 格式（严禁输出任何额外说明文本）：\n"
         "{\n"
-        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
+        '  "action_category": "VEHICLE_COLLISION" | "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "is_human_contact": true/false,\n'
         '  "is_false_alarm": true/false,\n'
         '  "threat_escalation": "CONFIRM_OR_UPGRADE" | "DOWNGRADE_TO_L1" | "MAINTAIN",\n'
-        '  "summary_text": "中文情况通报 (50字以内)"\n'
+        '  "summary_text": "中文情况通报 (50字以内，必须明确主客体，如“邻车开门碰触我车右侧车门”)"\n'
         "}"
     )
 
@@ -344,6 +351,51 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self._is_shutting_down = False
 
         atexit.register(self.shutdown)
+
+    def _build_prompt(self, event_record: ThreatEventRecord) -> str:
+        """组装带视角色彩与场景定向指引的高保真多模态提示词"""
+        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
+        dist_m = getattr(event_record, "target_distance", 0.0)
+        target_cat = getattr(event_record, "target_category", "person")
+        species_name = getattr(event_record, "species_cn", "")
+        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+
+        # 针对具体事件类别注入定向注意力指引 (引导视觉模型聚焦车身交互)
+        focus_guide = ""
+        cat_lower = str(target_cat).lower()
+        act_str = str(act_val).lower()
+        if (
+            "car" in cat_lower or "veh" in cat_lower or "车" in cat_lower
+            or event_record.action_type == ActionType.VEHICLE_COLLISION
+            or "撞" in act_str or "碰" in act_str
+        ):
+            focus_guide = (
+                "\n- 【定向研判重点】：当前画面涉及外部车辆。请重点观察该【邻车】车门开启时是否碰击/刮擦到本车车门或侧身？"
+                "邻车停靠或驶过时是否与本车发生物理剐蹭？切勿将画面中的邻车误认成本车！"
+            )
+        elif "person" in cat_lower or "人" in cat_lower:
+            focus_guide = (
+                "\n- 【定向研判重点】：当前目标为外部人员。请重点观察该人员是否在拉拽本车门把手、窥探车内、脚踢车身，"
+                "还是仅在邻车旁正常上下车或经过本车。"
+            )
+        elif species_name or "beast" in cat_lower or "animal" in cat_lower or "兽" in cat_lower or "物" in cat_lower:
+            focus_guide = (
+                f"\n- 【定向研判重点】：当前识别到动物 ({species_name or target_cat})。请观察其是否在接近、停留或扑咬本车。"
+            )
+
+        prompt_text = (
+            f"{self.SYSTEM_PROMPT}\n\n"
+            f"【现场传感器遥测上下文】\n"
+            f"- 目标外部类别: {target_cat}\n"
+            f"- 目标细分类型: {species_name or '未定'}\n"
+            f"- 快通路初判动作: {act_val}\n"
+            f"- 距离本车空间物理距离: {dist_m:.1f} 米\n"
+            f"- 靠近本车防区累计时间: {dwell_s:.1f} 秒\n"
+            f"- 车身硬件接触震动信号 (CAN/IMU): {'已确认发生物理接触' if event_record.has_contact_signal else '未检测到物理接触'}"
+            f"{focus_guide}\n\n"
+            f"请结合关键帧图像分析并输出判定 JSON："
+        )
+        return prompt_text
 
     def _probe_paths(self):
         """严格按显式设置校验路径，不进行任何猜测和候选目录推断"""
@@ -956,22 +1008,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if not self._init_in_process_engine():
             return None
 
-        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
-        dist_m = getattr(event_record, "target_distance", 0.0)
-        target_cat = getattr(event_record, "target_category", "person")
-        species_name = getattr(event_record, "species_cn", "")
-
-        prompt_text = (
-            f"{self.SYSTEM_PROMPT}\n\n"
-            f"【现场传感器遥测上下文】\n"
-            f"- 目标类别: {target_cat}\n"
-            f"- 识别物种: {species_name or '未定'}\n"
-            f"- 视觉动作类型: {event_record.action_type.value}\n"
-            f"- 空间物理距离: {dist_m:.1f} 米\n"
-            f"- 防区累计滞留时间: {dwell_s:.1f} 秒\n"
-            f"- 是否有车身硬件物理接触信号 (CAN/IMU): {event_record.has_contact_signal}\n\n"
-            f"请结合关键帧图像分析并输出判定 JSON："
-        )
+        prompt_text = self._build_prompt(event_record)
 
         shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
         tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_inproc_", dir=shm_dir)
@@ -1090,22 +1127,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if not self._is_valid_engine_dir(self._resolved_engine_dir):
             return None
 
-        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
-        dist_m = getattr(event_record, "target_distance", 0.0)
-        target_cat = getattr(event_record, "target_category", "person")
-        species_name = getattr(event_record, "species_cn", "")
-
-        prompt_text = (
-            f"{self.SYSTEM_PROMPT}\n\n"
-            f"【现场传感器遥测上下文】\n"
-            f"- 目标类别: {target_cat}\n"
-            f"- 识别物种: {species_name or '未定'}\n"
-            f"- 视觉动作类型: {event_record.action_type.value}\n"
-            f"- 空间物理距离: {dist_m:.1f} 米\n"
-            f"- 防区累计滞留时间: {dwell_s:.1f} 秒\n"
-            f"- 是否有车身硬件物理接触信号 (CAN/IMU): {event_record.has_contact_signal}\n\n"
-            f"请结合关键帧图像分析并输出判定 JSON："
-        )
+        prompt_text = self._build_prompt(event_record)
 
         # 优先使用 Linux /dev/shm 内存盘加速 (0ms 磁盘读写延迟，0 闪存损耗)
         shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
@@ -1472,22 +1494,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if not ready:
             return None
 
-        dwell_s = getattr(event_record, "target_dwell_time", 0.0)
-        dist_m = getattr(event_record, "target_distance", 0.0)
-        target_cat = getattr(event_record, "target_category", "person")
-        species_name = getattr(event_record, "species_cn", "")
-
-        prompt_text = (
-            f"{self.SYSTEM_PROMPT}\n\n"
-            f"【现场传感器遥测上下文】\n"
-            f"- 目标类别: {target_cat}\n"
-            f"- 识别物种: {species_name or '未定'}\n"
-            f"- 视觉动作类型: {event_record.action_type.value}\n"
-            f"- 空间物理距离: {dist_m:.1f} 米\n"
-            f"- 防区累计滞留时间: {dwell_s:.1f} 秒\n"
-            f"- 是否有车身硬件物理接触信号 (CAN/IMU): {event_record.has_contact_signal}\n\n"
-            f"请结合关键帧图像分析并输出判定 JSON："
-        )
+        prompt_text = self._build_prompt(event_record)
 
         shm_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
         tmp_dir = tempfile.mkdtemp(prefix="trt_vlm_srv_", dir=shm_dir)
