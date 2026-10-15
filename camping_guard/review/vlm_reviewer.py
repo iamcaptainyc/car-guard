@@ -805,6 +805,12 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             "llm_generation_gpu_ms": round(gen_ms, 2),
             "proc_elapsed_ms": round(proc_elapsed_ms, 2),
         }
+
+        # 融合 C++ 内核底层日志提取的微秒级阶段数据 (若有)
+        cpp_stages = TRTEdgeLLMOnDemandBackend._parse_cpp_log_timestamps(stdout_str)
+        if cpp_stages:
+            timing_data.update(cpp_stages)
+
         metric_data = {
             "prompt_tokens": prompt_tokens,
             "generated_tokens": gen_tokens,
@@ -815,6 +821,59 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             "timing_source": timing_source
         }
         return timing_data, metric_data
+
+    @staticmethod
+    def _parse_cpp_log_timestamps(log_text: Optional[str]) -> Dict[str, float]:
+        """从 TensorRT-Edge-LLM 的 C++ 日志时间戳中提取各初始化子阶段微秒级耗时"""
+        if not log_text:
+            return {}
+        ts_pattern = re.compile(r'\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s+\[([A-Z]+)\]\s+\[([^\]]+)\]\s+(.*)')
+        events = []
+        for line in log_text.splitlines():
+            m = ts_pattern.match(line.strip())
+            if m:
+                h, mi, s, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                t_sec = h * 3600 + mi * 60 + s + ms / 1000.0
+                events.append((t_sec, m.group(6), m.group(7)))
+        if not events:
+            return {}
+        t_start = events[0][0]
+        res: Dict[str, float] = {}
+        t_vocab_start = None
+        t_vocab_end = None
+        t_llm_start = None
+        t_vis_start = None
+        t_graph_start = None
+        t_graph_end = None
+        t_init_end = None
+        for t, src, msg in events:
+            if 'loading engine file:' in msg and 'llm.engine' in msg:
+                t_llm_start = t
+            elif 'loading vocab:' in msg or 'loading tokenizer' in msg:
+                t_vocab_start = t
+            elif 'load vocab:' in msg or 'Tokenizer successfully loaded' in msg:
+                t_vocab_end = t
+            elif 'loading engine file:' in msg and 'visual.engine' in msg:
+                t_vis_start = t
+            elif 'captureDecodingCUDAGraph' in src or 'Graph was captured' in msg:
+                if t_graph_start is None:
+                    t_graph_start = t
+                t_graph_end = t
+                t_init_end = t
+            elif 'Tokenizer successfully loaded' in msg or 'Service loop active' in msg or 'VLM in-process engine instantiated' in msg:
+                t_init_end = t
+
+        if t_llm_start and t_vocab_start and t_vocab_start >= t_llm_start:
+            res['cpp_llm_engine_ms'] = round((t_vocab_start - t_llm_start) * 1000.0, 1)
+        if t_vocab_start and t_vocab_end and t_vocab_end >= t_vocab_start:
+            res['cpp_vocab_load_ms'] = round((t_vocab_end - t_vocab_start) * 1000.0, 1)
+        if t_vis_start and t_graph_start and t_graph_start >= t_vis_start:
+            res['cpp_vis_engine_ms'] = round((t_graph_start - t_vis_start) * 1000.0, 1)
+        if t_graph_start and t_graph_end and t_graph_end >= t_graph_start:
+            res['cpp_graph_capture_ms'] = round((t_graph_end - t_graph_start) * 1000.0, 1)
+        if t_init_end and t_init_end >= t_start:
+            res['cpp_total_init_ms'] = round((t_init_end - t_start) * 1000.0, 1)
+        return res
 
     def _init_in_process_engine(self) -> bool:
         """
@@ -1172,6 +1231,19 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     tps_str = f" | 速度: {metric_data['tokens_per_second']:.1f} tps" if metric_data.get('tokens_per_second') else ""
                     fin_str = f" | 退出: {metric_data['finish_reason']}" if metric_data.get('finish_reason') else ""
                     print(f"[*] [TRT-Edge-LLM] C++ 原生按需推理完成 (总计 {timing_data['total_duration_ms']:.1f}ms | 冷启动: {cold_s:.2f}s | 纯推理: {inf_s:.2f}s{stage_str} | 前后处理: {post_s:.2f}s{tps_str}{fin_str}): {parsed.get('summary_text')}")
+                    cpp_stages = {k: v for k, v in timing_data.items() if k.startswith("cpp_")}
+                    if cpp_stages:
+                        print(f"    - [C++ 底层启动各阶段精确耗时]:")
+                        if "cpp_llm_engine_ms" in cpp_stages:
+                            print(f"      * LLM 引擎反序列化 : {cpp_stages['cpp_llm_engine_ms']:.1f} ms ({cpp_stages['cpp_llm_engine_ms']/1000.0:.2f}s)")
+                        if "cpp_vocab_load_ms" in cpp_stages:
+                            print(f"      * 词表加载 (loadVocab) : {cpp_stages['cpp_vocab_load_ms']:.1f} ms ({cpp_stages['cpp_vocab_load_ms']/1000.0:.2f}s)")
+                        if "cpp_vis_engine_ms" in cpp_stages:
+                            print(f"      * Visual 引擎反序列化: {cpp_stages['cpp_vis_engine_ms']:.1f} ms ({cpp_stages['cpp_vis_engine_ms']/1000.0:.2f}s)")
+                        if "cpp_graph_capture_ms" in cpp_stages:
+                            print(f"      * CUDA Graph 预捕获 : {cpp_stages['cpp_graph_capture_ms']:.1f} ms ({cpp_stages['cpp_graph_capture_ms']/1000.0:.2f}s)")
+                        if "cpp_total_init_ms" in cpp_stages:
+                            print(f"      * C++ 内核初始化总计: {cpp_stages['cpp_total_init_ms']:.1f} ms ({cpp_stages['cpp_total_init_ms']/1000.0:.2f}s)")
                     return parsed
                 else:
                     print(f"[!] [TRT-Edge-LLM] 模型已执行完毕 ({proc_elapsed_ms:.1f}ms)，但未能从输出中提取判定结果:")
