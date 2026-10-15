@@ -59,6 +59,46 @@ VLM_API double vlm_get_last_inference_ms(void* handle);
 VLM_API int vlm_get_last_generated_tokens(void* handle);
 
 /**
+ * @brief Get the vision encoder stage GPU time in milliseconds of the most recent vlm_generate call.
+ */
+VLM_API double vlm_get_last_vis_ms(void* handle);
+
+/**
+ * @brief Get the LLM prefill stage GPU time in milliseconds of the most recent vlm_generate call.
+ */
+VLM_API double vlm_get_last_prefill_ms(void* handle);
+
+/**
+ * @brief Get the LLM generation/decoding stage GPU time in milliseconds of the most recent vlm_generate call.
+ */
+VLM_API double vlm_get_last_gen_ms(void* handle);
+
+/**
+ * @brief Get the Time to First Token (TTFT = Vision + LLM Prefill) in milliseconds.
+ */
+VLM_API double vlm_get_last_ttft_ms(void* handle);
+
+/**
+ * @brief Get the average Time Per Output Token (TPOT) in milliseconds.
+ */
+VLM_API double vlm_get_last_tpot_ms(void* handle);
+
+/**
+ * @brief Get the peak memory in MB (Unified Memory on iGPU/Jetson, GPU VRAM on dGPU).
+ */
+VLM_API double vlm_get_peak_memory_mb(void* handle);
+
+/**
+ * @brief Get the number of prompt tokens of the most recent vlm_generate call.
+ */
+VLM_API int vlm_get_last_prompt_tokens(void* handle);
+
+/**
+ * @brief Get the number of image tokens of the most recent vlm_generate call.
+ */
+VLM_API int vlm_get_last_image_tokens(void* handle);
+
+/**
  * @brief Destroy the VLM instance and release 100% of Unified Memory / VRAM back to OS.
  */
 VLM_API void vlm_destroy(void* handle);
@@ -144,6 +184,46 @@ public:
     int getLastGeneratedTokens() const noexcept
     {
         return handle_ ? vlm_get_last_generated_tokens(handle_) : 0;
+    }
+
+    double getLastVisMs() const noexcept
+    {
+        return handle_ ? vlm_get_last_vis_ms(handle_) : 0.0;
+    }
+
+    double getLastPrefillMs() const noexcept
+    {
+        return handle_ ? vlm_get_last_prefill_ms(handle_) : 0.0;
+    }
+
+    double getLastGenMs() const noexcept
+    {
+        return handle_ ? vlm_get_last_gen_ms(handle_) : 0.0;
+    }
+
+    double getLastTtftMs() const noexcept
+    {
+        return handle_ ? vlm_get_last_ttft_ms(handle_) : 0.0;
+    }
+
+    double getLastTpotMs() const noexcept
+    {
+        return handle_ ? vlm_get_last_tpot_ms(handle_) : 0.0;
+    }
+
+    double getPeakMemoryMb() const noexcept
+    {
+        return handle_ ? vlm_get_peak_memory_mb(handle_) : 0.0;
+    }
+
+    int getLastPromptTokens() const noexcept
+    {
+        return handle_ ? vlm_get_last_prompt_tokens(handle_) : 0;
+    }
+
+    int getLastImageTokens() const noexcept
+    {
+        return handle_ ? vlm_get_last_image_tokens(handle_) : 0;
     }
 
     void release()

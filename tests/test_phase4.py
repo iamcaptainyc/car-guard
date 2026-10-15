@@ -1111,6 +1111,22 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
                     return 3450.0
                 elif self.name == "vlm_get_last_generated_tokens":
                     return 38
+                elif self.name == "vlm_get_last_vis_ms":
+                    return 164.87
+                elif self.name == "vlm_get_last_prefill_ms":
+                    return 388.96
+                elif self.name == "vlm_get_last_gen_ms":
+                    return 3018.56
+                elif self.name == "vlm_get_last_ttft_ms":
+                    return 553.83
+                elif self.name == "vlm_get_last_tpot_ms":
+                    return 18.87
+                elif self.name == "vlm_get_peak_memory_mb":
+                    return 1680.08
+                elif self.name == "vlm_get_last_prompt_tokens":
+                    return 1027
+                elif self.name == "vlm_get_last_image_tokens":
+                    return 1008
                 elif self.name == "vlm_destroy":
                     destroyed_handles.append(args[0])
                     return None
@@ -1124,6 +1140,14 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
                 self.vlm_get_cold_start_ms = DummyCtypesFunc("vlm_get_cold_start_ms")
                 self.vlm_get_last_inference_ms = DummyCtypesFunc("vlm_get_last_inference_ms")
                 self.vlm_get_last_generated_tokens = DummyCtypesFunc("vlm_get_last_generated_tokens")
+                self.vlm_get_last_vis_ms = DummyCtypesFunc("vlm_get_last_vis_ms")
+                self.vlm_get_last_prefill_ms = DummyCtypesFunc("vlm_get_last_prefill_ms")
+                self.vlm_get_last_gen_ms = DummyCtypesFunc("vlm_get_last_gen_ms")
+                self.vlm_get_last_ttft_ms = DummyCtypesFunc("vlm_get_last_ttft_ms")
+                self.vlm_get_last_tpot_ms = DummyCtypesFunc("vlm_get_last_tpot_ms")
+                self.vlm_get_peak_memory_mb = DummyCtypesFunc("vlm_get_peak_memory_mb")
+                self.vlm_get_last_prompt_tokens = DummyCtypesFunc("vlm_get_last_prompt_tokens")
+                self.vlm_get_last_image_tokens = DummyCtypesFunc("vlm_get_last_image_tokens")
                 self.vlm_destroy = DummyCtypesFunc("vlm_destroy")
 
         monkeypatch.setattr(ctypes, "CDLL", lambda p: DummyCDLL(p))
@@ -1157,7 +1181,15 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
         t1 = res1["timing_breakdown"]
         assert t1["cold_start_load_ms"] == 5120.0
         assert t1["pure_inference_ms"] == 3450.0
+        assert t1["vision_encoder_gpu_ms"] == 164.87
+        assert t1["llm_prefill_gpu_ms"] == 388.96
+        assert t1["llm_generation_gpu_ms"] == 3018.56
         assert res1["inference_metrics"]["timing_source"] == "INPROCESS_NATIVE_C_API"
+        assert res1["inference_metrics"]["ttft_ms"] == 553.83
+        assert res1["inference_metrics"]["tpot_ms"] == 18.87
+        assert res1["inference_metrics"]["peak_unified_memory_mb"] == 1680.08
+        assert res1["inference_metrics"]["prompt_tokens"] == 1027
+        assert res1["inference_metrics"]["image_tokens"] == 1008
 
         # 2. 第二次推理：0 冷启动常驻直调 (cold_start_load_ms == 0.0)
         res2 = backend.infer(event, keyframes=[dummy_frame])

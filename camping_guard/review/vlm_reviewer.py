@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 import os
 import sys
 import time
+import ctypes
 import json
 import re
 import base64
@@ -1092,16 +1093,9 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             prefill_ms = 0.0
             gen_gpu_ms = pure_inf_ms
             tpot_ms = None
-
-            if hasattr(self._so_lib, "vlm_get_last_ttft_ms"):
-                try:
-                    self._so_lib.vlm_get_last_ttft_ms.argtypes = [ctypes.c_void_p]
-                    self._so_lib.vlm_get_last_ttft_ms.restype = ctypes.c_double
-                    raw_ttft = float(self._so_lib.vlm_get_last_ttft_ms(self._inprocess_handle))
-                    if raw_ttft > 0.0:
-                        ttft_ms = round(raw_ttft, 2)
-                except Exception:
-                    pass
+            prompt_tokens = None
+            image_tokens = None
+            peak_vram_mb = None
 
             if hasattr(self._so_lib, "vlm_get_last_vis_ms"):
                 try:
@@ -1123,13 +1117,76 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 except Exception:
                     pass
 
-            if ttft_ms is not None and pure_inf_ms > ttft_ms:
-                gen_gpu_ms = round(pure_inf_ms - ttft_ms, 2)
-                decode_tokens = max(1, gen_tokens - 1) if gen_tokens else 0
-                if decode_tokens > 0:
-                    tpot_ms = round(gen_gpu_ms / float(decode_tokens), 2)
-            elif tps and tps > 0:
-                tpot_ms = round(1000.0 / tps, 2)
+            if hasattr(self._so_lib, "vlm_get_last_gen_ms"):
+                try:
+                    self._so_lib.vlm_get_last_gen_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_gen_ms.restype = ctypes.c_double
+                    raw_gen = float(self._so_lib.vlm_get_last_gen_ms(self._inprocess_handle))
+                    if raw_gen > 0.0:
+                        gen_gpu_ms = round(raw_gen, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_ttft_ms"):
+                try:
+                    self._so_lib.vlm_get_last_ttft_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_ttft_ms.restype = ctypes.c_double
+                    raw_ttft = float(self._so_lib.vlm_get_last_ttft_ms(self._inprocess_handle))
+                    if raw_ttft > 0.0:
+                        ttft_ms = round(raw_ttft, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_tpot_ms"):
+                try:
+                    self._so_lib.vlm_get_last_tpot_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_tpot_ms.restype = ctypes.c_double
+                    raw_tpot = float(self._so_lib.vlm_get_last_tpot_ms(self._inprocess_handle))
+                    if raw_tpot > 0.0:
+                        tpot_ms = round(raw_tpot, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_peak_memory_mb"):
+                try:
+                    self._so_lib.vlm_get_peak_memory_mb.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_peak_memory_mb.restype = ctypes.c_double
+                    raw_mem = float(self._so_lib.vlm_get_peak_memory_mb(self._inprocess_handle))
+                    if raw_mem > 0.0:
+                        peak_vram_mb = round(raw_mem, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_prompt_tokens"):
+                try:
+                    self._so_lib.vlm_get_last_prompt_tokens.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_prompt_tokens.restype = ctypes.c_int
+                    raw_pt = int(self._so_lib.vlm_get_last_prompt_tokens(self._inprocess_handle))
+                    if raw_pt > 0:
+                        prompt_tokens = raw_pt
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_image_tokens"):
+                try:
+                    self._so_lib.vlm_get_last_image_tokens.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_image_tokens.restype = ctypes.c_int
+                    raw_it = int(self._so_lib.vlm_get_last_image_tokens(self._inprocess_handle))
+                    if raw_it > 0:
+                        image_tokens = raw_it
+                except Exception:
+                    pass
+
+            if tpot_ms is None:
+                if ttft_ms is not None and pure_inf_ms > ttft_ms:
+                    gen_decode_ms = max(0.0, pure_inf_ms - ttft_ms)
+                    decode_tokens = max(1, gen_tokens - 1) if gen_tokens else 0
+                    if decode_tokens > 0:
+                        tpot_ms = round(gen_decode_ms / float(decode_tokens), 2)
+                elif gen_gpu_ms > 0 and gen_tokens and gen_tokens > 1:
+                    tpot_ms = round(gen_gpu_ms / float(gen_tokens - 1), 2)
+                elif tps and tps > 0:
+                    tpot_ms = round(1000.0 / tps, 2)
 
             timing_data = {
                 "cold_start_load_ms": round(cold_start_ms, 2),
@@ -1143,13 +1200,14 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 "total_duration_ms": round(cold_start_ms + preprocess_ms + proc_elapsed_ms + postprocess_ms, 2)
             }
             metric_data = {
-                "prompt_tokens": None,
+                "prompt_tokens": prompt_tokens,
+                "image_tokens": image_tokens,
                 "generated_tokens": gen_tokens,
                 "tokens_per_second": tps,
                 "ttft_ms": ttft_ms,
                 "tpot_ms": tpot_ms,
                 "finish_reason": "stop" if gen_tokens < self.max_tokens else "max-length",
-                "peak_unified_memory_mb": None,
+                "peak_unified_memory_mb": peak_vram_mb,
                 "timing_source": "INPROCESS_NATIVE_C_API"
             }
 

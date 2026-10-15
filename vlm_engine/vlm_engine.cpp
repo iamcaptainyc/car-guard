@@ -9,6 +9,11 @@
 #include "common/logger.h"
 #include "common/stringUtils.h"
 #include "common/trtUtils.h"
+#ifndef _WIN32
+#include "memoryMonitor.h"
+#endif
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -41,6 +46,14 @@ struct VLMEngineContext
     double graphCaptureMs{0.0};
     double lastInferenceMs{0.0};
     int lastGeneratedTokens{0};
+    int lastPromptTokens{0};
+    int lastImageTokens{0};
+    double lastVisMs{0.0};
+    double lastPrefillMs{0.0};
+    double lastGenMs{0.0};
+    double lastTtftMs{0.0};
+    double lastTpotMs{0.0};
+    double peakMemoryMb{0.0};
     std::string lastOutputBuffer;
 };
 } // namespace
@@ -147,6 +160,7 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
 
         if (!graphCaptured)
         {
+            cudaGetLastError(); // Clear sticky error status from failed stream capture
             std::cerr << "[VLMEngine] [Warning] Failed to capture CUDA graph for decoding, proceeding with normal execution." << std::endl;
         }
     }
@@ -176,6 +190,18 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
     {
         return "";
     }
+
+    // Reset previous generation metrics
+    ctx->lastPromptTokens = 0;
+    ctx->lastGeneratedTokens = 0;
+    ctx->lastImageTokens = 0;
+    ctx->lastVisMs = 0.0;
+    ctx->lastPrefillMs = 0.0;
+    ctx->lastGenMs = 0.0;
+    ctx->lastTtftMs = 0.0;
+    ctx->lastTpotMs = 0.0;
+    ctx->peakMemoryMb = 0.0;
+    ctx->lastOutputBuffer.clear();
 
     rt::LLMGenerationRequest req;
     req.temperature = 0.0f;
@@ -214,10 +240,31 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
     chatMessages.push_back(std::move(msg));
     req.requests = {rt::LLMGenerationRequest::Request{chatMessages, imageBuffers, {}}};
 
+    // Baseline counters to track per-request tokens accurately
+    int64_t prevReused = ctx->runtime->getPrefillMetrics().reusedTokens;
+    int64_t prevComputed = ctx->runtime->getPrefillMetrics().computedTokens;
+    int64_t prevImageTokens = ctx->runtime->getMultimodalMetrics().totalImageTokens;
+
+    // Reset timer data for this specific run
+    gTimer.reset();
+
+    // Enable TensorRT-Edge-LLM profiling and start memory monitor
+    setProfilingEnabled(true);
+#ifndef _WIN32
+    MemoryMonitor memoryMonitor;
+    memoryMonitor.start();
+#endif
+
     auto tInf0 = std::chrono::high_resolution_clock::now();
     rt::LLMGenerationResponse resp;
     bool status = ctx->runtime->handleRequest(req, resp, ctx->stream);
     auto tInf1 = std::chrono::high_resolution_clock::now();
+
+    // Stop profiling and memory monitor immediately
+    setProfilingEnabled(false);
+#ifndef _WIN32
+    memoryMonitor.stop();
+#endif
 
     ctx->lastInferenceMs = std::chrono::duration<double, std::milli>(tInf1 - tInf0).count();
 
@@ -238,6 +285,65 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
     {
         ctx->lastGeneratedTokens = 0;
     }
+
+    // Token delta calculations
+    int64_t deltaReused = ctx->runtime->getPrefillMetrics().reusedTokens - prevReused;
+    int64_t deltaComputed = ctx->runtime->getPrefillMetrics().computedTokens - prevComputed;
+    int64_t deltaImageTokens = ctx->runtime->getMultimodalMetrics().totalImageTokens - prevImageTokens;
+
+    ctx->lastPromptTokens = static_cast<int>(deltaReused + deltaComputed);
+    ctx->lastImageTokens = static_cast<int>(deltaImageTokens);
+
+    // Extract GPU microsecond timing from gTimer
+    auto prefillTiming = gTimer.getTimingData(metrics::StageNames::kLLM_PREFILL);
+    auto genTiming = gTimer.getTimingData(metrics::StageNames::kLLM_GENERATION);
+    auto visTiming = gTimer.getTimingData(metrics::StageNames::kVISION_ENCODER);
+    if (!visTiming)
+    {
+        visTiming = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
+    }
+
+    if (visTiming && visTiming->getTotalGpuTimeMs() > 0.0f)
+    {
+        ctx->lastVisMs = static_cast<double>(visTiming->getTotalGpuTimeMs());
+    }
+    if (prefillTiming && prefillTiming->getTotalGpuTimeMs() > 0.0f)
+    {
+        ctx->lastPrefillMs = static_cast<double>(prefillTiming->getTotalGpuTimeMs());
+    }
+    if (genTiming && genTiming->getTotalGpuTimeMs() > 0.0f)
+    {
+        ctx->lastGenMs = static_cast<double>(genTiming->getTotalGpuTimeMs());
+    }
+
+    // TTFT = Vision Encoder + LLM Prefill
+    if (ctx->lastVisMs > 0.0 || ctx->lastPrefillMs > 0.0)
+    {
+        ctx->lastTtftMs = ctx->lastVisMs + ctx->lastPrefillMs;
+    }
+
+    // TPOT: Time Per Output Token
+    if (ctx->lastGeneratedTokens > 1 && ctx->lastGenMs > 0.0)
+    {
+        ctx->lastTpotMs = ctx->lastGenMs / static_cast<double>(ctx->lastGeneratedTokens - 1);
+    }
+    else if (ctx->lastGeneratedTokens > 0 && ctx->lastGenMs > 0.0)
+    {
+        ctx->lastTpotMs = ctx->lastGenMs / static_cast<double>(ctx->lastGeneratedTokens);
+    }
+
+#ifndef _WIN32
+    if (memoryMonitor.isIntegratedGPU())
+    {
+        size_t peakBytes = memoryMonitor.getPeakUnifiedMemory();
+        ctx->peakMemoryMb = static_cast<double>(peakBytes) / (1024.0 * 1024.0);
+    }
+    else
+    {
+        size_t peakBytes = memoryMonitor.getPeakGpuMemory();
+        ctx->peakMemoryMb = static_cast<double>(peakBytes) / (1024.0 * 1024.0);
+    }
+#endif
 
     return ctx->lastOutputBuffer.c_str();
 }
@@ -264,6 +370,54 @@ int vlm_get_last_generated_tokens(void* handle)
 {
     if (!handle) return 0;
     return static_cast<VLMEngineContext*>(handle)->lastGeneratedTokens;
+}
+
+double vlm_get_last_vis_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->lastVisMs;
+}
+
+double vlm_get_last_prefill_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->lastPrefillMs;
+}
+
+double vlm_get_last_gen_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->lastGenMs;
+}
+
+double vlm_get_last_ttft_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->lastTtftMs;
+}
+
+double vlm_get_last_tpot_ms(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->lastTpotMs;
+}
+
+double vlm_get_peak_memory_mb(void* handle)
+{
+    if (!handle) return 0.0;
+    return static_cast<VLMEngineContext*>(handle)->peakMemoryMb;
+}
+
+int vlm_get_last_prompt_tokens(void* handle)
+{
+    if (!handle) return 0;
+    return static_cast<VLMEngineContext*>(handle)->lastPromptTokens;
+}
+
+int vlm_get_last_image_tokens(void* handle)
+{
+    if (!handle) return 0;
+    return static_cast<VLMEngineContext*>(handle)->lastImageTokens;
 }
 
 void vlm_destroy(void* handle)
