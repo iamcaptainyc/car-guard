@@ -148,24 +148,65 @@ class FastPathwayLoadGenerator:
 def main():
     parser = argparse.ArgumentParser(description="显存总线争抢物理假说梯度论证工具")
     parser.add_argument("--so-path", type=str, default="/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/examples/vlm_engine/libvlm_engine.so")
+    parser.add_argument("--build-dir", type=str, default="/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build",
+                        help="TensorRT-Edge-LLM 编译产物目录")
+    parser.add_argument("--plugin-path", type=str, default=None,
+                        help="libNvInfer_edgellm_plugin.so 显式路径")
     parser.add_argument("--model-dir", type=str, default="/home/nvidia/qwen35-orin/models/official-0.8B")
     parser.add_argument("--image", type=str, default="models/sample_keyframe.jpg")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--output", type=str, default="logs/contention_proof_results.json")
     args = parser.parse_args()
 
+    build_dir = Path(args.build_dir).resolve() if args.build_dir else Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build")
     model_dir = Path(args.model_dir).resolve()
     llm_dir = model_dir / "engines" / "llm" if (model_dir / "engines" / "llm").exists() else model_dir / "llm"
     vis_dir = model_dir / "engines" / "visual" if (model_dir / "engines" / "visual").exists() else model_dir / "visual"
+
     so_path = Path(args.so_path).resolve()
     if not so_path.exists():
-        cand_so = Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/lib/libvlm_engine.so")
+        cand_so = build_dir / "lib" / "libvlm_engine.so"
         if cand_so.exists():
             so_path = cand_so
+        elif (build_dir / "examples" / "vlm_engine" / "libvlm_engine.so").exists():
+            so_path = build_dir / "examples" / "vlm_engine" / "libvlm_engine.so"
+
+    # 1. 自动定位与全局预装载 libNvInfer_edgellm_plugin.so
+    plugin_path = Path(args.plugin_path).resolve() if args.plugin_path else None
+    if not plugin_path or not plugin_path.exists():
+        plugin_cands = [
+            build_dir / "libNvInfer_edgellm_plugin.so",
+            build_dir / "lib" / "libNvInfer_edgellm_plugin.so",
+            so_path.parent / "libNvInfer_edgellm_plugin.so",
+            so_path.parent.parent / "libNvInfer_edgellm_plugin.so",
+            so_path.parent.parent.parent / "libNvInfer_edgellm_plugin.so",
+            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so"),
+            Path("/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/lib/libNvInfer_edgellm_plugin.so"),
+        ]
+        for pc in plugin_cands:
+            if pc.is_file():
+                plugin_path = pc.resolve()
+                break
+
+    if plugin_path and plugin_path.exists():
+        print(f"[*] 显式定位插件库: {plugin_path}")
+        os.environ["EDGELLM_PLUGIN_PATH"] = str(plugin_path)
+        # 预先以 RTLD_GLOBAL 全局载入插件动态库，确保 TensorRT 插件注册表完成 causal_conv1d 等算子初始化
+        try:
+            ctypes.CDLL(str(plugin_path), mode=ctypes.RTLD_GLOBAL)
+            print("[+] 已成功全局预装载 libNvInfer_edgellm_plugin.so (TRT 插件注册表就绪)")
+        except Exception as e:
+            print(f"[!] 全局载入插件库异常: {e}")
+
+    # 同时将 build_dir 加入 LD_LIBRARY_PATH
+    if build_dir.exists():
+        curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if str(build_dir) not in curr_ld:
+            os.environ["LD_LIBRARY_PATH"] = f"{build_dir}:{curr_ld}" if curr_ld else str(build_dir)
 
     img_path = Path(args.image).resolve()
     if not img_path.exists():
-        for cand in [Path("test.jpg"), Path("models/sample.jpg"), Path("/home/nvidia/test.jpg")]:
+        for cand in [Path("test.jpg"), Path("models/sample.jpg"), Path("/home/nvidia/test.jpg"), Path("test_proof.jpg")]:
             if cand.exists():
                 img_path = cand.resolve()
                 break

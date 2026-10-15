@@ -184,9 +184,27 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
             "libNvInfer_edgellm_plugin.so",
             "../libNvInfer_edgellm_plugin.so",
             "../../libNvInfer_edgellm_plugin.so",
-            "build/libNvInfer_edgellm_plugin.so"
+            "build/libNvInfer_edgellm_plugin.so",
+            "/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so",
+            "/home/nvidia/qwen35-orin/TensorRT-Edge-LLM/build/lib/libNvInfer_edgellm_plugin.so"
         };
 #ifndef _WIN32
+        try
+        {
+            Dl_info dlInfo;
+            if (dladdr(reinterpret_cast<void*>(vlm_create), &dlInfo) && dlInfo.dli_fname)
+            {
+                auto soPath = std::filesystem::canonical(dlInfo.dli_fname);
+                auto soDir = soPath.parent_path();
+                candPaths.push_back((soDir / "libNvInfer_edgellm_plugin.so").string());
+                candPaths.push_back((soDir / "../libNvInfer_edgellm_plugin.so").string());
+                candPaths.push_back((soDir / "../../libNvInfer_edgellm_plugin.so").string());
+                candPaths.push_back((soDir / "../../../libNvInfer_edgellm_plugin.so").string());
+            }
+        }
+        catch (...)
+        {
+        }
         try
         {
             if (std::filesystem::exists("/proc/self/exe"))
