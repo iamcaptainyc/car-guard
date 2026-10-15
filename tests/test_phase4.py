@@ -853,6 +853,7 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     assert "avg_llm_prefill_gpu_ms" in aggr
     assert "avg_llm_generation_gpu_ms" in aggr
     assert "avg_ttft_ms" in aggr
+    assert "avg_tpot_ms" in aggr
     assert aggr["avg_pure_inference_sec"] >= 0.04
 
     # 3. 验证 JSON 报告导出
@@ -1160,6 +1161,8 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
         assert t1["llm_prefill_gpu_ms"] > 0
         assert res1["inference_metrics"]["ttft_ms"] is not None
         assert res1["inference_metrics"]["ttft_ms"] > 0
+        assert res1["inference_metrics"]["tpot_ms"] is not None
+        assert res1["inference_metrics"]["tpot_ms"] > 0
 
         # 2. 第二次推理：0 冷启动常驻直调 (cold_start_load_ms == 0.0)
         res2 = backend.infer(event, keyframes=[dummy_frame])
