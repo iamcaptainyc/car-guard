@@ -139,9 +139,6 @@ def test_subprocess_mode(
         "--multimodalEngineDir", str(vis_dir),
         "--inputFile", str(input_file),
         "--outputFile", str(output_file),
-        "--temperature", "0.0",
-        "--topP", "1.0",
-        "--topK", "1",
         "--maxGenerateLength", str(max_tokens),
         "--dumpProfile",
         "--profileOutputFile", str(profile_file)
@@ -157,6 +154,13 @@ def test_subprocess_mode(
     t0 = time.perf_counter()
     res = subprocess.run(cmd, env=env, timeout=120.0, capture_output=True, text=True)
     wall_ms = (time.perf_counter() - t0) * 1000.0
+
+    if res.returncode != 0:
+        print(f"[!] 方案 A (llm_inference) 执行异常 (退出码 {res.returncode}):")
+        if res.stderr:
+            print(f"    - stderr:\n{res.stderr.strip()[:800]}")
+        if res.stdout:
+            print(f"    - stdout:\n{res.stdout.strip()[:800]}")
 
     profile_data = {}
     if profile_file.exists():
@@ -178,8 +182,9 @@ def test_subprocess_mode(
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # 解析 C++ 底层精确时间戳
-    cpp_stages = parse_cpp_log_timestamps(res.stdout)
+    # 解析 C++ 底层精确时间戳 (合并 stdout 和 stderr)
+    combined_log = (res.stdout or "") + "\n" + (res.stderr or "")
+    cpp_stages = parse_cpp_log_timestamps(combined_log)
 
     # 解析 GPU 纯推理时间
     vis_gpu_ms = 0.0
