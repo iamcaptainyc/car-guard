@@ -1049,12 +1049,16 @@ def run_video_pipeline(
 
         # 4. 算法研判分发 (铁律 1：100% 帧框同源合一，当前帧同步推理并直接在该帧上绘制 OpenCV 检测框与骨骼点)
         camera_dict = {camera_id: frame}
-        run_detection = (frame_idx % detect_interval == 0) if detect_interval > 1 else True
-        tick_res = engine.process_tick(
-            camera_frames=camera_dict,
-            raw_detections=None if run_detection else [],
-            current_time=video_timestamp
-        )
+        try:
+            tick_res = engine.process_tick(
+                camera_frames=camera_dict,
+                raw_detections=None if run_detection else [],
+                current_time=video_timestamp
+            )
+        except Exception as e:
+            print(f"[!] [Pipeline] process_tick 发生异常 (帧 #{frame_idx}): {e}")
+            tick_res = {"threat_level": "L0", "e2e_ms": 0.0}
+
         active_targets = engine.active_targets
         active_rois = engine.active_roi_disturbances
         ai_e2e_ms = tick_res.get("e2e_ms", 0.0)

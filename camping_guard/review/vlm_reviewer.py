@@ -341,6 +341,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         self._so_lib = None
         self._is_first_inprocess_run = True
         self._inprocess_cold_start_ms = 0.0
+        self._is_shutting_down = False
 
         atexit.register(self.shutdown)
 
@@ -1601,6 +1602,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
     def shutdown(self):
         """停止后台拉起的 vlm_server 进程与释放 libvlm_engine.so 原生句柄"""
+        self._is_shutting_down = True
         if self._inprocess_handle is not None and self._so_lib is not None:
             try:
                 self._so_lib.vlm_destroy(self._inprocess_handle)
@@ -1633,6 +1635,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         keyframes: Optional[List[np.ndarray]] = None
     ) -> Dict[str, Any]:
         """端侧 VLM 视觉推理与语义战报生成入口"""
+        if getattr(self, "_is_shutting_down", False):
+            res = self.fallback_mock.infer(event_record, keyframes)
+            res["backend_source"] = "FALLBACK_RULE_MOCK (系统正在关闭释放)"
+            return res
+
         self._probe_paths()
 
         # 模式分支 A: 原生共享库进程内直调模式 (最高优先级，零网络协议开销、零 TCP 握手与端口探测超时，首帧 5s 物理反序列化加载，后续 3.5s 内存直调)

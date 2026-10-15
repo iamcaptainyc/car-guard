@@ -466,3 +466,35 @@ void vlm_destroy(void* handle)
 2. **首帧装载全面反超子进程**：首帧总冷启动耗时从 **10.72s 压减至 4.00s**（比官方子进程的 5.27s 快了 **1.27 秒**，成功省去了系统级进程拉起与磁盘文件交互成本）；
 3. **常驻直调保持 3 秒级极速**：第 2 次及后续复用时，冷启动耗时完全归零，端到端总耗时稳定在 **3.08 秒**（其中纯硬件计算 2.98 秒）；
 4. **架构升级圆满达成**：成功实现了在保证代码完全兼容官方 `llm_inference` 底层规范的前提下，达成了车载低功耗按需调用的最佳工程实践。
+
+---
+
+## 六、 完整系统联调中的多流碰撞问题与深度修复
+
+在将修复后的 `libvlm_engine.so` 接入完整车载守卫系统 (`run_jetson_guard.py --realtime`) 联调时，触发了多线程 CUDA 运行时的深层冲突：
+
+### 1. 现场报错日志
+```text
+RuntimeError: CUDA error: operation would make the legacy stream depend on a capturing blocking stream
+```
+伴随 C++ 端：
+```text
+[WARNING] [trtUtils.cpp:42:captureTRTCudaGraph] Failed to capture CUDA graph: CUDA runtime error in cudaStreamEndCapture(stream, &graph): operation failed due to a previous error during capture
+```
+
+### 2. 根因剖析：CUDA Graph 捕获与 Legacy Stream 的隐式依赖冲突
+1. **阻塞流（Blocking Stream）陷阱**：
+   在 `vlm_engine.cpp` 中最初使用 `cudaStreamCreate(&ctx->stream)` 创建 CUDA 流，默认标志为 `cudaStreamDefault`（即阻塞流）。在 CUDA 调度规范中，任何提交到 Legacy 默认流（Stream 0）的操作，都会隐式与该进程内所有的活跃阻塞流进行同步。
+2. **图捕获期间的同步禁令**：
+   当后台 VLM 线程调用 `captureDecodingCUDAGraph(ctx->stream)` 进入图捕获模式时，CUDA 严禁任何外部操作与捕获流同步。
+3. **主线程 DtoH 内存拷贝踩坑**：
+   主视频检测管线（YOLO/Pose）在主线程运行，其在 `trt_engine.py` 中推理完成后执行 `[t.cpu().numpy() for t in out_tensors]`。因位于 `with torch.cuda.stream(stream):` 上下文之外，PyTorch 默认在 Stream 0 (Legacy Stream) 上执行 DtoH 搬运。
+   Stream 0 尝试与捕获中的阻塞流隐式同步，CUDA 驱动直接触发安全断言并抛出 `operation would make the legacy stream depend on a capturing blocking stream`，导致主检测线程异常崩溃。
+
+### 3. 三重安全防御修复措施
+* **防御 1（C++ 内核隔离）**：`vlm_engine.cpp` 改用 `cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking)` 创建**非阻塞流**，彻底切断与 Stream 0 的隐式同步依赖；同时提供环境变量 `VLM_DISABLE_CUDA_GRAPH=1` 允许动态旁路图捕获。
+* **防御 2（Python 作用域约束）**：`camping_guard/perception/trt_engine.py` 将 `end_event.synchronize()` 与 `t.cpu().numpy()` 严格收敛至 `with torch.cuda.stream(stream):` 专有流内，杜绝任何阶段触碰 Legacy 默认流。
+* **防御 3（生命周期与鲁棒性加固）**：
+  * `TRTEdgeLLMOnDemandBackend` 增加 `_is_shutting_down` 原子标志，防止主线程退出释放句柄后工作线程再次尝试请求；
+  * `test_video_pipeline.py` 对单帧 `engine.process_tick` 增加异常容灾保护，确保偶发单帧异常不影响车载哨兵系统的 7×24h 连续守护。
+

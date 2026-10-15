@@ -375,20 +375,19 @@ class TRTInferenceSession:
                 self.context.execute_async_v2(bindings, stream.cuda_stream)
 
             end_event.record(stream)
+            end_event.synchronize()
+            try:
+                self.last_gpu_compute_ms = float(start_event.elapsed_time(end_event))
+            except Exception:
+                self.last_gpu_compute_ms = 0.0
 
-        end_event.synchronize()
-        try:
-            self.last_gpu_compute_ms = float(start_event.elapsed_time(end_event))
-        except Exception:
-            self.last_gpu_compute_ms = 0.0
+            # 严格按照 output_names 请求顺序返回结果，完全对齐 ONNXRuntime 规范
+            if output_names:
+                out_tensors = [out_buffers_dict[name] for name in output_names if name in out_buffers_dict]
+            else:
+                out_tensors = [out_buffers_dict[meta.name] for meta in self.outputs]
 
-        # 严格按照 output_names 请求顺序返回结果，完全对齐 ONNXRuntime 规范
-        if output_names:
-            out_tensors = [out_buffers_dict[name] for name in output_names if name in out_buffers_dict]
-        else:
-            out_tensors = [out_buffers_dict[meta.name] for meta in self.outputs]
-
-        return [t.cpu().numpy() for t in out_tensors]
+            return [t.cpu().numpy() for t in out_tensors]
 
     def _run_cuda_python(self, input_feed: Dict[str, np.ndarray], output_names: Optional[List[str]]) -> List[np.ndarray]:
         from cuda import cudart

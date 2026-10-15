@@ -97,7 +97,7 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
     auto ctx = std::make_unique<VLMEngineContext>();
     ctx->pluginHandles = loadEdgellmPluginLib();
 
-    CUDA_CHECK(cudaStreamCreate(&ctx->stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
 
     auto t0 = std::chrono::high_resolution_clock::now();
     std::unordered_map<std::string, std::string> loraMap;
@@ -128,15 +128,27 @@ void* vlm_create(const char* engineDir, const char* multimodalEngineDir)
     auto tRuntime = std::chrono::high_resolution_clock::now();
     double runtimeLoadMs = std::chrono::duration<double, std::milli>(tRuntime - t0).count();
 
-    // Capture decoding CUDA graph (matching llm_inference standard process)
-    auto tGraph0 = std::chrono::high_resolution_clock::now();
-    bool graphCaptured = ctx->runtime->captureDecodingCUDAGraph(ctx->stream);
-    auto tGraph1 = std::chrono::high_resolution_clock::now();
-    ctx->graphCaptureMs = std::chrono::duration<double, std::milli>(tGraph1 - tGraph0).count();
-
-    if (!graphCaptured)
+    // Check if CUDA Graph capture is disabled via environment variable (default enabled)
+    bool enableGraph = true;
+    const char* envNoGraph = std::getenv("VLM_DISABLE_CUDA_GRAPH");
+    if (envNoGraph && (std::strcmp(envNoGraph, "1") == 0 || std::strcmp(envNoGraph, "true") == 0))
     {
-        std::cerr << "[VLMEngine] [Warning] Failed to capture CUDA graph for decoding, proceeding with normal execution." << std::endl;
+        enableGraph = false;
+        std::cout << "[VLMEngine] CUDA Graph capture explicitly disabled via VLM_DISABLE_CUDA_GRAPH." << std::endl;
+    }
+
+    if (enableGraph)
+    {
+        // Capture decoding CUDA graph (matching llm_inference standard process)
+        auto tGraph0 = std::chrono::high_resolution_clock::now();
+        bool graphCaptured = ctx->runtime->captureDecodingCUDAGraph(ctx->stream);
+        auto tGraph1 = std::chrono::high_resolution_clock::now();
+        ctx->graphCaptureMs = std::chrono::duration<double, std::milli>(tGraph1 - tGraph0).count();
+
+        if (!graphCaptured)
+        {
+            std::cerr << "[VLMEngine] [Warning] Failed to capture CUDA graph for decoding, proceeding with normal execution." << std::endl;
+        }
     }
 
     auto tTotal = std::chrono::high_resolution_clock::now();
