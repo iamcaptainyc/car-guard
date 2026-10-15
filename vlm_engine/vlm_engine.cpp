@@ -10,7 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/trtUtils.h"
 #ifndef _WIN32
-#include "memoryMonitor.h"
+#include <sys/resource.h>
 #endif
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -19,6 +19,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +37,113 @@ using namespace trt_edgellm;
 
 namespace
 {
+//! Check if the current CUDA device is an integrated GPU (iGPU / Jetson Orin)
+bool isIntegratedGPU()
+{
+    int device{-1};
+    if (cudaGetDevice(&device) != cudaSuccess)
+    {
+        return false;
+    }
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess)
+    {
+        return false;
+    }
+    return integrated == 1;
+}
+
+//! Get current GPU free and total memory
+std::pair<size_t, size_t> queryGpuMemory()
+{
+    size_t freeMem{0}, totalMem{0};
+    cudaMemGetInfo(&freeMem, &totalMem);
+    return {freeMem, totalMem};
+}
+
+//! Read process RSS in bytes on Linux
+size_t getProcessRssBytes()
+{
+#ifndef _WIN32
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0)
+    {
+        // ru_maxrss is in kilobytes on Linux, convert to bytes
+        return static_cast<size_t>(usage.ru_maxrss) * 1024;
+    }
+#endif
+    return 0;
+}
+
+//! Self-contained memory monitor built with -fPIC (matches official MemoryMonitor behavior without non-PIC link error)
+class InProcessMemoryMonitor
+{
+public:
+    InProcessMemoryMonitor() = default;
+    ~InProcessMemoryMonitor()
+    {
+        stop();
+    }
+
+    void start()
+    {
+        mIsIGPU = isIntegratedGPU();
+        mPeakGpuMemory = 0;
+        mActive = true;
+
+        if (!mIsIGPU)
+        {
+            auto [freeMem, totalMem] = queryGpuMemory();
+            mBaselineGpuFreeMemory = freeMem;
+            mWorker = std::thread([this]() {
+                while (mActive.load())
+                {
+                    auto [currentFreeMem, totalMem] = queryGpuMemory();
+                    size_t gpuMemoryUsed = (currentFreeMem < mBaselineGpuFreeMemory)
+                        ? (mBaselineGpuFreeMemory - currentFreeMem)
+                        : 0;
+                    if (mPeakGpuMemory < gpuMemoryUsed)
+                    {
+                        mPeakGpuMemory = gpuMemoryUsed;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            });
+        }
+    }
+
+    void stop()
+    {
+        mActive = false;
+        if (mWorker.joinable())
+        {
+            mWorker.join();
+        }
+    }
+
+    size_t getPeakUnifiedMemory() const
+    {
+        return getProcessRssBytes();
+    }
+
+    size_t getPeakGpuMemory() const
+    {
+        return mPeakGpuMemory.load();
+    }
+
+    bool isIGPU() const
+    {
+        return mIsIGPU;
+    }
+
+private:
+    std::atomic<bool> mActive{false};
+    std::atomic<size_t> mPeakGpuMemory{0};
+    size_t mBaselineGpuFreeMemory{0};
+    bool mIsIGPU{false};
+    std::thread mWorker;
+};
+
 struct VLMEngineContext
 {
     std::unique_ptr<void, DlDeleter> pluginHandles{nullptr};
@@ -250,10 +359,8 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
 
     // Enable TensorRT-Edge-LLM profiling and start memory monitor
     setProfilingEnabled(true);
-#ifndef _WIN32
-    MemoryMonitor memoryMonitor;
+    InProcessMemoryMonitor memoryMonitor;
     memoryMonitor.start();
-#endif
 
     auto tInf0 = std::chrono::high_resolution_clock::now();
     rt::LLMGenerationResponse resp;
@@ -262,9 +369,7 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
 
     // Stop profiling and memory monitor immediately
     setProfilingEnabled(false);
-#ifndef _WIN32
     memoryMonitor.stop();
-#endif
 
     ctx->lastInferenceMs = std::chrono::duration<double, std::milli>(tInf1 - tInf0).count();
 
@@ -332,8 +437,7 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
         ctx->lastTpotMs = ctx->lastGenMs / static_cast<double>(ctx->lastGeneratedTokens);
     }
 
-#ifndef _WIN32
-    if (memoryMonitor.isIntegratedGPU())
+    if (memoryMonitor.isIGPU())
     {
         size_t peakBytes = memoryMonitor.getPeakUnifiedMemory();
         ctx->peakMemoryMb = static_cast<double>(peakBytes) / (1024.0 * 1024.0);
@@ -343,7 +447,6 @@ const char* vlm_generate(void* handle, const char* prompt, const char* imagePath
         size_t peakBytes = memoryMonitor.getPeakGpuMemory();
         ctx->peakMemoryMb = static_cast<double>(peakBytes) / (1024.0 * 1024.0);
     }
-#endif
 
     return ctx->lastOutputBuffer.c_str();
 }

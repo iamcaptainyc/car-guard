@@ -17,13 +17,11 @@ target_include_directories(${TARGET_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${COMMON_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/cpp
-        ${CMAKE_SOURCE_DIR}/examples/utils
 )
 
 target_link_libraries(${TARGET_NAME}
     PUBLIC
         edgellmCore
-        exampleUtils
         commonLibraryExt
 )
 
