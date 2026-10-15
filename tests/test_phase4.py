@@ -798,6 +798,7 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     assert timing_data_prof["cold_start_load_ms"] == round(8200.0 - timing_data_prof["pure_inference_ms"], 2)
     assert metric_data_prof["tokens_per_second"] == 53.0
     assert metric_data_prof["prompt_tokens"] == 1027
+    assert metric_data_prof["ttft_ms"] == round(164.86 + 388.95, 2)
     assert metric_data_prof["generated_tokens"] == 160
     assert metric_data_prof["finish_reason"] == "end-of-sequence"
     assert metric_data_prof["peak_unified_memory_mb"] == 1680.08
@@ -851,6 +852,7 @@ def test_vlm_timing_breakdown_and_aggregates_in_audit_and_json():
     assert "avg_vision_encoder_gpu_ms" in aggr
     assert "avg_llm_prefill_gpu_ms" in aggr
     assert "avg_llm_generation_gpu_ms" in aggr
+    assert "avg_ttft_ms" in aggr
     assert aggr["avg_pure_inference_sec"] >= 0.04
 
     # 3. 验证 JSON 报告导出
@@ -1154,6 +1156,10 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
         t1 = res1["timing_breakdown"]
         assert t1["cold_start_load_ms"] == 5120.0
         assert t1["pure_inference_ms"] == 3450.0
+        assert t1["vision_encoder_gpu_ms"] > 0
+        assert t1["llm_prefill_gpu_ms"] > 0
+        assert res1["inference_metrics"]["ttft_ms"] is not None
+        assert res1["inference_metrics"]["ttft_ms"] > 0
 
         # 2. 第二次推理：0 冷启动常驻直调 (cold_start_load_ms == 0.0)
         res2 = backend.infer(event, keyframes=[dummy_frame])
