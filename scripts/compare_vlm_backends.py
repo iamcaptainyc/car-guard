@@ -292,8 +292,8 @@ def test_subprocess_mode(
     }
 
 
-def start_contention_process(fps: float = 22.0) -> Optional[subprocess.Popen]:
-    """启动一个独立的后台轻量级 CUDA 负载进程，模拟快通路双 YOLO (22 FPS) 的显存与计算争抢"""
+def start_contention_process(fps: float = 22.0, burn_ms: float = 28.5) -> Optional[subprocess.Popen]:
+    """启动一个独立的后台 CUDA 负载进程，模拟快通路 YOLO (22 FPS, 单帧 28.5ms) 的显存与计算争抢"""
     script_content = f"""
 import time
 import os
@@ -301,14 +301,18 @@ try:
     import torch
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
-        # 分配约 16MB 的 FP16 矩阵，模拟 YOLO11s 的特征图卷积吞吐与显存总线争抢
-        a = torch.randn(1024, 1024, device=device, dtype=torch.float16)
-        b = torch.randn(1024, 1024, device=device, dtype=torch.float16)
+        stream = torch.cuda.Stream()
+        # 2048x2048 FP16 矩阵，模拟 YOLO11s 的特征图卷积吞吐与显存总线争抢
+        a = torch.randn(2048, 2048, device=device, dtype=torch.float16)
+        b = torch.randn(2048, 2048, device=device, dtype=torch.float16)
         interval = 1.0 / {fps}
+        burn_sec = {burn_ms} / 1000.0
         while True:
             t0 = time.perf_counter()
-            c = torch.matmul(a, b)
-            torch.cuda.synchronize()
+            with torch.cuda.stream(stream):
+                while (time.perf_counter() - t0) < burn_sec:
+                    c = torch.matmul(a, b)
+                torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
             rem = interval - elapsed
             if rem > 0:
