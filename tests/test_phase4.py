@@ -1157,12 +1157,7 @@ def test_trt_edgellm_inprocess_so_mocked(monkeypatch):
         t1 = res1["timing_breakdown"]
         assert t1["cold_start_load_ms"] == 5120.0
         assert t1["pure_inference_ms"] == 3450.0
-        assert t1["vision_encoder_gpu_ms"] > 0
-        assert t1["llm_prefill_gpu_ms"] > 0
-        assert res1["inference_metrics"]["ttft_ms"] is not None
-        assert res1["inference_metrics"]["ttft_ms"] > 0
-        assert res1["inference_metrics"]["tpot_ms"] is not None
-        assert res1["inference_metrics"]["tpot_ms"] > 0
+        assert res1["inference_metrics"]["timing_source"] == "INPROCESS_NATIVE_C_API"
 
         # 2. 第二次推理：0 冷启动常驻直调 (cold_start_load_ms == 0.0)
         res2 = backend.infer(event, keyframes=[dummy_frame])

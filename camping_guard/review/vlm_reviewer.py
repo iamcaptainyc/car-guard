@@ -1084,43 +1084,52 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             if gen_tokens <= 0 and raw_res_str:
                 gen_tokens = max(1, len([c for c in raw_res_str if ord(c) > 127]) + len([w for w in raw_res_str.split() if any(ord(c) <= 127 for c in w)]))
 
-            # 细化拆解硬件推理各阶段耗时与首字时间 (TTFT)
-            has_image = bool(img_bytes)
-            if has_image and pure_inf_ms > 400.0 and gen_tokens > 0:
-                # 视觉多模态推理：ViT 编码器耗时与 LLM Prefill 阶段
-                # 基于 Jetson Orin 硬件实测基准 (Qwen-0.8B ViT 640x640: ~164ms, Prefill: ~394ms, TTFT 基准 ~558ms)
-                vis_ms = 163.6
-                if pure_inf_ms > 600.0:
-                    ttft_ms = round(min(557.8, pure_inf_ms * 0.35), 2)
-                    prefill_ms = round(max(0.0, ttft_ms - vis_ms), 2)
-                    gen_gpu_ms = round(max(0.0, pure_inf_ms - ttft_ms), 2)
-                else:
-                    ttft_ms = round(pure_inf_ms * 0.45, 2)
-                    vis_ms = round(min(vis_ms, ttft_ms * 0.4), 2)
-                    prefill_ms = round(max(0.0, ttft_ms - vis_ms), 2)
-                    gen_gpu_ms = round(max(0.0, pure_inf_ms - ttft_ms), 2)
-            elif pure_inf_ms > 0.0 and gen_tokens > 0:
-                # 纯文本推理：无需视觉编码，Prefill 约占 20%
-                vis_ms = 0.0
-                ttft_ms = round(min(pure_inf_ms * 0.25, 300.0), 2)
-                prefill_ms = ttft_ms
-                gen_gpu_ms = round(max(0.0, pure_inf_ms - ttft_ms), 2)
-            else:
-                vis_ms = 0.0
-                prefill_ms = 0.0
-                gen_gpu_ms = round(pure_inf_ms, 2)
-                ttft_ms = None
-
             tps = round(float(gen_tokens) / (pure_inf_ms / 1000.0), 2) if (gen_tokens and pure_inf_ms > 0) else None
 
-            # 计算纯解码单字生成延迟 TPOT (Time Per Output Token: 单个 token 解码耗时)
-            decode_tokens = max(1, gen_tokens - 1) if gen_tokens else 0
-            if gen_gpu_ms > 0 and decode_tokens > 0:
-                tpot_ms = round(gen_gpu_ms / float(decode_tokens), 2)
+            # 严格读取 C++ 共享库导出的真实阶段耗时 (若 C-API 提供了相应硬件打点接口)
+            ttft_ms = None
+            vis_ms = 0.0
+            prefill_ms = 0.0
+            gen_gpu_ms = pure_inf_ms
+            tpot_ms = None
+
+            if hasattr(self._so_lib, "vlm_get_last_ttft_ms"):
+                try:
+                    self._so_lib.vlm_get_last_ttft_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_ttft_ms.restype = ctypes.c_double
+                    raw_ttft = float(self._so_lib.vlm_get_last_ttft_ms(self._inprocess_handle))
+                    if raw_ttft > 0.0:
+                        ttft_ms = round(raw_ttft, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_vis_ms"):
+                try:
+                    self._so_lib.vlm_get_last_vis_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_vis_ms.restype = ctypes.c_double
+                    raw_vis = float(self._so_lib.vlm_get_last_vis_ms(self._inprocess_handle))
+                    if raw_vis > 0.0:
+                        vis_ms = round(raw_vis, 2)
+                except Exception:
+                    pass
+
+            if hasattr(self._so_lib, "vlm_get_last_prefill_ms"):
+                try:
+                    self._so_lib.vlm_get_last_prefill_ms.argtypes = [ctypes.c_void_p]
+                    self._so_lib.vlm_get_last_prefill_ms.restype = ctypes.c_double
+                    raw_pre = float(self._so_lib.vlm_get_last_prefill_ms(self._inprocess_handle))
+                    if raw_pre > 0.0:
+                        prefill_ms = round(raw_pre, 2)
+                except Exception:
+                    pass
+
+            if ttft_ms is not None and pure_inf_ms > ttft_ms:
+                gen_gpu_ms = round(pure_inf_ms - ttft_ms, 2)
+                decode_tokens = max(1, gen_tokens - 1) if gen_tokens else 0
+                if decode_tokens > 0:
+                    tpot_ms = round(gen_gpu_ms / float(decode_tokens), 2)
             elif tps and tps > 0:
                 tpot_ms = round(1000.0 / tps, 2)
-            else:
-                tpot_ms = None
 
             timing_data = {
                 "cold_start_load_ms": round(cold_start_ms, 2),
@@ -1134,13 +1143,13 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 "total_duration_ms": round(cold_start_ms + preprocess_ms + proc_elapsed_ms + postprocess_ms, 2)
             }
             metric_data = {
-                "prompt_tokens": 1150 if has_image else 150,
+                "prompt_tokens": None,
                 "generated_tokens": gen_tokens,
                 "tokens_per_second": tps,
                 "ttft_ms": ttft_ms,
                 "tpot_ms": tpot_ms,
                 "finish_reason": "stop" if gen_tokens < self.max_tokens else "max-length",
-                "peak_unified_memory_mb": 1680.08,
+                "peak_unified_memory_mb": None,
                 "timing_source": "INPROCESS_NATIVE_C_API"
             }
 
