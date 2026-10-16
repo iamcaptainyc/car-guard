@@ -281,8 +281,8 @@ def main():
                         help="显式指定端侧 Qwen-VLM Visual 视觉编码器引擎目录或路径 (如 /home/nvidia/models/Qwen3.5-0.8B/engines/visual)")
     parser.add_argument("--vlm-timeout", type=float, default=35.0,
                         help="端侧 Qwen-VLM 推理超时时间 (秒，默认 35.0，为 Orin 引擎反序列化加载与生成留足裕量)")
-    parser.add_argument("--vlm-max-tokens", type=int, default=128,
-                        help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 128)")
+    parser.add_argument("--vlm-max-tokens", type=int, default=256,
+                        help="端侧 Qwen-VLM 单次复核最大生成 Token 长度 (默认 256)")
     parser.add_argument("--vlm-mode", type=str, default="auto", choices=["auto", "inprocess", "server", "subprocess"],
                         help="端侧 VLM 推理模式: auto (优先使用 libvlm_engine.so 原生直调，次选 vlm_server，自动降级 llm_inference), inprocess (强制原生 C-API 进程内直调), server (强制常驻服务模式), subprocess (传统一次性 llm_inference 进程模式)")
     parser.add_argument("--vlm-engine-so", type=str, default=None,
@@ -441,7 +441,7 @@ def main():
         edgellm_dir=args.edgellm_dir,
         build_dir=args.edgellm_dir,
         vlm_timeout=args.vlm_timeout,
-        vlm_max_tokens=getattr(args, "vlm_max_tokens", 128),
+        vlm_max_tokens=getattr(args, "vlm_max_tokens", 256),
         vlm_mode=getattr(args, "vlm_mode", "auto"),
         vlm_engine_so=getattr(args, "vlm_engine_so", None),
         vlm_server_port=getattr(args, "vlm_server_port", 8090),

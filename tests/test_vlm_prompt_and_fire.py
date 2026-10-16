@@ -200,3 +200,47 @@ def test_mock_backend_fire_output():
     assert res["action_category"] == "FIRE_SMOKE"
     assert "火" in res["visual_description"] or "烟" in res["visual_description"]
     assert "火" in res["summary_text"] or "烟" in res["summary_text"]
+
+
+def test_truncated_json_healing_user_case():
+    """验证用户现场遭遇的未闭合残缺 JSON 能够被智能修补，不退化为 OTHER 也不包含代码片段"""
+    backend = TRTEdgeLLMOnDemandBackend(mode="mock")
+
+    # 用户在 Orin 终端实际打印的被 max_tokens 截断的原始字符串
+    truncated_raw = """{
+  "visual_description": "车内视角，一名身穿深色西装的男子在车内站立，双手高举点燃的火焰，火焰呈橙黄色，周围有烟雾弥漫，火光在车内及地面投射出明亮的光斑，背景可见模糊的室内灯光与装饰物。",
+  "action_category": "FIRE_SMOKE",
+  "confidence": 0.98,
+  "is_human_contact": false,
+  "is_false_alarm": false,
+  "threat_escalation": "CONFIRM",
+  "summary_text": "检测到车内男子高举火焰，火势浓烟"""
+
+    raw_text, parsed = backend._extract_vlm_response(truncated_raw, truncated_raw)
+    assert parsed is not None, "残缺 JSON 必须被自动修补成功"
+    assert parsed["action_category"] == "FIRE_SMOKE", "动作类别必须正确解析为 FIRE_SMOKE，严禁退化为 OTHER"
+    assert "火焰" in parsed["visual_description"], "必须正确提取完整的画面视觉描述"
+    assert "{" not in parsed["visual_description"], "画面描述中严禁包含 JSON 花括号或语法标记"
+    assert parsed["confidence"] == 0.98
+    assert parsed["is_human_contact"] is False
+    assert parsed["is_false_alarm"] is False
+    assert "CONFIRM" in parsed["threat_escalation"]
+    assert "火焰" in parsed["summary_text"]
+    assert "{" not in parsed["summary_text"]
+
+
+def test_truncated_json_regex_fallback():
+    """验证即使 JSON 结构被严重破坏，正则表达式也能安全兜底提取已知字段"""
+    backend = TRTEdgeLLMOnDemandBackend(mode="mock")
+
+    badly_broken = """{
+  "visual_description": "一名可疑人员正在窥视副驾驶车窗",
+  "action_category": "CABIN_PEEKING
+"""
+
+    raw_text, parsed = backend._extract_vlm_response(badly_broken, badly_broken)
+    assert parsed is not None
+    assert parsed["action_category"] == "CABIN_PEEKING"
+    assert "窥视" in parsed["visual_description"]
+    assert "{" not in parsed["visual_description"]
+

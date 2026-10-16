@@ -230,7 +230,7 @@ class LocalHttpVLMBackend(VLMBackendBase):
                 {"role": "user", "content": user_content}
             ],
             "temperature": 0.1,
-            "max_tokens": 150
+            "max_tokens": 256
         }
 
         try:
@@ -311,7 +311,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
         timeout: float = 35.0,
-        max_tokens: int = 160,
+        max_tokens: int = 256,
         mode: str = "auto",
         server_bin: Optional[str] = None,
         server_host: str = "127.0.0.1",
@@ -700,15 +700,140 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             if "visual_description" not in p and "scene_description" in p:
                 p["visual_description"] = p["scene_description"]
             if "visual_description" in p and isinstance(p["visual_description"], str):
-                p["visual_description"] = p["visual_description"][:60]
+                p["visual_description"] = " ".join(p["visual_description"].split())[:120]
             if "summary_text" in p and isinstance(p["summary_text"], str):
-                p["summary_text"] = p["summary_text"][:50]
+                p["summary_text"] = " ".join(p["summary_text"].split())[:80]
             return p
 
-        # 4. 尝试从候选文本中提取并解析 JSON
+        def _try_repair_truncated_json(raw: str) -> Optional[dict]:
+            """智能修补因 max_tokens 达到上限而被截断的残缺 JSON (如未闭合双引号或花括号)"""
+            if "{" not in raw:
+                return None
+            s = raw.find("{")
+            body = raw[s:].strip()
+            # 尝试常见截断修补后缀
+            repair_suffixes = [
+                "",          # 完整 JSON
+                "}",         # 仅缺右大括号
+                '"\n}',      # 字符串尾部未闭合且缺右括号
+                '"}',        # 紧凑闭合
+                '""}',       # 空串补齐
+                '\n}'
+            ]
+            for suff in repair_suffixes:
+                cand = body + suff
+                try:
+                    p = json.loads(cand)
+                    if isinstance(p, dict) and any(k in p for k in ["action_category", "visual_description", "summary_text"]):
+                        return _norm_vlm_dict(p)
+                except Exception:
+                    pass
+
+            # 若截断在某个逗号之后，回退至上一完整字段逗号处并尝试闭合
+            last_comma = body.rfind(",")
+            if last_comma > 0:
+                truncated_at_comma = body[:last_comma].strip() + "\n}"
+                try:
+                    p = json.loads(truncated_at_comma)
+                    if isinstance(p, dict) and any(k in p for k in ["action_category", "visual_description", "summary_text"]):
+                        return _norm_vlm_dict(p)
+                except Exception:
+                    pass
+            return None
+
+        def _regex_extract_vlm_dict(text: str) -> Optional[dict]:
+            """当 JSON 截断严重或结构损坏时，通过精准正则表达式反查已生成的核心研判字段"""
+            if not any(k in text for k in ["action_category", "visual_description", "summary_text", "threat_escalation"]):
+                return None
+            res: Dict[str, Any] = {}
+
+            # 1. action_category
+            m_act = re.search(r'["\']action_category["\']\s*:\s*["\']?([A-Za-z0-9_]+)["\']?', text)
+            if m_act:
+                act = m_act.group(1).strip()
+                known_actions = [
+                    "FIRE_SMOKE", "VEHICLE_COLLISION", "DOOR_HANDLE_TAMPERING",
+                    "CABIN_PEEKING", "VEHICLE_BODY_KICK", "ROOF_THEFT",
+                    "WILD_BEAST_DETECTED", "WILD_ANIMAL_ATTACK", "FALSE_ALARM", "OTHER"
+                ]
+                if act not in known_actions:
+                    act_up = act.upper()
+                    if any(k in act_up for k in ["FIRE", "SMOKE"]):
+                        act = "FIRE_SMOKE"
+                    elif any(k in act_up for k in ["COLLISION", "CRASH"]):
+                        act = "VEHICLE_COLLISION"
+                    elif any(k in act_up for k in ["DOOR", "HANDLE", "TAMPER"]):
+                        act = "DOOR_HANDLE_TAMPERING"
+                    elif any(k in act_up for k in ["CABIN", "PEEK"]):
+                        act = "CABIN_PEEKING"
+                    elif any(k in act_up for k in ["FALSE", "ALARM"]):
+                        act = "FALSE_ALARM"
+                    else:
+                        act = "OTHER"
+                res["action_category"] = act
+
+            # 2. visual_description
+            m_vis = re.search(r'["\']visual_description["\']\s*:\s*["\']([^"\'\r\n]+)', text)
+            if m_vis:
+                res["visual_description"] = m_vis.group(1).strip()
+
+            # 3. summary_text
+            m_sum = re.search(r'["\']summary_text["\']\s*:\s*["\']([^"\'\r\n]+)', text)
+            if m_sum:
+                res["summary_text"] = m_sum.group(1).strip()
+
+            # 4. confidence
+            m_conf = re.search(r'["\']confidence["\']\s*:\s*([0-9.]+)', text)
+            if m_conf:
+                try:
+                    res["confidence"] = float(m_conf.group(1))
+                except Exception:
+                    res["confidence"] = 0.90
+            else:
+                res["confidence"] = 0.90
+
+            # 5. is_human_contact
+            m_hc = re.search(r'["\']is_human_contact["\']\s*:\s*(true|false)', text, re.I)
+            if m_hc:
+                res["is_human_contact"] = (m_hc.group(1).lower() == "true")
+            else:
+                res["is_human_contact"] = False
+
+            # 6. is_false_alarm
+            m_fa = re.search(r'["\']is_false_alarm["\']\s*:\s*(true|false)', text, re.I)
+            if m_fa:
+                res["is_false_alarm"] = (m_fa.group(1).lower() == "true")
+            else:
+                res["is_false_alarm"] = False
+
+            # 7. threat_escalation
+            m_esc = re.search(r'["\']threat_escalation["\']\s*:\s*["\']?([A-Za-z0-9_]+)["\']?', text)
+            if m_esc:
+                esc = m_esc.group(1).strip().upper()
+                if "UPGRADE" in esc or "CONFIRM" in esc:
+                    res["threat_escalation"] = "CONFIRM_OR_UPGRADE"
+                elif "DOWNGRADE" in esc:
+                    res["threat_escalation"] = "DOWNGRADE_TO_L1"
+                else:
+                    res["threat_escalation"] = "MAINTAIN"
+            else:
+                res["threat_escalation"] = "MAINTAIN"
+
+            if "action_category" in res or "visual_description" in res or "summary_text" in res:
+                res.setdefault("action_category", "OTHER")
+                res.setdefault("confidence", 0.90)
+                res.setdefault("is_human_contact", False)
+                res.setdefault("is_false_alarm", False)
+                res.setdefault("threat_escalation", "MAINTAIN")
+                if "summary_text" not in res:
+                    res["summary_text"] = res.get("visual_description", "端侧 VLM 研判")
+                return _norm_vlm_dict(res)
+            return None
+
+        # 4. 尝试从候选文本中提取并解析完整或修补后的 JSON
         for txt in cand_texts:
             raw_text = txt.strip()
-            # 尝试 markdown json 块
+            # 4.1 尝试 markdown json 块
             if "```" in raw_text:
                 parts = raw_text.split("```")
                 for part in parts:
@@ -724,7 +849,12 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                                 return txt, _norm_vlm_dict(parsed)
                         except Exception:
                             pass
-            # 尝试直接 {...}
+                    # 尝试修补 markdown 内截断 JSON
+                    repaired = _try_repair_truncated_json(sub)
+                    if repaired:
+                        return txt, repaired
+
+            # 4.2 尝试标准 {...} 提取
             if "{" in raw_text and "}" in raw_text:
                 s = raw_text.find("{")
                 e = raw_text.rfind("}") + 1
@@ -734,6 +864,16 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         return txt, _norm_vlm_dict(parsed)
                 except Exception:
                     pass
+
+            # 4.3 尝试智能修补截断的残缺 JSON (如结尾缺少引号或右大括号)
+            repaired = _try_repair_truncated_json(raw_text)
+            if repaired:
+                return txt, repaired
+
+            # 4.4 尝试正则表达式提取已知合法字段
+            extracted = _regex_extract_vlm_dict(raw_text)
+            if extracted:
+                return txt, extracted
 
         # 5. 宽松容错：若含有合法 JSON 但未完全匹配上述字段
         for txt in cand_texts:
@@ -757,15 +897,19 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             for prefix in ["Output:", "Generation:", "Response:", "Assistant:"]:
                 if clean.startswith(prefix):
                     clean = clean[len(prefix):].strip()
+            # 严格防卫：如果文本是未闭合的 JSON 语法代码片段，禁止当作纯文本截取
+            if clean.startswith("{") or '"visual_description"' in clean or '"action_category"' in clean:
+                continue
             if len(clean) >= 6 and not clean.startswith("Command") and not clean.startswith("[*]") and not clean.startswith("[!]"):
+                clean_one_line = " ".join(clean.split())
                 return txt, {
-                    "visual_description": clean[:30],
+                    "visual_description": clean_one_line[:50],
                     "action_category": "OTHER",
                     "confidence": 0.90,
                     "is_human_contact": False,
                     "is_false_alarm": False,
                     "threat_escalation": "MAINTAIN",
-                    "summary_text": clean[:50]
+                    "summary_text": clean_one_line[:50]
                 }
 
         return None, None
