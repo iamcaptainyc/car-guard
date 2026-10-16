@@ -718,6 +718,9 @@ class CampingGuardEngine:
                     highest_action = collision_action
                     threat_description = collision_desc
                     has_contact_confirmed = has_contact_confirmed or collision_contact
+                    if target_for_threat is None and self.active_targets:
+                        sorted_targets = sorted(self.active_targets, key=lambda t: t.ground_dist)
+                        target_for_threat = sorted_targets[0]
 
             # 极近距离 (<0.5m) 绝对兜底：任何目标进入 0.5m 内绝不可判定为 L0 安全
             threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
@@ -766,17 +769,110 @@ class CampingGuardEngine:
         )
 
         # 12. 慢通路异步 VLM 复核 (阶段 2.2 / 阶段 4)
+        roi_clip_locked = False
         with self.profiler.profile_stage("VLM_Dispatch"):
+            is_roi_event = len(self.active_roi_disturbances) > 0
             if self.vlm_reviewer.should_trigger_vlm(
                 category_conf=target_for_threat.confidence if target_for_threat else 1.0,
                 is_unknown_obstacle=False,
                 fast_path_threat=highest_threat,
                 action_type=highest_action,
                 has_contact_signal=has_contact_confirmed,
-                is_zone3_roi_event=(len(self.active_roi_disturbances) > 0)
+                is_zone3_roi_event=is_roi_event
             ):
-                kframes = [primary_frame] if primary_frame is not None else []
-                vlm_res = self.vlm_reviewer.review_event_async(event_record, keyframes=kframes)
+                # 针对车身部件 ROI 扰动微动，提取扰动时间点前后 1.0s 窗口的 5 帧时序画面 (5 FPS) 送检复核
+                if is_roi_event:
+                    kframes = self.recorder.get_temporal_window_frames(
+                        center_time=current_time,
+                        window_sec=1.0,
+                        target_fps=5.0,
+                        target_count=5
+                    )
+                    if not kframes and primary_frame is not None:
+                        kframes = [primary_frame]
+                else:
+                    kframes = [primary_frame] if primary_frame is not None else []
+
+                roi_event_id = event_record.event_id
+                vlm_callback = None
+
+                # 若为车身部件扰动微动：立即从扰动时间点启动试探性录制 (遵循统一录制规则: 事前 10s + 事后 20s)
+                if is_roi_event:
+                    # 检查是否已有活跃的切片正在录制 (避免连发帧重复生成切片)
+                    has_active_pending = False
+                    if self._last_locked_event_id:
+                        pending_clip = self.recorder.pending_clips.get(self._last_locked_event_id)
+                        if pending_clip and not pending_clip.is_finalized:
+                            has_active_pending = True
+
+                    if not has_active_pending:
+                        roi_clip_locked = True
+                        sig = self.recorder.lock_event_clip(
+                            event_id=roi_event_id,
+                            threat_level_str=event_record.threat_level.value,
+                            trigger_time=current_time,
+                            event_record=event_record
+                        )
+                        self._last_locked_event_id = roi_event_id
+                        self._last_locked_time = current_time
+                        event_record.hash_signature = sig
+                        video_filename = f"{roi_event_id}_{event_record.threat_level.value.replace(' ', '_')}.mp4"
+                        event_record.video_clip_path = str(self.recorder.storage_dir / video_filename)
+                        self.historical_threat_events.append(event_record)
+
+                        print(f"[*] [ROI-Monitor] 监测到车身部件扰动微动: {disturbed_rois} | 触发时间: {current_time:.3f}s")
+                        print(f"[*] [ROI-Monitor] 立即从扰动点启动试探性录制 [{roi_event_id}], 提取前后 1.0s 窗口 5 帧时序画面 (5 FPS) 送检 VLM 复核...")
+
+                        def _on_roi_vlm_completed(vlm_result: Dict[str, Any]):
+                            action_cat = vlm_result.get("action_category", "")
+                            is_false_alarm = bool(vlm_result.get("is_false_alarm", False))
+                            final_threat = vlm_result.get("final_threat", ThreatLevel.L1_NOTICE)
+                            threat_esc = str(vlm_result.get("threat_escalation", ""))
+
+                            high_risk_actions = {
+                                "DOOR_HANDLE_TAMPERING", "DOOR_HANDLE_PULL", "EQUIPMENT_THEFT",
+                                "VEHICLE_COLLISION", "FIRE_SMOKE", "HUMAN_TAMPERING",
+                                ActionType.DOOR_HANDLE_PULL.value, ActionType.EQUIPMENT_THEFT.value,
+                                ActionType.VEHICLE_COLLISION.value, ActionType.FIRE_SMOKE.value
+                            }
+
+                            # 高危判定：非误报，且动作命中高危分类、或者仲裁维持/升级至 L2/L3
+                            is_high_risk = (
+                                not is_false_alarm
+                                and (
+                                    action_cat in high_risk_actions
+                                    or final_threat in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL, "L2 预警", "L3 紧急"]
+                                    or "CONFIRM" in threat_esc
+                                    or "MAINTAIN" in threat_esc
+                                )
+                            )
+
+                            # 物理接触硬件信号 (CAN/IMU) 绝对保护：有接触绝不可视作误报丢弃
+                            if event_record.has_contact_signal:
+                                is_high_risk = True
+
+                            if is_high_risk:
+                                print(f"[+] [ROI-Review] VLM 复核确认为真实高危风险 ({action_cat} | 等级: {final_threat})，继续遵循统一规则存证录制")
+                                if hasattr(self.recorder, 'update_clip_metadata'):
+                                    self.recorder.update_clip_metadata(roi_event_id, {
+                                        "vlm_summary": vlm_result.get("summary_text", ""),
+                                        "vlm_action": action_cat,
+                                        "vlm_verified": True
+                                    })
+                            else:
+                                print(f"[-] [ROI-Review] VLM 复核判定为良性扰动/假阳性 ({action_cat} | 等级: {final_threat} | 误报: {is_false_alarm})，立即丢弃试探性录制切片: {roi_event_id}")
+                                self.recorder.discard_clip(roi_event_id)
+                                if self._last_locked_event_id == roi_event_id:
+                                    self._last_locked_event_id = None
+                                self.historical_threat_events = [ev for ev in self.historical_threat_events if ev.event_id != roi_event_id]
+
+                        vlm_callback = _on_roi_vlm_completed
+
+                vlm_res = self.vlm_reviewer.review_event_async(
+                    event_record,
+                    keyframes=kframes,
+                    callback=vlm_callback
+                )
                 self.vlm_summaries.append(vlm_res)
                 if len(self.vlm_summaries) > 200:
                     self.vlm_summaries = self.vlm_summaries[-200:]
@@ -803,7 +899,9 @@ class CampingGuardEngine:
                 # 存证事件去重与防抖合并机制：
                 # 持续高危期间避免在每一帧重复创建独立录像切片，而是复用/延展当前活跃录制切片
                 need_new_clip = True
-                if self._last_locked_event_id:
+                if roi_clip_locked:
+                    need_new_clip = False
+                elif self._last_locked_event_id:
                     pending_clip = self.recorder.pending_clips.get(self._last_locked_event_id)
                     if pending_clip and not pending_clip.is_finalized:
                         need_new_clip = False

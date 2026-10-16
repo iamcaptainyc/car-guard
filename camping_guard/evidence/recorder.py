@@ -384,6 +384,81 @@ class EvidenceRecorder:
             if pending and hasattr(pending, 'event_metadata'):
                 pending.event_metadata.update(updates)
 
+    def discard_clip(self, event_id: str) -> bool:
+        """
+        丢弃/取消指定事件录像切片 (如经 VLM 语义复核为假阳性/非高危，立即撤销录制并释放内存)
+        :param event_id: 待丢弃的事件 ID
+        :return: 是否成功丢弃
+        """
+        with self._lock:
+            pending = self.pending_clips.pop(event_id, None)
+            if pending is not None:
+                pending.free_frames()
+                # 级联清理可能已在 locked_evidence 中的临时记录
+                self.locked_evidence = [ev for ev in self.locked_evidence if ev.get("event_id") != event_id]
+                # 清理若已在磁盘生成的对应前缀临时文件
+                for ext in [".mp4", ".avi"]:
+                    for f in self.storage_dir.glob(f"{event_id}*{ext}"):
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+                return True
+        return False
+
+    def get_temporal_window_frames(
+        self,
+        center_time: float,
+        window_sec: float = 1.0,
+        target_fps: float = 5.0,
+        target_count: int = 5
+    ) -> List[np.ndarray]:
+        """
+        从环形视频缓冲区中提取指定时间点前后 (默认 [center_time - window_sec, center_time]) 的多帧画面，
+        按目标帧率 (默认 5 FPS, 共 5 帧) 均匀重采样并解码为 BGR numpy array 返回，供 VLM 进行时序复核。
+        :param center_time: 扰动发生的时间戳 (秒)
+        :param window_sec: 提取时间窗长度 (默认 1.0 秒)
+        :param target_fps: 目标抽帧率 (默认 5.0 FPS)
+        :param target_count: 目标输出帧数 (默认 5 帧)
+        :return: 解码后的连续帧列表 [frame_0, ..., frame_4]
+        """
+        with self._lock:
+            if not self.ring_buffer:
+                return []
+            buffer_snapshot = list(self.ring_buffer)
+
+        # 时间窗口：以 center_time 为基准，取向前 1.0s 至当刻
+        t_min = center_time - window_sec
+        t_max = center_time + (window_sec * 0.1)
+
+        candidates = [pair for pair in buffer_snapshot if t_min <= pair[0] <= t_max]
+
+        # 若窗口内帧不足 (如刚开机)，向左放宽取最近的若干帧
+        if len(candidates) < target_count:
+            candidates = buffer_snapshot[-max(target_count * 2, 10):]
+
+        if not candidates:
+            return []
+
+        # 按时间均匀抽取 target_count 帧
+        if len(candidates) <= target_count:
+            chosen = [pair[1] for pair in candidates]
+        else:
+            indices = np.linspace(0, len(candidates) - 1, target_count, dtype=int)
+            chosen = [candidates[i][1] for i in indices]
+
+        # 解码可能压缩为 JPEG 字节流的帧为标准 BGR 图像
+        decoded_frames: List[np.ndarray] = []
+        for f in chosen:
+            if isinstance(f, np.ndarray) and f.ndim == 1:
+                dec = cv2.imdecode(f, cv2.IMREAD_COLOR)
+                if dec is not None:
+                    decoded_frames.append(dec)
+            elif isinstance(f, np.ndarray) and f.ndim >= 2:
+                decoded_frames.append(f.copy())
+
+        return decoded_frames
+
     def finalize_clip(self, event_id: str) -> Optional[Dict[str, Any]]:
         """
         完成并封装事件录像 (事前 10s + 事后 20s 拼装)

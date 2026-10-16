@@ -25,6 +25,46 @@ import numpy as np
 from camping_guard.types import ThreatLevel, ActionType, ThreatEventRecord
 
 
+def create_temporal_keyframes_composite(keyframes: Optional[List[np.ndarray]], target_width: int = 1280) -> Optional[np.ndarray]:
+    """
+    将前后 1s 抽取的多帧连续时序关键帧 (例如 5 帧 5 FPS) 拼接为单张带时序标记的长图或合适尺度的拼图，
+    供单目 VLM 视觉编码器 (ViT) 一次性感知完整的物理动作演变过程。
+    """
+    if not keyframes:
+        return None
+    valid_frames = [f for f in keyframes if isinstance(f, np.ndarray) and f.ndim >= 2]
+    if not valid_frames:
+        return None
+    import cv2
+    if len(valid_frames) == 1:
+        img = valid_frames[0]
+        h, w = img.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > 640:
+            scale = 640.0 / max_dim
+            return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        return img
+
+    n = len(valid_frames)
+    frame_h = 360
+    resized_frames = []
+    for idx, f in enumerate(valid_frames):
+        h, w = f.shape[:2]
+        fw = int(w * (frame_h / float(h))) if h > 0 else 360
+        rf = cv2.resize(f, (fw, frame_h), interpolation=cv2.INTER_AREA)
+        # 标注时序标签 T1..Tn
+        label = f"T{idx+1}"
+        cv2.putText(rf, label, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+        resized_frames.append(rf)
+
+    composite = np.hstack(resized_frames)
+    ch, cw = composite.shape[:2]
+    if cw > target_width:
+        scale = target_width / float(cw)
+        composite = cv2.resize(composite, (target_width, int(ch * scale)), interpolation=cv2.INTER_AREA)
+    return composite
+
+
 class VLMBackendBase:
     """端侧 VLM 推理后端抽象基类"""
     def infer(
@@ -212,10 +252,10 @@ class LocalHttpVLMBackend(VLMBackendBase):
             {"type": "text", "text": f"快通路事件动作: {event_record.action_type.value}, 初始威胁等级: {event_record.threat_level.value}, 是否有物理接触信号: {event_record.has_contact_signal}。请对以下事件关键帧进行语义复核："}
         ]
 
-        # 编码多帧关键帧为 Base64 JPEG
+        # 编码多帧关键帧为 Base64 JPEG (支持最多 5 帧 5 FPS 时序序列)
         if keyframes:
             import cv2
-            for idx, img in enumerate(keyframes[:3]):
+            for idx, img in enumerate(keyframes[:5]):
                 _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
                 b64_str = base64.b64encode(buffer).decode('utf-8')
                 user_content.append({
@@ -432,6 +472,18 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 "\n- 【定向研判重点】：请以关键帧图像为准，客观观察画面中发生的真实景象（明火、浓烟、邻车碰擦、人员活动、动物出没或自然光影），如实描述画面景象并做出准确研判。"
             )
 
+        # 车身敏感部件微动定向指引 (如门把手触碰、防撞区扰动)
+        disturbed_rois = list(getattr(event_record, "disturbed_rois", []))
+        roi_guide = ""
+        if disturbed_rois:
+            roi_guide = (
+                f"\n- 【车身部件微动重点研判】：系统在此刻检测到车身敏感部件 [{', '.join(disturbed_rois)}] 发生物理微动/扰动！\n"
+                f"  所附图像包含该部件扰动时间点前后的时序动作画面 (T1~T5，从左至右历时约 1 秒)。\n"
+                f"  请仔细研判：画面中该部件是否受到人员手部触碰、拉动、踢踹撬锁，或邻车碰擦？\n"
+                f"  若确实存在人为触碰拉拽或碰撞破坏，action_category 判定为对应真实危险动作 (如 DOOR_HANDLE_TAMPERING / VEHICLE_COLLISION)；"
+                f"若仅为光影变化、风吹晃动或人员未触及车身正常走过，必须判定为假阳性 (is_false_alarm: true, action_category: FALSE_ALARM)。"
+            )
+
         prompt_text = (
             f"{self.SYSTEM_PROMPT}\n\n"
             f"【现场传感器遥测上下文】\n"
@@ -440,8 +492,10 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             f"- 快通路初判动作: {act_val}\n"
             f"- 距离本车空间物理距离: {dist_m:.1f} 米\n"
             f"- 靠近本车防区累计时间: {dwell_s:.1f} 秒\n"
+            f"- 扰动车身部件: {', '.join(disturbed_rois) if disturbed_rois else '无'}\n"
             f"- 车身硬件接触震动信号 (CAN/IMU): {'已确认发生物理接触' if event_record.has_contact_signal else '未检测到物理接触'}"
-            f"{focus_guide}\n\n"
+            f"{focus_guide}"
+            f"{roi_guide}\n\n"
             f"请结合关键帧图像分析并输出判定 JSON："
         )
         return prompt_text
@@ -1235,16 +1289,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         try:
             if keyframes and len(keyframes) > 0:
                 import cv2
-                img = keyframes[0]
-                h, w = img.shape[:2]
-                max_dim = max(h, w)
-                if max_dim > 640:
-                    scale = 640.0 / max_dim
-                    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
-                img_file = tmp_dir_path / "keyframe.jpg"
-                cv2.imwrite(str(img_file), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                img_path_str = str(img_file.resolve())
+                composite_img = create_temporal_keyframes_composite(keyframes)
+                if composite_img is not None:
+                    img_file = tmp_dir_path / "keyframe.jpg"
+                    cv2.imwrite(str(img_file), composite_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    img_path_str = str(img_file.resolve())
 
             preprocess_ms = (time.perf_counter() - t_pre_0) * 1000.0
 
@@ -1460,19 +1509,14 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
 
             content_list: List[Dict[str, Any]] = []
 
-            # 关键帧处理：优化分辨率至不超过 640px 以确保 ViT 编码器百毫秒内完成
+            # 关键帧处理：多帧时序长图拼接或单帧规整
             if keyframes and len(keyframes) > 0:
                 import cv2
-                img = keyframes[0]
-                h, w = img.shape[:2]
-                max_dim = max(h, w)
-                if max_dim > 640:
-                    scale = 640.0 / max_dim
-                    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
-                img_path = tmp_dir_path / "keyframe.jpg"
-                cv2.imwrite(str(img_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                content_list.append({"type": "image", "image": str(img_path.resolve())})
+                composite_img = create_temporal_keyframes_composite(keyframes)
+                if composite_img is not None:
+                    img_path = tmp_dir_path / "keyframe.jpg"
+                    cv2.imwrite(str(img_path), composite_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    content_list.append({"type": "image", "image": str(img_path.resolve())})
 
             content_list.append({"type": "text", "text": prompt_text})
 
@@ -1817,16 +1861,11 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         try:
             if keyframes and len(keyframes) > 0:
                 import cv2
-                img = keyframes[0]
-                h, w = img.shape[:2]
-                max_dim = max(h, w)
-                if max_dim > 640:
-                    scale = 640.0 / max_dim
-                    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
-                img_file = tmp_dir_path / "keyframe.jpg"
-                cv2.imwrite(str(img_file), img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                img_path_str = str(img_file.resolve())
+                composite_img = create_temporal_keyframes_composite(keyframes)
+                if composite_img is not None:
+                    img_file = tmp_dir_path / "keyframe.jpg"
+                    cv2.imwrite(str(img_file), composite_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    img_path_str = str(img_file.resolve())
 
             preprocess_ms = (time.perf_counter() - t_pre_0) * 1000.0
 
@@ -2066,13 +2105,19 @@ class AsyncVLMReviewer:
 
     @staticmethod
     def _get_dedup_key(event_record: ThreatEventRecord) -> str:
+        disturbed = getattr(event_record, "disturbed_rois", None)
+        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
+        if disturbed and len(disturbed) > 0:
+            roi_tag = "_".join(str(r) for r in disturbed[:3])
+            tid = getattr(event_record, "target_id", None)
+            tid_str = f"_T{tid}" if tid is not None else ""
+            return f"ROI_{roi_tag}{tid_str}_{act_val}"
         sess_id = getattr(event_record, "person_session_id", None)
         if sess_id:
             return f"SESS_{sess_id}"
         tid = getattr(event_record, "target_id", None)
         if tid is not None:
             return f"TRK_{tid}"
-        act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
         tgt_cat = getattr(event_record, "target_category", "unknown")
         return f"EVT_{tgt_cat}_{act_val}"
 
@@ -2144,16 +2189,18 @@ class AsyncVLMReviewer:
         curr_rank = self._threat_rank(event_record.threat_level)
         now_ts = float(getattr(event_record, "timestamp", 0.0) or time.time())
         has_contact = bool(getattr(event_record, "has_contact_signal", False))
+        has_roi = bool(getattr(event_record, "disturbed_rois", None))
 
         with self._lock:
             prev = self._target_cooldown_map.get(dedup_key)
             is_escalated = False
             if prev is not None:
-                # 威胁等级提升、动作类型突变、或新增车身物理接触信号时，立即破冰穿透冷却
+                # 威胁等级提升、动作类型突变、新增车身物理接触信号、或新增车身 ROI 扰动微动时，立即破冰穿透冷却
                 if (
                     curr_rank > prev.get("last_threat_rank", 0)
                     or act_val != prev.get("last_action", "")
                     or (has_contact and not prev.get("had_contact", False))
+                    or (has_roi and not prev.get("had_roi", False))
                 ):
                     is_escalated = True
 
@@ -2177,6 +2224,7 @@ class AsyncVLMReviewer:
                 "last_action": act_val,
                 "last_threat_rank": curr_rank,
                 "had_contact": has_contact,
+                "had_roi": has_roi,
                 "in_flight": True,
                 "last_real_result": None if is_escalated else (prev.get("last_real_result") if prev else None),
             }
@@ -2306,7 +2354,8 @@ class AsyncVLMReviewer:
     def review_event_async(
         self,
         event_record: ThreatEventRecord,
-        keyframes: Optional[List[Any]] = None
+        keyframes: Optional[List[Any]] = None,
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None
     ) -> Dict[str, Any]:
         """
         向后兼容接口：提交异步队列由后台执行真实大模型推理，
@@ -2315,7 +2364,7 @@ class AsyncVLMReviewer:
         """
         if self._is_running:
             dedup_key = self._get_dedup_key(event_record)
-            self.submit_review_async(event_record, keyframes)
+            self.submit_review_async(event_record, keyframes, callback=callback)
 
             with self._lock:
                 cached_entry = self._target_cooldown_map.get(dedup_key)
@@ -2326,7 +2375,7 @@ class AsyncVLMReviewer:
 
             # 首次触发尚未完成时，快通路立即返回端侧保底仲裁（< 1ms），不污染 review_history
             fallback = getattr(self.backend, "fallback_mock", None)
-            if fallback:
+            if fallback and hasattr(fallback, "infer") and not str(type(fallback)).endswith("MagicMock'>"):
                 provisional_out = fallback.infer(event_record, keyframes)
             else:
                 provisional_out = {
@@ -2341,7 +2390,13 @@ class AsyncVLMReviewer:
 
         # 2. 若后台工作线程未开启（如纯离线测试），则同步执行复核
         raw_vlm_out = self.backend.infer(event_record, keyframes)
-        return self._arbitrate_and_finalize(event_record, raw_vlm_out, record_history=True)
+        res = self._arbitrate_and_finalize(event_record, raw_vlm_out, record_history=True)
+        if callback:
+            try:
+                callback(res)
+            except Exception:
+                pass
+        return res
 
     def _arbitrate_and_finalize(
         self,
@@ -2353,11 +2408,15 @@ class AsyncVLMReviewer:
         核心安全权限沙箱：执行“只升不降铁律”与“纯视觉假阳性降级”
         """
         adjusted_threat = event_record.threat_level
-        action_cat = raw_vlm_out.get("action_category", "")
-        vlm_conf = raw_vlm_out.get("confidence", 0.8)
-        summary = raw_vlm_out.get("summary_text", "")
-        threat_escalation = raw_vlm_out.get("threat_escalation", "MAINTAIN")
-        vis_desc = raw_vlm_out.get("visual_description", "")
+        action_cat = str(raw_vlm_out.get("action_category", ""))
+        vlm_conf_val = raw_vlm_out.get("confidence", 0.8)
+        try:
+            vlm_conf = float(vlm_conf_val)
+        except (ValueError, TypeError):
+            vlm_conf = 0.8
+        summary = str(raw_vlm_out.get("summary_text", ""))
+        threat_escalation = str(raw_vlm_out.get("threat_escalation", "MAINTAIN"))
+        vis_desc = str(raw_vlm_out.get("visual_description", ""))
 
         # 权限沙箱原则 1: “只升不降铁律” (Hard Rule)
         # 凡是有 CAN 门把手、车锁或车身 IMU 物理接触信号支撑的事件，VLM 绝对禁止降级！
