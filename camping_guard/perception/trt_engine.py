@@ -149,10 +149,16 @@ class TRTInferenceSession:
         with open(self.engine_path, "rb") as f:
             runtime = trt.Runtime(logger)
             if self.dla_core is not None:
+                core_val = int(self.dla_core)
                 try:
-                    runtime.dla_core = int(self.dla_core)
+                    if hasattr(runtime, "DLA_core"):
+                        runtime.DLA_core = core_val
+                    elif hasattr(runtime, "dla_core"):
+                        runtime.dla_core = core_val
+                    elif hasattr(runtime, "set_dla_core"):
+                        runtime.set_dla_core(core_val)
                 except Exception as ex:
-                    print(f"[TRTInferenceSession] 设置 runtime.dla_core={self.dla_core} 提示: {ex}")
+                    pass
             self.engine = runtime.deserialize_cuda_engine(f.read())
 
         if self.engine is None:
