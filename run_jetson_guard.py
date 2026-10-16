@@ -300,7 +300,8 @@ def main():
                         help="主目标检测器输入分辨率 (如 640 或 1280，默认自动探测模型输入维度)")
     parser.add_argument("--fire-size", type=int, default=None,
                         help="火焰检测器输入分辨率 (如 640 或 1280，默认自动探测模型输入维度)")
-    parser.add_argument("--max-frames", type=int, default=None, help="最大测试评估帧数 (达到后自动结束)")
+    parser.add_argument("--no-fire", action="store_true", default=False,
+                        help="显式关闭火焰检测并发 (默认开启)")
     parser.add_argument("--vlm-throttle", dest="vlm_throttle", action="store_true", default=True,
                         help="启用慢通路 VLM 复核时动态自适应降频让步机制 (方案 A，默认开启)")
     parser.add_argument("--no-vlm-throttle", dest="vlm_throttle", action="store_false",
@@ -329,7 +330,7 @@ def main():
         custom_cls=args.cls_model,
         custom_pose=args.pose,
         custom_fire=args.fire_detector,
-        enable_fire=not args.no_fire
+        enable_fire=not getattr(args, "no_fire", False)
     )
     # 统一主检测器与二级动物细分类器 (自由指定 YOLO 或 MegaDetector)
     chosen_det = args.detector or (str(engines["detector"]) if engines["detector"] else None)
@@ -429,7 +430,7 @@ def main():
         vlm_server_bin=getattr(args, "vlm_server_bin", None),
         cls_onnx_path=chosen_cls,
         fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] and str(engines["fire_det"]) != "builtin:VisualFlameDetector" else None),
-        enable_fire=not args.no_fire,
+        enable_fire=not getattr(args, "no_fire", False),
         detector_size=args.detector_size,
         fire_size=args.fire_size,
         vlm_throttle_enabled=getattr(args, "vlm_throttle", True),
