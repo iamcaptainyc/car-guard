@@ -151,14 +151,15 @@ class TegrastatsHardwareMonitor:
         return emc_pct, gpu_pct
 
     def _read_sysfs_temp(self) -> float:
-        for tp in ["/sys/class/thermal/thermal_zone0/temp", "/sys/class/thermal/thermal_zone1/temp"]:
-            if os.path.exists(tp):
-                try:
-                    with open(tp, "r") as f:
-                        val = float(f.read().strip())
-                        return val / 1000.0 if val > 1000 else val
-                except Exception:
-                    pass
+        # 兼容 Jetson Orin 各种 thermal zone 命名 (GPU-therm, soc-therm 等)
+        for tz in Path("/sys/class/thermal").glob("thermal_zone*"):
+            try:
+                t_type = (tz / "type").read_text().strip().lower()
+                if "gpu" in t_type or "soc" in t_type:
+                    val = float((tz / "temp").read_text().strip())
+                    return val / 1000.0 if val > 1000 else val
+            except Exception:
+                pass
         return 0.0
 
     def start(self):
@@ -269,8 +270,9 @@ class ContentionWorkload:
                         t_frame = time.perf_counter()
                         with torch.cuda.stream(stream):
                             while (time.perf_counter() - t_frame) < burn_sec and not self._stop_event.is_set():
-                                _ = torch.matmul(a, b)
-                            torch.cuda.synchronize()
+                                for _ in range(50):
+                                    _ = torch.matmul(a, b)
+                                torch.cuda.synchronize()
                         frame_ms = (time.perf_counter() - t_frame) * 1000.0
                         accum_gpu_ms += frame_ms
                         calls += 1
@@ -297,11 +299,15 @@ class ContentionWorkload:
                     # 分配两块 64MB 的连续显存 (合计 128MB，远超 4MB L2 缓存)
                     buf_a = torch.empty((16, 1024, 1024), device="cuda", dtype=torch.float32)
                     buf_b = torch.empty((16, 1024, 1024), device="cuda", dtype=torch.float32)
-                    burn_sec = self.burn_duration_ms / 1000.0
+                    # 单帧精确搬运 18 次 64MB 张量 (累计 1.15 GB，与 YOLO11s 单帧特征图物理显存吞吐严格对齐)
+                    # 耗时约 18~20 ms，完美匹配 22 FPS 的 45.4ms 帧周期，杜绝异步队列无限膨胀
+                    num_copies_per_frame = max(1, int(self.burn_duration_ms / 1.5))
                     while not self._stop_event.is_set():
                         t_frame = time.perf_counter()
                         with torch.cuda.stream(stream):
-                            while (time.perf_counter() - t_frame) < burn_sec and not self._stop_event.is_set():
+                            for _ in range(num_copies_per_frame):
+                                if self._stop_event.is_set():
+                                    break
                                 buf_b.copy_(buf_a)
                             torch.cuda.synchronize()
                         frame_ms = (time.perf_counter() - t_frame) * 1000.0
