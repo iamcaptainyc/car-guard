@@ -65,6 +65,7 @@ class MockVLMBackend(VLMBackendBase):
         is_false_alarm = self.force_false_alarm
         threat_escalation = "MAINTAIN"
         summary_text = ""
+        visual_desc = ""
 
         if self.force_false_alarm:
             is_false_alarm = True
@@ -72,33 +73,40 @@ class MockVLMBackend(VLMBackendBase):
             is_human_contact = False
             action_category = "ENVIRONMENT_DISTURBANCE"
             threat_escalation = "DOWNGRADE_TO_L1"
+            visual_desc = "画面中树木与草丛因风晃动，地面光影变幻，无实质安全威胁实体。"
             summary_text = "复核确认为树叶飘落或风吹光影晃动，未发现实质安全风险。"
         elif action == ActionType.DOOR_HANDLE_PULL:
             action_category = "DOOR_HANDLE_TAMPERING"
             is_human_contact = True
             if has_contact:
                 threat_escalation = "CONFIRM_OR_UPGRADE"
+                visual_desc = "画面中人员正用手反复用力拉拽车门把手，伴有锁体晃动。"
                 summary_text = "发现人员正用力反复拉扯门把手，伴有锁具冲击，已阻断。"
             else:
                 threat_escalation = "MAINTAIN"
+                visual_desc = "画面中人员接近车门，手部置于把手附近握持位持续试探。"
                 summary_text = "监测到人员在门把手附近有抓握动作，正在持续监视。"
         elif action == ActionType.INTENTIONAL_KICK:
             action_category = "VEHICLE_BODY_KICK"
             is_human_contact = True
             if has_contact:
                 threat_escalation = "CONFIRM_OR_UPGRADE"
+                visual_desc = "画面中人员蓄意脚踢车门下边梁，车身产生机械震动冲击。"
                 summary_text = "监测到外侧人员蓄意踢踹车门下边梁，冲击已被锁定存证。"
             else:
+                visual_desc = "画面中人员向车门下边梁做出疑似踢踹动作，暂无接触冲击。"
                 summary_text = "人员向车身做出疑似踢踹动作，暂无机械接触震动。"
         elif action == ActionType.WINDOW_PEEKING:
             action_category = "CABIN_PEEKING"
             is_human_contact = False
+            visual_desc = "画面中人员贴近车窗玻璃，头部前倾正向座舱内部窥探视线。"
             summary_text = "发现人员正贴近车窗窥探座舱内部，建议车内人员保持警惕。"
         elif action == ActionType.EQUIPMENT_THEFT:
             action_category = "ROOF_OR_EXTERNAL_THEFT"
             is_human_contact = True
             # 无接触传感器的疑似装备盗窃，VLM 予以确认为盗窃并建议升级 L3
             threat_escalation = "CONFIRM_OR_UPGRADE"
+            visual_desc = "画面中人员攀附车顶或拉扯车外装备，正在尝试拆卸外挂行李。"
             summary_text = "发现人员正尝试拆卸车顶行李架或外挂装备，建议立即驱逐！"
         elif action == ActionType.BEAST_PROXIMITY:
             action_category = "WILD_BEAST_DETECTED"
@@ -106,30 +114,38 @@ class MockVLMBackend(VLMBackendBase):
             threat_escalation = "MAINTAIN"
             species_cn = getattr(event_record, "species_cn", "")
             spec_str = f"({species_cn})" if species_cn else ""
+            visual_desc = f"画面防区内发现大型野生动物{spec_str}在车周游荡徘徊。"
             summary_text = f"注意！防区内发现大型野生猛兽{spec_str}游荡，已锁定录像并警戒。"
         elif action == ActionType.BEAST_SPRINT:
             action_category = "WILD_ANIMAL_ATTACK"
             is_human_contact = False
             threat_escalation = "CONFIRM_OR_UPGRADE"
+            visual_desc = "画面中大型猛兽正以高速向宿主车辆径向冲刺扑来。"
             summary_text = "警报！大型猛兽正高速逼近车辆，请务必紧闭车窗切勿外出！"
         elif action == ActionType.FIRE_SMOKE:
-            action_category = "FIRE_OR_SMOKE_HAZARD"
+            action_category = "FIRE_SMOKE"
             is_human_contact = False
+            threat_escalation = "CONFIRM_OR_UPGRADE"
+            visual_desc = "画面中明显观察到明火火焰燃烧升腾，伴随浓烟向车辆方向扩散。"
             summary_text = "监测到露营火情烟雾扩散，请注意防风并准备应急灭火。"
         elif action == ActionType.VEHICLE_COLLISION:
             action_category = "VEHICLE_COLLISION"
             is_human_contact = False
             threat_escalation = "CONFIRM_OR_UPGRADE" if has_contact else "MAINTAIN"
             if has_contact:
+                visual_desc = "画面中邻车开门过度猛烈撞击或外物剧烈碰擦我车车体侧面。"
                 summary_text = "监测到外物剧烈撞击车身(如邻车开门/倒木砸车)，伴随震动冲击，已存证锁定！"
             else:
+                visual_desc = "画面中车身边缘出现异常运动贴靠或外物轻微碰擦触碰。"
                 summary_text = "监测到车身区域出现异常运动碰撞(如邻车开门贴近/外物触碰)，已锁定录像并复核。"
         else:
             action_category = "BENIGN_ACTIVITY"
+            visual_desc = f"画面中仅为车身外围常规人员车辆活动，未见异常侵扰动作。"
             summary_text = f"车身外围发现常规活动目标，等级为 {event_record.threat_level.value}。"
 
         delay_ms = max(0.0, self.simulated_delay_sec * 1000.0)
         return {
+            "visual_description": visual_desc[:60],
             "action_category": action_category,
             "confidence": confidence,
             "is_human_contact": is_human_contact,
@@ -162,17 +178,21 @@ class LocalHttpVLMBackend(VLMBackendBase):
     支持部署在本地端口 (例如 http://127.0.0.1:8000/v1) 的 llama.cpp / vLLM / Ollama
     """
     SYSTEM_PROMPT = (
-        "你是一个部署在智能汽车座舱域控制器（高通8155）上的安全哨兵多模态复核大模型。"
+        "你是一个部署在智能汽车座舱域控制器上的安全哨兵多模态复核大模型。"
         "你的职责是对守卫系统快通路提交的可疑事件关键帧进行深度语义研判，"
-        "排除光影、树叶飘落、鸟禽等环境假阳性，并为车主生成不超过50字的人性化简明情况通报。\n"
-        "请严格输出 JSON 格式：\n"
+        "甄别火灾烟雾、邻车碰撞、人员侵扰、野生动物或排除环境假阳性，并生成人性化简明情况通报。\n"
+        "【视觉客观性原则】：\n"
+        "必须以画面中肉眼可见的物理事实为准，首字段必须客观陈述画面中实际看到的景象，严禁凭空臆造不存在的人员动作！\n"
+        "若画面中出现明火、火苗、浓烟，必须判定为 FIRE_SMOKE！若未见人员拉车门，严禁输出 DOOR_HANDLE_TAMPERING！\n\n"
+        "请严格输出 JSON 格式（严禁输出任何额外说明文本）：\n"
         "{\n"
-        '  "action_category": "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "VEHICLE_COLLISION" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
+        '  "visual_description": "画面客观景象描述 (30字以内，如实描述图像中实际看到的物体、明火、烟雾、人员或环境，切勿编造)",\n'
+        '  "action_category": "FIRE_SMOKE" | "VEHICLE_COLLISION" | "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "is_human_contact": true/false,\n'
         '  "is_false_alarm": true/false,\n'
         '  "threat_escalation": "CONFIRM_OR_UPGRADE" | "DOWNGRADE_TO_L1" | "MAINTAIN",\n'
-        '  "summary_text": "中文情况通报 (50字以内)"\n'
+        '  "summary_text": "中文情况通报 (50字以内，紧扣真实画面如实通报)"\n'
         "}"
     )
 
@@ -256,22 +276,29 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
     SYSTEM_PROMPT = (
         "你是一个部署在智能汽车车载边缘计算平台（Jetson Orin）上的安全哨兵多模态复核大模型。\n"
         "【至关重要的主车视角认知与主客体定义】：\n"
-        "1. 视角法则：摄像头固定安装在本车（受保护宿主车辆）车身上向外拍摄。画面正前/侧方看到的完整车辆全部是【外部邻车/他车】，绝不是本车！画面下沿/侧边缘偶尔露出的极小反光面为本车车体外轮廓。\n"
-        "2. 主客体关系：画面中的车辆和人员属于【外部邻车/外部客体】，本车（搭载摄像头的车辆）为【受保护主体】。\n"
-        "【职责与核心事件研判范围】：\n"
-        "对关键帧画面结合传感器上下文进行深度语义研判，重点甄别以下事件：\n"
-        "- 【邻车碰撞/剐蹭 (VEHICLE_COLLISION)】：邻车人员开门幅度过大撞击/碰擦本车车身（俗称开门杀/开门碰擦）、邻车泊车/驶过时与本车发生车身刮蹭或物理贴靠；\n"
-        "- 【人员侵扰破坏 (DOOR_HANDLE_TAMPERING / VEHICLE_BODY_KICK / CABIN_PEEKING)】：外部人员拉拽本车门把手、窥探本车车内、脚踢/拍打本车车身；\n"
-        "- 【野生动物侵扰 (WILD_BEAST_DETECTED / WILD_ANIMAL_ATTACK)】：大型猛兽或流浪动物接近本车、抓挠扑咬；\n"
-        "- 【环境假阳性 (FALSE_ALARM)】：自然光影晃动、树叶摇曳、飞鸟掠过，或远处正常行人车辆路过且未侵扰本车。\n\n"
+        "1. 视角法则：摄像头固定安装在本车（受保护宿主车辆）车身上向外拍摄。画面正前/侧方看到的完整车辆全部是【外部邻车/他车】，绝不是本车！画面下沿/侧边缘偶尔露出的反光面为本车车体外轮廓。\n"
+        "2. 主客体关系：画面中的车辆、人员、动物、火源为【外部客体】，搭载摄像头的车辆为【受保护主体】。\n"
+        "【核心事件研判范围】：\n"
+        "- 【火灾浓烟 (FIRE_SMOKE)】：车身周围或野外地面出现明火、火苗、浓烟、篝火过近失控或火情蔓延；\n"
+        "- 【邻车碰撞 (VEHICLE_COLLISION)】：邻车人员开门幅度过大撞击我车车门（开门杀/碰擦）、邻车泊车或驶过时与我车发生刮蹭贴靠；\n"
+        "- 【人员侵扰 (DOOR_HANDLE_TAMPERING / VEHICLE_BODY_KICK / CABIN_PEEKING)】：外部人员实际用手拉拽门把手、贴窗窥探车内、脚踢车身；\n"
+        "- 【装备盗窃 (ROOF_THEFT)】：外部人员尝试拆卸盗取车顶帐篷、行李架或车外外挂装备；\n"
+        "- 【野生动物 (WILD_BEAST_DETECTED / WILD_ANIMAL_ATTACK)】：大型猛兽或流浪动物接近、抓挠扑咬车辆；\n"
+        "- 【环境假阳性 (FALSE_ALARM)】：自然光影晃动、树叶摇曳、飞鸟掠过，或远处正常行人车辆路过未侵扰本车。\n\n"
+        "【视觉客观性与防臆造铁律（必须严格执行）】：\n"
+        "1. 视觉真实性第一：必须优先且客观描述关键帧图像中的实际景象。严禁无中生有！严禁把野外地面、树木或火焰无端幻想成人员拉拽门把手！\n"
+        "2. 火灾判定义务：只要图像中存在明火、火焰、烟雾或篝火，action_category 必须判定为 FIRE_SMOKE，并准确通报火情位置与扩散趋势，绝不可输出拉门或无关动作！\n"
+        "3. 人员动作严格证据：只有在图像中肉眼确凿看到人员手部正在拉拽门把手时，才允许判定为 DOOR_HANDLE_TAMPERING。若画面中无人拉门，绝对严禁输出 DOOR_HANDLE_TAMPERING！\n"
+        "4. 输出首字段必须是 visual_description：必须先用一句话如实陈述画面中肉眼看到的真实物体与动作，再做出分类与通报。\n\n"
         "请严格输出 JSON 格式（严禁输出任何额外说明文本）：\n"
         "{\n"
-        '  "action_category": "VEHICLE_COLLISION" | "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
+        '  "visual_description": "画面客观景象描述 (30字以内，如实描述图像中实际看到的物体、明火、烟雾、人员或环境，切勿编造)",\n'
+        '  "action_category": "FIRE_SMOKE" | "VEHICLE_COLLISION" | "DOOR_HANDLE_TAMPERING" | "CABIN_PEEKING" | "VEHICLE_BODY_KICK" | "ROOF_THEFT" | "WILD_BEAST_DETECTED" | "WILD_ANIMAL_ATTACK" | "FALSE_ALARM" | "OTHER",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "is_human_contact": true/false,\n'
         '  "is_false_alarm": true/false,\n'
         '  "threat_escalation": "CONFIRM_OR_UPGRADE" | "DOWNGRADE_TO_L1" | "MAINTAIN",\n'
-        '  "summary_text": "中文情况通报 (50字以内，必须明确主客体，如“邻车开门碰触我车右侧车门”)"\n'
+        '  "summary_text": "中文情况通报 (50字以内，紧扣真实画面如实通报主客体与险情)"\n'
         "}"
     )
 
@@ -284,7 +311,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         edgellm_dir: Optional[str] = None,
         model_name: str = "qwen3.5-2b",
         timeout: float = 35.0,
-        max_tokens: int = 128,
+        max_tokens: int = 160,
         mode: str = "auto",
         server_bin: Optional[str] = None,
         server_host: str = "127.0.0.1",
@@ -358,15 +385,30 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         """组装带视角色彩与场景定向指引的高保真多模态提示词"""
         dwell_s = getattr(event_record, "target_dwell_time", 0.0)
         dist_m = getattr(event_record, "target_distance", 0.0)
-        target_cat = getattr(event_record, "target_category", "person")
+        raw_target_cat = getattr(event_record, "target_category", None)
+        target_cat = raw_target_cat if raw_target_cat is not None else "unknown"
         species_name = getattr(event_record, "species_cn", "")
         act_val = event_record.action_type.value if hasattr(event_record.action_type, "value") else str(event_record.action_type)
 
-        # 针对具体事件类别注入定向注意力指引 (引导视觉模型聚焦车身交互)
+        # 针对具体事件类别注入定向注意力指引 (引导视觉模型聚焦客观事实)
         focus_guide = ""
         cat_lower = str(target_cat).lower()
         act_str = str(act_val).lower()
+        evt_desc = str(getattr(event_record, "description", "")).lower()
+
+        # 优先判定火灾/烟雾事件指引 (防止被误判为人员动作)
         if (
+            event_record.action_type == ActionType.FIRE_SMOKE
+            or "fire" in cat_lower or "smoke" in cat_lower or "flame" in cat_lower
+            or "火" in act_str or "烟" in act_str
+            or "火" in cat_lower or "烟" in cat_lower
+            or "火" in evt_desc or "烟" in evt_desc
+        ):
+            focus_guide = (
+                "\n- 【定向研判重点】：当前传感器或快通路报告疑似火灾/浓烟疑点！请仔细观察关键帧画面中是否存在明火燃烧、烟雾弥漫、篝火过近或失控扩散？"
+                "如果画面确实存在火灾或烟雾，action_category 必须判定为 FIRE_SMOKE，并在 visual_description 与 summary_text 中如实通报火情方位与距离，绝不可套用人员拉车门等无关动作！"
+            )
+        elif (
             "car" in cat_lower or "veh" in cat_lower or "车" in cat_lower
             or event_record.action_type == ActionType.VEHICLE_COLLISION
             or "撞" in act_str or "碰" in act_str
@@ -377,12 +419,17 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
             )
         elif "person" in cat_lower or "人" in cat_lower:
             focus_guide = (
-                "\n- 【定向研判重点】：当前目标为外部人员。请重点观察该人员是否在拉拽本车门把手、窥探车内、脚踢车身，"
-                "还是仅在邻车旁正常上下车或经过本车。"
+                "\n- 【定向研判重点】：当前检测到画面内存在人员。请仔细观察关键帧画面中该人员的真实行为："
+                "该人员是否真的在拉拽本车门把手、窥探车内，还是仅在车旁正常路过、驻留或在邻车旁活动？"
+                "切勿凭空猜测！若画面中未发生拉车门动作，严禁判定为 DOOR_HANDLE_TAMPERING！"
             )
         elif species_name or "beast" in cat_lower or "animal" in cat_lower or "兽" in cat_lower or "物" in cat_lower:
             focus_guide = (
                 f"\n- 【定向研判重点】：当前识别到动物 ({species_name or target_cat})。请观察其是否在接近、停留或扑咬本车。"
+            )
+        else:
+            focus_guide = (
+                "\n- 【定向研判重点】：请以关键帧图像为准，客观观察画面中发生的真实景象（明火、浓烟、邻车碰擦、人员活动、动物出没或自然光影），如实描述画面景象并做出准确研判。"
             )
 
         prompt_text = (
@@ -649,6 +696,15 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
         if stdout_str and stdout_str.strip():
             cand_texts.append(stdout_str.strip())
 
+        def _norm_vlm_dict(p: dict) -> dict:
+            if "visual_description" not in p and "scene_description" in p:
+                p["visual_description"] = p["scene_description"]
+            if "visual_description" in p and isinstance(p["visual_description"], str):
+                p["visual_description"] = p["visual_description"][:60]
+            if "summary_text" in p and isinstance(p["summary_text"], str):
+                p["summary_text"] = p["summary_text"][:50]
+            return p
+
         # 4. 尝试从候选文本中提取并解析 JSON
         for txt in cand_texts:
             raw_text = txt.strip()
@@ -664,8 +720,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                         e = sub.rfind("}") + 1
                         try:
                             parsed = json.loads(sub[s:e])
-                            if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed):
-                                return txt, parsed
+                            if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed or "visual_description" in parsed):
+                                return txt, _norm_vlm_dict(parsed)
                         except Exception:
                             pass
             # 尝试直接 {...}
@@ -674,8 +730,8 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 e = raw_text.rfind("}") + 1
                 try:
                     parsed = json.loads(raw_text[s:e])
-                    if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed):
-                        return txt, parsed
+                    if isinstance(parsed, dict) and ("action_category" in parsed or "summary_text" in parsed or "visual_description" in parsed):
+                        return txt, _norm_vlm_dict(parsed)
                 except Exception:
                     pass
 
@@ -687,7 +743,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 try:
                     parsed = json.loads(txt[s:e])
                     if isinstance(parsed, dict):
-                        return txt, parsed
+                        return txt, _norm_vlm_dict(parsed)
                 except Exception:
                     pass
 
@@ -703,6 +759,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                     clean = clean[len(prefix):].strip()
             if len(clean) >= 6 and not clean.startswith("Command") and not clean.startswith("[*]") and not clean.startswith("[!]"):
                 return txt, {
+                    "visual_description": clean[:30],
                     "action_category": "OTHER",
                     "confidence": 0.90,
                     "is_human_contact": False,
@@ -1423,14 +1480,7 @@ class TRTEdgeLLMOnDemandBackend(VLMBackendBase):
                 if self._resolved_engine_dir:
                     self._py_runner = trt_edge.ModelRunner(str(self._resolved_engine_dir))
             if getattr(self, "_py_runner", None):
-                dwell_s = getattr(event_record, "target_dwell_time", 0.0)
-                dist_m = getattr(event_record, "target_distance", 0.0)
-                prompt = (
-                    f"{self.SYSTEM_PROMPT}\n\n"
-                    f"当前事件动作: {event_record.action_type.value}, 目标类别: {getattr(event_record, 'target_category', 'person')}, "
-                    f"滞留时间: {dwell_s:.1f}秒, 空间距离: {dist_m:.1f}米, 是否有物理接触信号: {event_record.has_contact_signal}。\n"
-                    "请输出判定 JSON："
-                )
+                prompt = self._build_prompt(event_record)
                 output_str = self._py_runner.generate(prompt, keyframes=keyframes[:2] if keyframes else None)
                 if output_str:
                     raw_text = output_str.strip()
@@ -1924,6 +1974,10 @@ class AsyncVLMReviewer:
         if action_type in [ActionType.BEAST_PROXIMITY, ActionType.BEAST_SPRINT]:
             return True
 
+        # 条件 7: 火情烟雾险情 (FIRE_SMOKE)，必须唤醒 VLM 研判并生成火险通报
+        if action_type == ActionType.FIRE_SMOKE:
+            return True
+
         return False
 
     def submit_review_async(
@@ -2081,10 +2135,14 @@ class AsyncVLMReviewer:
                 print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 (总耗时: {dur_ms/1000.0:.2f}s | 冷启动: {timing_entry['cold_start_load_sec']:.2f}s | 纯推理: {timing_entry['pure_inference_sec']:.2f}s | 前后处理: {(prep_ms+post_ms)/1000.0:.2f}s)")
                 print(f"    - 推理后端: {backend_source}")
                 print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
-                print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+                vis_desc = result.get('visual_description')
+                vis_info = f" | 画面: \"{vis_desc}\"" if vis_desc else ""
+                print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | 动作={result.get('action_category')}{vis_info} | 通报: \"{result.get('summary_text')}\"")
             else:
                 print(f"[!] [VLM-Reviewer] [FALLBACK] [WARN] 真实大模型未就绪/超时/退出异常，当前生效为【离线规则保底模板】")
-                print(f"    - 保底战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+                vis_desc = result.get('visual_description')
+                vis_info = f" | 画面: \"{vis_desc}\"" if vis_desc else ""
+                print(f"    - 保底战报: 等级={fin_threat_val} | 动作={result.get('action_category')}{vis_info} | 通报: \"{result.get('summary_text')}\"")
             return result
         except Exception as e:
             dur_ms = (time.perf_counter() - t0) * 1000.0
@@ -2155,6 +2213,7 @@ class AsyncVLMReviewer:
         vlm_conf = raw_vlm_out.get("confidence", 0.8)
         summary = raw_vlm_out.get("summary_text", "")
         threat_escalation = raw_vlm_out.get("threat_escalation", "MAINTAIN")
+        vis_desc = raw_vlm_out.get("visual_description", "")
 
         # 权限沙箱原则 1: “只升不降铁律” (Hard Rule)
         # 凡是有 CAN 门把手、车锁或车身 IMU 物理接触信号支撑的事件，VLM 绝对禁止降级！
@@ -2177,6 +2236,12 @@ class AsyncVLMReviewer:
                 if event_record.action_type == ActionType.EQUIPMENT_THEFT:
                     adjusted_threat = ThreatLevel.L3_CRITICAL
 
+        # 权限沙箱原则 3: 火情烟雾险情处理 (FIRE_SMOKE)
+        if action_cat in ["FIRE_SMOKE", "FIRE_OR_SMOKE_HAZARD"] or event_record.action_type == ActionType.FIRE_SMOKE:
+            if not raw_vlm_out.get("is_false_alarm", False):
+                if threat_escalation == "CONFIRM_OR_UPGRADE" or event_record.threat_level in [ThreatLevel.L2_WARNING, ThreatLevel.L3_CRITICAL]:
+                    adjusted_threat = ThreatLevel.L3_CRITICAL
+
         # 战报长度硬性截断 <= 50 字
         summary = summary[:50]
 
@@ -2187,6 +2252,7 @@ class AsyncVLMReviewer:
             "vlm_confidence": vlm_conf,
             "action_category": action_cat,
             "threat_escalation": threat_escalation,
+            "visual_description": vis_desc[:60] if vis_desc else "",
             "summary_text": summary,
             "timestamp": time.time()
         }
@@ -2303,10 +2369,14 @@ class AsyncVLMReviewer:
                     print(f"[+] [VLM-Reviewer] [REAL-VLM] 端侧 Qwen-VLM 真实推理完成 [{task_id}] (总耗时: {dur_ms/1000.0:.2f}s | 冷启动: {timing_entry['cold_start_load_sec']:.2f}s | 纯推理: {timing_entry['pure_inference_sec']:.2f}s | 前后处理: {(prep_ms+post_ms)/1000.0:.2f}s)")
                     print(f"    - 推理后端: {backend_source}")
                     print(f"    - VLM 原始模型输出:\n      \"\"\"{raw_text.strip()}\"\"\"")
-                    print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+                    vis_desc = result.get('visual_description')
+                    vis_info = f" | 画面: \"{vis_desc}\"" if vis_desc else ""
+                    print(f"    - 解析后仲裁战报: 等级={fin_threat_val} | 动作={result.get('action_category')}{vis_info} | 通报: \"{result.get('summary_text')}\"")
                 else:
                     print(f"[!] [VLM-Reviewer] [FALLBACK] [WARN] 真实大模型未就绪/超时/退出异常，当前生效为【离线规则保底模板】")
-                    print(f"    - 保底战报: 等级={fin_threat_val} | \"{result.get('summary_text')}\"")
+                    vis_desc = result.get('visual_description')
+                    vis_info = f" | 画面: \"{vis_desc}\"" if vis_desc else ""
+                    print(f"    - 保底战报: 等级={fin_threat_val} | 动作={result.get('action_category')}{vis_info} | 通报: \"{result.get('summary_text')}\"")
 
                 # 更新原记录
                 event_record.vlm_summary = result.get("summary_text")

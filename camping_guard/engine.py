@@ -613,10 +613,12 @@ class CampingGuardEngine:
             person_targets = [t for t in self.active_targets if t.category == 'person']
             if fire_targets:
                 fire_threat, fire_desc = self.fire_monitor.update_fire_status(fire_targets, person_targets, current_time)
-                if fire_threat.value > highest_threat.value:
+                threat_rank = {ThreatLevel.L0_SAFE: 0, ThreatLevel.L1_NOTICE: 1, ThreatLevel.L2_WARNING: 2, ThreatLevel.L3_CRITICAL: 3}
+                if threat_rank.get(fire_threat, 0) > threat_rank.get(highest_threat, 0):
                     highest_threat = fire_threat
                     highest_action = ActionType.FIRE_SMOKE
                     threat_description = fire_desc
+                    target_for_threat = fire_targets[0]
 
             # 人员与动物研判通道
             handle_polys = [r.polygon for r in self.zone3_daemon.rois if "handle" in r.roi_id]
