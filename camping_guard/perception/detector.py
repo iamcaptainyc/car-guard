@@ -54,7 +54,8 @@ class ONNXObjectDetector(BaseObjectDetector):
         use_trt: bool = False,
         animal_classifier: Optional[Any] = None,
         custom_cls_map: Optional[Dict[int, str]] = None,
-        profiler: Optional[Any] = None
+        profiler: Optional[Any] = None,
+        dla_core: Optional[int] = None
     ):
         self.model_path = model_path
         self.input_size = input_size
@@ -65,6 +66,15 @@ class ONNXObjectDetector(BaseObjectDetector):
         self.custom_cls_map = custom_cls_map
         self.profiler = profiler
         self.defer_animal_cls = False
+
+        # 自动识别或显式设置 DLA Core
+        if dla_core is None and model_path:
+            mp_lower = str(model_path).lower()
+            if "dla0" in mp_lower:
+                dla_core = 0
+            elif "dla1" in mp_lower:
+                dla_core = 1
+        self.dla_core = dla_core
 
         # COCO 类别映射到露营守卫规范类别
         # 10 种动物类别 (14~23) 统一映射为 'animal'，统一路由至二级动物细分类器 (MobileNetV3) 判定物种与猛兽/小型动物
@@ -112,17 +122,25 @@ class ONNXObjectDetector(BaseObjectDetector):
             base_stem = Path(model_path).stem if model_path else "YOLO"
             self.profiler_label = f"{base_stem.upper()}-Det" if "yolo" in base_stem.lower() else "General-Det"
 
+        if self.dla_core is not None:
+            self.profiler_label = f"{self.profiler_label}-DLA{self.dla_core}"
+
         is_engine = str(model_path).lower().endswith(".engine")
         if os.path.exists(model_path) or is_engine:
             try:
                 from camping_guard.perception.trt_engine import load_inference_backend
-                self.session, self.backend = load_inference_backend(model_path, prefer_tensorrt=(use_trt or is_engine))
+                self.session, self.backend = load_inference_backend(
+                    model_path,
+                    prefer_tensorrt=(use_trt or is_engine),
+                    dla_core=self.dla_core
+                )
                 if hasattr(self.session, "engine_path"):
                     self.model_path = self.session.engine_path
                 elif hasattr(self.session, "model_path"):
                     self.model_path = self.session.model_path
                 self.input_name = self.session.get_inputs()[0].name
-                print(f"[ObjectDetector] 成功载入模型 ({self.backend}): {self.model_path} (置信度阈值: {self.conf_threshold:.2f})")
+                dla_str = f" [DLA Core {self.dla_core}]" if self.dla_core is not None else ""
+                print(f"[ObjectDetector] 成功载入模型 ({self.backend}{dla_str}): {self.model_path} (置信度阈值: {self.conf_threshold:.2f})")
             except Exception as e:
                 # 兼容回退原生 ONNXRuntime
                 if os.path.exists(model_path) and not is_engine:

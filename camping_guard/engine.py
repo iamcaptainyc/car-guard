@@ -47,7 +47,9 @@ class CampingGuardEngine:
         calib: Optional[VehicleCalibration] = None,
         profiler: Optional[PipelineProfiler] = None,
         use_tensorrt: bool = False,
-        animal_classifier: Optional[Any] = None
+        animal_classifier: Optional[Any] = None,
+        vlm_throttle_enabled: bool = True,
+        vlm_active_fps: float = 5.0
     ):
         # 0. 载入整车标定参数配置 (解耦 JSON 配置形式)
         if calib is not None:
@@ -202,6 +204,19 @@ class CampingGuardEngine:
         self._last_locked_event_id: Optional[str] = None
         self._last_locked_time: float = 0.0
 
+        # 慢通路并发动态自适应让步调度 (方案 A: Dynamic Yield / Adaptive Throttling)
+        self.vlm_throttle_enabled = vlm_throttle_enabled
+        self.vlm_active_fps = vlm_active_fps
+        self._last_detection_time: float = 0.0
+        self._last_raw_detections: List[dict] = []
+        self.is_vlm_throttling_now: bool = False
+
+    def is_vlm_active(self) -> bool:
+        """查询慢通路端侧大模型当前是否正在执行生成/复核 (纯进程内状态，零耗时查询)"""
+        if self.vlm_reviewer is not None and getattr(self.vlm_reviewer, "is_inferencing", False):
+            return True
+        return False
+
     def _on_zone3_roi_disturbed(self, roi_id: str, camera_id: int):
         """Zone 3 常驻守护进程回调，强制拉起 S2"""
         self._zone3_triggered_this_frame = True
@@ -277,7 +292,19 @@ class CampingGuardEngine:
 
         # 5. 目标检测 (若未显式传入 detections 且配置了 Detector)
         with self.profiler.profile_stage("Object_Detection"):
-            if (raw_detections is None or len(raw_detections) == 0) and self.detector is not None:
+            vlm_busy = self.is_vlm_active()
+            should_throttle = False
+            if vlm_busy and self.vlm_throttle_enabled:
+                # 动态自适应降频让步机制 (Dynamic Throttling / Yield - 方案 A):
+                # 当大模型在 GPU 上进行自回归解码时，将快通路 YOLO 动态降频至 vlm_active_fps (如 5 FPS)
+                # 释放 80%+ 的 SM 计算时间片给大模型，同时依靠 ByteTrack 卡尔曼滤波预测维持丝滑目标轨迹
+                min_interval = 1.0 / max(0.1, self.vlm_active_fps)
+                if (current_time - self._last_detection_time) < min_interval:
+                    should_throttle = True
+
+            self.is_vlm_throttling_now = should_throttle
+
+            if not should_throttle and (raw_detections is None or len(raw_detections) == 0) and self.detector is not None:
                 if primary_frame is not None:
                     det_sess = getattr(self.detector, 'session', None)
                     if getattr(self.detector, 'is_ensemble', False):
@@ -285,9 +312,16 @@ class CampingGuardEngine:
                     elif getattr(self.detector, 'is_megadetector', False):
                         det_label = "MegaDetector"
                     else:
-                        det_label = "YOLO11n-Det"
+                        det_label = getattr(self.detector, 'profiler_label', 'YOLO11n-Det')
                     with self.profiler.profile_model(det_label, condition="S1全图目标检测 (640x480)", session=det_sess):
                         raw_detections = self.detector.detect(primary_frame)
+                    self._last_detection_time = current_time
+                    self._last_raw_detections = raw_detections
+            elif should_throttle:
+                # 动态降频让步帧：跳过重量级 GPU 前向推理，复用上一有效检测候选传入 ByteTrack，
+                # 配合卡尔曼滤波在 CPU 上微秒级更新，既不造成目标漂移/丢失，又彻底释放 GPU SM！
+                raw_detections = list(self._last_raw_detections)
+
             if raw_detections is None:
                 raw_detections = []
 

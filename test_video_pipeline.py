@@ -427,7 +427,10 @@ def run_video_pipeline(
     fire_detector_path: Optional[str] = None,
     enable_fire: bool = True,
     detector_size: Optional[int] = None,
-    fire_size: Optional[int] = None
+    fire_size: Optional[int] = None,
+    vlm_throttle_enabled: bool = True,
+    vlm_active_fps: float = 5.0,
+    dla_core: Optional[int] = None
 ):
     from camping_guard.perception.trt_engine import is_jetson
     use_trt = use_trt or is_jetson()
@@ -615,7 +618,8 @@ def run_video_pipeline(
             input_size=det_input_size,
             conf_threshold=conf_threshold,
             use_trt=use_trt,
-            animal_classifier=animal_classifier
+            animal_classifier=animal_classifier,
+            dla_core=dla_core
         )
     else:
         model_type_str = "未挂载"
@@ -731,7 +735,9 @@ def run_video_pipeline(
         use_bytetrack=True,
         profiler=profiler,
         use_tensorrt=use_trt,
-        animal_classifier=animal_classifier
+        animal_classifier=animal_classifier,
+        vlm_throttle_enabled=vlm_throttle_enabled,
+        vlm_active_fps=vlm_active_fps
     )
     success, msg = engine.activate()
     print(f"[*] 系统激活状态: {msg}")

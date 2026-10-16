@@ -301,8 +301,14 @@ def main():
     parser.add_argument("--fire-size", type=int, default=None,
                         help="火焰检测器输入分辨率 (如 640 或 1280，默认自动探测模型输入维度)")
     parser.add_argument("--max-frames", type=int, default=None, help="最大测试评估帧数 (达到后自动结束)")
-    parser.add_argument("--no-fire", action="store_true",
-                        help="显式关闭火焰检测并发 (默认开启)")
+    parser.add_argument("--vlm-throttle", dest="vlm_throttle", action="store_true", default=True,
+                        help="启用慢通路 VLM 复核时动态自适应降频让步机制 (方案 A，默认开启)")
+    parser.add_argument("--no-vlm-throttle", dest="vlm_throttle", action="store_false",
+                        help="关闭慢通路让步降频，始终保持全频检测")
+    parser.add_argument("--vlm-throttle-fps", type=float, default=5.0,
+                        help="VLM 复核期间快通路 YOLO 降频目标 FPS (默认 5.0)")
+    parser.add_argument("--dla-core", type=int, choices=[0, 1], default=None,
+                        help="将快通路检测器卸载至专用 DLA 硬件加速核心运行 (方案 B，可选 0 或 1)")
     parser.add_argument("--stats-json", type=str, default=None,
                         help="额外指定全维度性能诊断 JSON 报告保存路径 (默认始终自动导出至 logs/latest_perf_report.json)")
 
@@ -425,7 +431,10 @@ def main():
         fire_detector_path=args.fire_detector or (str(engines["fire_det"]) if engines["fire_det"] and str(engines["fire_det"]) != "builtin:VisualFlameDetector" else None),
         enable_fire=not args.no_fire,
         detector_size=args.detector_size,
-        fire_size=args.fire_size
+        fire_size=args.fire_size,
+        vlm_throttle_enabled=getattr(args, "vlm_throttle", True),
+        vlm_active_fps=getattr(args, "vlm_throttle_fps", 5.0),
+        dla_core=getattr(args, "dla_core", None)
     )
 
 

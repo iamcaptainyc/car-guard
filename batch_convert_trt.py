@@ -242,13 +242,20 @@ def build_single_engine(
     skip_existing=False,
     benchmark_only=False,
     force=False,
+    dla_core=None,
+    allow_gpu_fallback=True,
 ):
-    """编译单个 ONNX 模型为 TensorRT Engine 并返回性能指标"""
+    """编译单个 ONNX 模型为 TensorRT Engine 并返回性能指标 (支持 GPU 与 DLA Core 异构编译)"""
     onnx_path = Path(onnx_path).resolve()
     engine_path = Path(engine_path).resolve()
     cache_path = Path(cache_path).resolve()
 
     log_path = engine_path.with_suffix(".trtexec.log")
+
+    if dla_core is not None:
+        if precision == "fp32":
+            print(f"⚠️ [DLA 提示] DLA 硬件不支持 FP32 浮点计算，已自动调整为 --fp16 精度！")
+            precision = "fp16"
 
     shape_args_load = get_shape_args(
         onnx_path,
@@ -269,6 +276,10 @@ def build_single_engine(
             "--iterations=50",
             "--verbose=false",
         ]
+        if dla_core is not None:
+            cmd.append(f"--useDLACore={dla_core}")
+            if allow_gpu_fallback:
+                cmd.append("--allowGPUFallback")
         cmd.extend(shape_args_load)
     elif not force and skip_existing and engine_path.is_file():
         # 跳过编译直接测试已有 engine
@@ -279,6 +290,10 @@ def build_single_engine(
             "--iterations=50",
             "--verbose=false",
         ]
+        if dla_core is not None:
+            cmd.append(f"--useDLACore={dla_core}")
+            if allow_gpu_fallback:
+                cmd.append("--allowGPUFallback")
         cmd.extend(shape_args_load)
     else:
         # 完整编译 + 测试
@@ -297,6 +312,11 @@ def build_single_engine(
             cmd.append("--fp16")
         elif precision == "int8":
             cmd.append("--int8")
+
+        if dla_core is not None:
+            cmd.append(f"--useDLACore={dla_core}")
+            if allow_gpu_fallback:
+                cmd.append("--allowGPUFallback")
 
         # 动态/静态维度配置
         shape_args = get_shape_args(
@@ -486,6 +506,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="强制全量重新编译（覆盖已有 .engine，忽略历史缓存）")
     parser.add_argument("--output-md", default="", help="输出 Markdown 报告路径（默认: <models_dir>/benchmark_report.md）")
     parser.add_argument("--output-json", default="", help="输出 JSON 结果路径（默认: <models_dir>/benchmark_results.json）")
+    parser.add_argument("--dla-core", type=int, choices=[0, 1], default=None, help="目标 NVIDIA DLA 硬件加速核心 (0 或 1，针对 Jetson Orin 异构卸载)")
+    parser.add_argument("--no-gpu-fallback", action="store_true", help="禁止 DLA 不支持算子自动回退至 GPU SM")
 
     args = parser.parse_args()
 
@@ -559,7 +581,10 @@ def main():
         print(f"   [{i:02d}] -> {p.name}")
 
     for idx, onnx_path in enumerate(onnx_files, 1):
-        engine_path = onnx_path.with_suffix(".engine")
+        if args.dla_core is not None:
+            engine_path = onnx_path.with_name(f"{onnx_path.stem}_dla{args.dla_core}.engine")
+        else:
+            engine_path = onnx_path.with_suffix(".engine")
         rel_name = f"{onnx_path.parent.name}/{onnx_path.name}"
 
         # 检查是否可以命中缓存直接复用已有指标（避免无谓的重复测速）
@@ -570,7 +595,8 @@ def main():
             continue
 
         print("\n" + "-" * 70)
-        print(f"⏳ [{idx}/{len(onnx_files)}] 正在构建/测速: {rel_name}")
+        dla_desc = f" (DLA Core {args.dla_core})" if args.dla_core is not None else ""
+        print(f"⏳ [{idx}/{len(onnx_files)}] 正在构建/测速: {rel_name}{dla_desc} -> {engine_path.name}")
         print("-" * 70)
 
         res = build_single_engine(
@@ -587,6 +613,8 @@ def main():
             skip_existing=args.skip_existing,
             benchmark_only=args.benchmark_only,
             force=args.force,
+            dla_core=args.dla_core,
+            allow_gpu_fallback=not args.no_gpu_fallback,
         )
 
         processed_results.append(res)

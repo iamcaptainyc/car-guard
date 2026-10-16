@@ -101,10 +101,20 @@ class TRTInferenceSession:
         session.get_outputs() -> [TensorMeta, ...]
         session.run(output_names, input_feed={name: np_arr}) -> [np_arr, ...]
     """
-    def __init__(self, engine_path: str, device: str = "cuda:0"):
+    def __init__(self, engine_path: str, device: str = "cuda:0", dla_core: Optional[int] = None):
         self.engine_path = str(engine_path)
         self.model_path = str(engine_path)
         self.device = device
+        
+        # 自动识别或显式设置 DLA Core (Orin NX 具备 DLA 0 与 DLA 1 两个专用加速核心)
+        if dla_core is None:
+            ep_lower = self.engine_path.lower()
+            if "dla0" in ep_lower:
+                dla_core = 0
+            elif "dla1" in ep_lower:
+                dla_core = 1
+        self.dla_core = dla_core
+
         self.engine = None
         self.context = None
         self.inputs: List[TensorMeta] = []
@@ -138,6 +148,11 @@ class TRTInferenceSession:
         logger = trt.Logger(trt.Logger.WARNING)
         with open(self.engine_path, "rb") as f:
             runtime = trt.Runtime(logger)
+            if self.dla_core is not None:
+                try:
+                    runtime.dla_core = int(self.dla_core)
+                except Exception as ex:
+                    print(f"[TRTInferenceSession] 设置 runtime.dla_core={self.dla_core} 提示: {ex}")
             self.engine = runtime.deserialize_cuda_engine(f.read())
 
         if self.engine is None:
@@ -178,8 +193,9 @@ class TRTInferenceSession:
 
         # 确定显存调度后端 (首选 PyTorch CUDA，备选 cuda-python / pycuda)
         self._setup_backend()
+        dla_tag = f", DLA Core: {self.dla_core}" if self.dla_core is not None else ""
         print(f"[TRTInferenceSession] 成功载入 TensorRT Engine: {Path(self.engine_path).name} "
-              f"(Inputs: {len(self.inputs)}, Outputs: {len(self.outputs)}, GPU显存管理: {self._backend})")
+              f"(Inputs: {len(self.inputs)}, Outputs: {len(self.outputs)}, 显存/调度管理: {self._backend}{dla_tag})")
 
     def _setup_backend(self):
         """配置显存搬运与 CUDA 流后端"""
@@ -439,7 +455,8 @@ class MockTRTInferenceSession:
 def load_inference_backend(
     model_path: str,
     prefer_tensorrt: bool = False,
-    providers: Optional[List[str]] = None
+    providers: Optional[List[str]] = None,
+    dla_core: Optional[int] = None
 ) -> Tuple[Any, str]:
     """
     智能选择并加载推理会话：
@@ -456,7 +473,7 @@ def load_inference_backend(
 
     if should_try_trt and os.path.exists(target_engine):
         try:
-            session = TRTInferenceSession(target_engine)
+            session = TRTInferenceSession(target_engine, dla_core=dla_core)
             session.model_path = target_engine
             return session, "tensorrt"
         except Exception as e:
