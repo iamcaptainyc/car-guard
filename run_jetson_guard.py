@@ -310,6 +310,20 @@ def main():
                         help="VLM 复核期间快通路 YOLO 降频目标 FPS (默认 5.0)")
     parser.add_argument("--dla-core", type=int, choices=[0, 1], default=None,
                         help="将快通路检测器卸载至专用 DLA 硬件加速核心运行 (方案 B，可选 0 或 1)")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="最大测试评估帧数 (达到后自动结束并输出统计报告)")
+    parser.add_argument("--detect-interval", type=int, default=1,
+                        help="目标检测推理采样间隔 (默认 1，即每帧推理；设置 >1 可跳帧推理仅运行轻量跟踪)")
+    parser.add_argument("--camera-height", type=float, default=None,
+                        help="手动覆盖相机离地安装高度 (米，默认从 --config 读取)")
+    parser.add_argument("--camera-pitch", type=float, default=None,
+                        help="手动覆盖相机俯仰角 (度，向下为负，默认从 --config 读取)")
+    parser.add_argument("--camera-yaw", type=float, default=None,
+                        help="手动覆盖相机偏航角 (度，0前, 90左, -90右, 180后，默认从 --config 读取)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="输出每帧的详细耗时指标日志")
+    parser.add_argument("--reid", type=str, default="models/reid/osnet_x0_25.onnx",
+                        help="OSNet 人员重识别模型路径 (默认: models/reid/osnet_x0_25.onnx)")
     parser.add_argument("--stats-json", type=str, default=None,
                         help="额外指定全维度性能诊断 JSON 报告保存路径 (默认始终自动导出至 logs/latest_perf_report.json)")
 
@@ -408,8 +422,13 @@ def main():
         conf_threshold=args.conf,
         show_sidebar=show_sb,
         headless=args.headless,
-        max_frames=args.max_frames,
+        max_frames=getattr(args, "max_frames", None),
         realtime=args.realtime,
+        detect_interval=getattr(args, "detect_interval", 1),
+        verbose=getattr(args, "verbose", False),
+        camera_height=getattr(args, "camera_height", None),
+        camera_pitch=getattr(args, "camera_pitch", None),
+        camera_yaw=getattr(args, "camera_yaw", None),
         use_trt=True,
         loop_video=loop_val,
         output_path=args.output,

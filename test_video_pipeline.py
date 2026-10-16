@@ -1500,6 +1500,16 @@ def main():
                         help="目标检测模型输入分辨率 (默认自动适配模型，如 640 或 1280)")
     parser.add_argument("--fire-size", type=int, default=None,
                         help="火灾检测模型输入分辨率 (默认自动适配模型，如 640 或 1280)")
+    parser.add_argument("--vlm-engine-so", type=str, default=None,
+                        help="显式指定 libvlm_engine.so 共享库路径 (默认自动在 build 目录检索)")
+    parser.add_argument("--vlm-throttle", dest="vlm_throttle", action="store_true", default=True,
+                        help="启用慢通路 VLM 复核时动态自适应降频让步机制 (方案 A，默认开启)")
+    parser.add_argument("--no-vlm-throttle", dest="vlm_throttle", action="store_false",
+                        help="关闭慢通路让步降频，始终保持全频检测")
+    parser.add_argument("--vlm-throttle-fps", type=float, default=5.0,
+                        help="VLM 复核期间快通路 YOLO 降频目标 FPS (默认 5.0)")
+    parser.add_argument("--dla-core", type=int, choices=[0, 1], default=None,
+                        help="将快通路检测器卸载至专用 DLA 硬件加速核心运行 (方案 B，可选 0 或 1)")
 
     args = parser.parse_args()
     loop_val = args.loop_video
@@ -1538,6 +1548,7 @@ def main():
         vlm_timeout=args.vlm_timeout,
         vlm_max_tokens=args.vlm_max_tokens,
         vlm_mode=args.vlm_mode,
+        vlm_engine_so=getattr(args, "vlm_engine_so", None),
         vlm_server_port=args.vlm_server_port,
         vlm_idle_timeout=args.vlm_idle_timeout,
         vlm_server_bin=args.vlm_server_bin,
@@ -1545,7 +1556,10 @@ def main():
         fire_detector_path=args.fire_detector,
         enable_fire=not args.no_fire,
         detector_size=args.detector_size,
-        fire_size=args.fire_size
+        fire_size=args.fire_size,
+        vlm_throttle_enabled=getattr(args, "vlm_throttle", True),
+        vlm_active_fps=getattr(args, "vlm_throttle_fps", 5.0),
+        dla_core=getattr(args, "dla_core", None)
     )
 
 
